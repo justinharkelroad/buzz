@@ -1,0 +1,600 @@
+name: Personal Relay Image
+
+on:
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".dockerignore"
+      - ".github/workflows/personal-relay-image.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "admin-web/**"
+      - "crates/**"
+      - "deploy/personal-relay/**"
+      - "migrations/**"
+      - "package.json"
+      - "patches/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "rust-toolchain.toml"
+      - "schema/**"
+      - "web/**"
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact 40-character candidate SHA. It must equal github.sha."
+        required: true
+        type: string
+      confirmation:
+        description: "Enter PUBLISH_PERSONAL_RELAY"
+        required: true
+        type: string
+
+concurrency:
+  group: personal-relay-image-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Bind workflow to source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_tag: ${{ steps.contract.outputs.candidate_tag }}
+      image_name: ${{ steps.contract.outputs.image_name }}
+      source_sha: ${{ steps.contract.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify invocation contract
+        id: contract
+        env:
+          CONFIGURED_IMAGE: ${{ vars.PERSONAL_RELAY_IMAGE }}
+          INPUT_CONFIRMATION: ${{ inputs.confirmation }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          actual_sha=$(git rev-parse 'HEAD^{commit}')
+          [[ "$actual_sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::checkout does not match github.sha"
+            exit 1
+          }
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$REPOSITORY" == "justinharkelroad/buzz" ]] || {
+              echo "::error::publication is limited to Justin's personal fork"
+              exit 1
+            }
+            [[ "$INPUT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters"
+              exit 1
+            }
+            [[ "$INPUT_SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+              echo "::error::source_sha must exactly equal github.sha"
+              exit 1
+            }
+            [[ "$INPUT_CONFIRMATION" == "PUBLISH_PERSONAL_RELAY" ]] || {
+              echo "::error::publication confirmation did not match"
+              exit 1
+            }
+          fi
+
+          image_name=${CONFIGURED_IMAGE:-ghcr.io/justinharkelroad/buzz-relay-personal}
+          [[ "$image_name" =~ ^ghcr\.io/justinharkelroad/[a-z0-9._-]+$ ]] || {
+            echo "::error::PERSONAL_RELAY_IMAGE must stay in Justin's lowercase GHCR namespace"
+            exit 1
+          }
+
+          {
+            echo "candidate_tag=sha-${GITHUB_SHA}"
+            echo "image_name=$image_name"
+            echo "source_sha=$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify personal release contracts
+        run: bash ./deploy/personal-relay/release-contract-test.sh
+
+  build-check:
+    name: Build-only check (${{ matrix.platform }})
+    if: github.event_name == 'pull_request'
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Build personal runtime without publication
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-personal
+          platforms: ${{ matrix.platform }}
+          tags: personal-relay-check:${{ matrix.arch }}
+          load: true
+          provenance: false
+          sbom: false
+
+      - name: Verify personal runtime contract
+        env:
+          IMAGE_REF: personal-relay-check:${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE_REF")" = "root:root"
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE_REF")" = '["/usr/local/bin/personal-relay-entrypoint"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE_REF")" = '["/usr/local/bin/buzz-relay"]'
+          if docker run --rm "$IMAGE_REF" >/tmp/no-volume.out 2>&1; then
+            echo "::error::relay startup succeeded without the Railway volume marker"
+            exit 1
+          fi
+          grep -q 'RAILWAY_VOLUME_MOUNT_PATH must be /data/git' /tmp/no-volume.out
+          docker run --rm --tmpfs /data/git:rw \
+            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" /bin/sh -ec \
+            'test "$(id -u):$(id -g)" = 1000:1000
+             test -x /usr/local/bin/buzz-relay
+             test -x /usr/local/bin/buzz-admin
+             test "$(stat -c %u:%g /data/git)" = 1000:1000
+             touch /data/git/runtime-probe
+             test "$(stat -c %u:%g /data/git/runtime-probe)" = 1000:1000
+             rm /data/git/runtime-probe'
+
+  release-gate:
+    name: Approve source and run release tests
+    if: github.event_name == 'workflow_dispatch'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: personal-relay-release
+    permissions:
+      contents: read
+      packages: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: buzz
+          POSTGRES_PASSWORD: buzz_dev
+          POSTGRES_USER: buzz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U buzz -d buzz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      BUZZ_TEST_DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+      DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Require the exact independently approved candidate
+        env:
+          APPROVED_SOURCE_SHA: ${{ vars.PERSONAL_APPROVED_RELAY_SHA }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::personal-relay-release must define PERSONAL_APPROVED_RELAY_SHA"
+            exit 1
+          }
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+            echo "::error::prepared source does not match github.sha"
+            exit 1
+          }
+          [[ "$APPROVED_SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+            echo "::error::github.sha is not the exact approved relay candidate"
+            exit 1
+          }
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]] || {
+            echo "::error::checkout does not match the approved invocation source"
+            exit 1
+          }
+
+      - name: Fail if the candidate tag already exists
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          package_name=${IMAGE_NAME#ghcr.io/justinharkelroad/}
+          api_path="users/justinharkelroad/packages/container/${package_name}/versions?per_page=100"
+          if ! gh api --paginate --slurp "$api_path" > /tmp/package-versions.json 2>/tmp/package-versions.err; then
+            if grep -q 'HTTP 404' /tmp/package-versions.err; then
+              printf '%s\n' '[]' > /tmp/package-versions.json
+            else
+              cat /tmp/package-versions.err >&2
+              exit 1
+            fi
+          fi
+          if jq -e --arg tag "$CANDIDATE_TAG" \
+            'any(.[][]?; any((.metadata.container.tags // [])[]?; . == $tag))' \
+            /tmp/package-versions.json >/dev/null; then
+            echo "::error::candidate tag already exists and will not be moved"
+            exit 1
+          fi
+
+      - name: Run workflow engine tests with HTTP support
+        run: cargo test --locked -p buzz-workflow --features reqwest
+
+      - name: Run database-backed dispatch regressions
+        run: |
+          set -euo pipefail
+          cargo test --locked -p buzz-workflow --features reqwest \
+            executor::tests::webhook_dispatch_revalidation_allows_current_admin \
+            -- --ignored --exact --test-threads=1
+          cargo test --locked -p buzz-workflow --features reqwest \
+            executor::tests::webhook_dispatch_denial_precedes_transport_and_disables_workflow \
+            -- --ignored --exact --test-threads=1
+          cargo test --locked -p buzz-workflow --features reqwest \
+            executor::tests::webhook_dispatch_revalidation_preserves_community_scope \
+            -- --ignored --exact --test-threads=1
+
+  build-publish:
+    name: Build candidate digest (${{ matrix.platform }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, release-gate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to personal GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push platform manifest by digest
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-personal
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=Personal Buzz Relay
+          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+
+      - name: Export platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p /tmp/personal-relay-digests
+          touch "/tmp/personal-relay-digests/${DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-digest-${{ matrix.arch }}
+          path: /tmp/personal-relay-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  scan:
+    name: Scan candidate digest (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build-publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Download platform digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: personal-relay-digest-${{ matrix.arch }}
+          path: /tmp/personal-relay-digest
+
+      - name: Resolve platform digest
+        id: digest
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find /tmp/personal-relay-digest -maxdepth 1 -type f)
+          [[ ${#files[@]} -eq 1 ]] || {
+            echo "::error::expected exactly one platform digest"
+            exit 1
+          }
+          digest="sha256:$(basename "${files[0]}")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to personal GHCR read-only
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Export vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          format: json
+          output: personal-relay-trivy-${{ matrix.arch }}.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Upload vulnerability report before the blocking gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-trivy-${{ matrix.arch }}
+          path: personal-relay-trivy-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce high and critical vulnerability gate
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  publish:
+    name: Create candidate manifest and attest digest
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, release-gate, build-publish, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/personal-relay-digests
+          pattern: personal-relay-digest-*
+          merge-multiple: true
+
+      - name: Download vulnerability reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/personal-relay-trivy
+          pattern: personal-relay-trivy-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Log in to personal GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Recheck that the candidate tag does not exist
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          package_name=${IMAGE_NAME#ghcr.io/justinharkelroad/}
+          api_path="users/justinharkelroad/packages/container/${package_name}/versions?per_page=100"
+          gh api --paginate --slurp "$api_path" > /tmp/package-versions.json
+          if jq -e --arg tag "$CANDIDATE_TAG" \
+            'any(.[][]?; any((.metadata.container.tags // [])[]?; . == $tag))' \
+            /tmp/package-versions.json >/dev/null; then
+            echo "::error::candidate tag already exists and will not be moved"
+            exit 1
+          fi
+
+      - name: Create non-overwriting candidate tag and resolve digest
+        id: manifest
+        working-directory: /tmp/personal-relay-digests
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          digest_refs=()
+          for digest in *; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
+            digest_refs+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+          [[ ${#digest_refs[@]} -eq 2 ]] || {
+            echo "::error::expected exactly two platform digests"
+            exit 1
+          }
+          candidate_ref="${IMAGE_NAME}:${CANDIDATE_TAG}"
+          docker buildx imagetools create -t "$candidate_ref" "${digest_refs[@]}"
+          manifest_digest=$(docker buildx imagetools inspect "$candidate_ref" \
+            --format '{{json .Manifest}}' | jq -r '.digest')
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          {
+            echo "candidate_ref=$candidate_ref"
+            echo "digest=$manifest_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify binaries and scoped privilege drop
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE_REF")" = "root:root"
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE_REF")" = '["/usr/local/bin/personal-relay-entrypoint"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE_REF")" = '["/usr/local/bin/buzz-relay"]'
+          if docker run --rm "$IMAGE_REF" >/tmp/no-volume.out 2>&1; then
+            echo "::error::relay startup succeeded without the Railway volume marker"
+            exit 1
+          fi
+          grep -q 'RAILWAY_VOLUME_MOUNT_PATH must be /data/git' /tmp/no-volume.out
+          docker run --rm --tmpfs /data/git:rw \
+            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" /bin/sh -ec \
+            'test "$(id -u):$(id -g)" = 1000:1000
+             test -x /usr/local/bin/buzz-relay
+             test -x /usr/local/bin/buzz-admin
+             test "$(stat -c %u:%g /data/git)" = 1000:1000
+             touch /data/git/runtime-probe
+             test "$(stat -c %u:%g /data/git/runtime-probe)" = 1000:1000
+             rm /data/git/runtime-probe'
+          docker run --rm --tmpfs /data/git:rw \
+            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" buzz-admin --help >/dev/null
+
+      - name: Attest merged image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ needs.prepare.outputs.image_name }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify repository-scoped attestation and inspect predicate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.manifest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE_REF}" \
+            -R "$GITHUB_REPOSITORY" \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners \
+            --format json > personal-relay-attestation-verification.json
+          jq -e 'length > 0' personal-relay-attestation-verification.json >/dev/null
+          jq '[.[].verificationResult.statement.predicate]' \
+            personal-relay-attestation-verification.json \
+            > personal-relay-attestation-predicate.json
+
+      - name: Write non-secret release ledger
+        env:
+          CANDIDATE_REF: ${{ steps.manifest.outputs.candidate_ref }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg image "$IMAGE_NAME" \
+            --arg candidate_ref "$CANDIDATE_REF" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg deployment_ref "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{repository: $repository, source_sha: $source_sha, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha, image: $image, candidate_ref: $candidate_ref, candidate_tag_policy: "created once by this workflow and never used for deployment", digest: $digest, deployment_ref: $deployment_ref, sbom: "BuildKit SBOM attestation attached to each platform manifest", vulnerability_gate: "Trivy fixed HIGH and CRITICAL findings blocked on AMD64 and ARM64", database_regressions: "three webhook dispatch authority tests passed against Postgres", workflow_run: $workflow_run}' \
+            > personal-relay-release.json
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-evidence-${{ github.sha }}
+          path: |
+            personal-relay-attestation-predicate.json
+            personal-relay-attestation-verification.json
+            personal-relay-release.json
+            /tmp/personal-relay-trivy/*.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.manifest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          {
+            echo "### Personal relay artifact"
+            echo
+            echo "Source: \`$SOURCE_SHA\`"
+            echo
+            echo "Deployment image: \`$IMAGE_REF\`"
+            echo
+            echo "Only the digest-qualified image is immutable and eligible for promotion."
+            echo
+            echo "This workflow publishes an artifact only. It does not deploy Railway or change hosted Buzz."
+          } >> "$GITHUB_STEP_SUMMARY"

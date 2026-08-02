@@ -1,0 +1,522 @@
+name: Personal Desktop Staging Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact 40-character source SHA. It must equal github.sha and the relay source."
+        required: true
+        type: string
+      relay_evidence_run_id:
+        description: "Successful Personal Relay Image workflow run ID for the same source"
+        required: true
+        type: string
+      staging_deployment_receipt_sha256:
+        description: "SHA-256 of the canonical approved staging deployment receipt"
+        required: true
+        type: string
+      version:
+        description: "Staging desktop semver"
+        required: true
+        type: string
+      target:
+        description: "macOS staging target"
+        required: true
+        default: aarch64-apple-darwin
+        type: choice
+        options:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+concurrency:
+  group: personal-desktop-staging-${{ github.sha }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build unsigned staging candidate (${{ inputs.target }})
+    if: github.repository == 'justinharkelroad/buzz'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    environment: personal-staging
+    permissions:
+      actions: read
+      contents: read
+    env:
+      BASE_BUNDLE_ID: ${{ vars.PERSONAL_DESKTOP_BUNDLE_ID }}
+      BASE_PRODUCT_NAME: ${{ vars.PERSONAL_DESKTOP_PRODUCT_NAME }}
+      RELAY_EVIDENCE_RUN_ID: ${{ inputs.relay_evidence_run_id }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      STAGING_DEPLOYMENT_RECEIPT_JSON: ${{ vars.PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON }}
+      STAGING_DEPLOYMENT_RECEIPT_SHA256: ${{ inputs.staging_deployment_receipt_sha256 }}
+      TARGET: ${{ inputs.target }}
+      VERSION: ${{ inputs.version }}
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Validate independently approved staging deployment receipt
+        id: deployment
+        run: |
+          set -euo pipefail
+          [[ "$STAGING_DEPLOYMENT_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::staging_deployment_receipt_sha256 must be 64 lowercase hexadecimal characters"
+            exit 1
+          }
+          [[ -n "$STAGING_DEPLOYMENT_RECEIPT_JSON" ]] || {
+            echo "::error::PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON is required in personal-staging"
+            exit 1
+          }
+          canonical_receipt=$(jq -ceS . <<<"$STAGING_DEPLOYMENT_RECEIPT_JSON") || {
+            echo "::error::staging deployment receipt is not valid JSON"
+            exit 1
+          }
+          computed_sha=$(printf '%s' "$STAGING_DEPLOYMENT_RECEIPT_JSON" \
+            | bash ./deploy/personal-relay/canonical-json-sha256.sh)
+          [[ "$computed_sha" == "$STAGING_DEPLOYMENT_RECEIPT_SHA256" ]] || {
+            echo "::error::staging deployment receipt does not match the independently approved SHA-256"
+            exit 1
+          }
+          jq -e '
+            . as $receipt
+            | $receipt.environment == "personal-staging"
+            and ($receipt.https_origin | type == "string" and length > 0)
+            and ($receipt.wss_origin | type == "string" and length > 0)
+            and ($receipt.hosted_https_origin | type == "string" and length > 0)
+            and ($receipt.personal_production_https_origin | type == "string" and length > 0)
+            and ($receipt.forbidden_origins | type == "array" and length >= 2)
+            and all($receipt.forbidden_origins[]; type == "string" and length > 0)
+            and ($receipt.forbidden_origins | index($receipt.hosted_https_origin) != null)
+            and ($receipt.forbidden_origins | index($receipt.personal_production_https_origin) != null)
+            and ($receipt.deployed_relay_image_ref | test("^ghcr\\.io/justinharkelroad/[a-z0-9._-]+@sha256:[0-9a-f]{64}$"))
+            and ($receipt.relay_pubkey | test("^[0-9a-f]{64}$"))
+            and ($receipt.smoke_approval_record_sha256 | test("^[0-9a-f]{64}$"))
+            and $receipt.smoke_passed == true
+            and ($receipt.smoke_completed_at | type == "string" and length > 0)
+            and ($receipt.approved_by | type == "string" and length > 0)
+            and ($receipt.approved_at | type == "string" and length > 0)
+            and ($receipt.evidence_reference | type == "string" and test("^[A-Za-z0-9._:/-]+$"))
+          ' <<<"$canonical_receipt" >/dev/null || {
+            echo "::error::staging deployment receipt is incomplete or invalid"
+            exit 1
+          }
+          node --input-type=module - "$canonical_receipt" <<'NODE'
+          const receipt = JSON.parse(process.argv[2]);
+          const parseHttpsOrigin = (value) => {
+            const url = new URL(value);
+            if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash || value !== url.origin) {
+              throw new Error("invalid HTTPS origin");
+            }
+            return url;
+          };
+          const stagingHttps = parseHttpsOrigin(receipt.https_origin);
+          const hostedHttps = parseHttpsOrigin(receipt.hosted_https_origin);
+          const productionHttps = parseHttpsOrigin(receipt.personal_production_https_origin);
+          const stagingWss = new URL(receipt.wss_origin);
+          if (stagingWss.protocol !== "wss:" || stagingWss.username || stagingWss.password || stagingWss.pathname !== "/" || stagingWss.search || stagingWss.hash || receipt.wss_origin !== stagingWss.origin) {
+            throw new Error("invalid WSS origin");
+          }
+          if (stagingWss.host !== stagingHttps.host || stagingHttps.origin === hostedHttps.origin || stagingHttps.origin === productionHttps.origin || hostedHttps.origin === productionHttps.origin) {
+            throw new Error("staging, hosted, and production origins are not isolated");
+          }
+          const forbidden = new Set(receipt.forbidden_origins.map((origin) => parseHttpsOrigin(origin).origin));
+          if (forbidden.size !== receipt.forbidden_origins.length || !forbidden.has(hostedHttps.origin) || !forbidden.has(productionHttps.origin) || forbidden.has(stagingHttps.origin)) {
+            throw new Error("forbidden-origin receipt does not protect staging");
+          }
+          NODE
+          relay_https=$(jq -r .https_origin <<<"$canonical_receipt")
+          relay_wss=$(jq -r .wss_origin <<<"$canonical_receipt")
+          {
+            echo "BUZZ_RELAY_HTTP=$relay_https"
+            echo "BUZZ_RELAY_URL=$relay_wss"
+          } >> "$GITHUB_ENV"
+          {
+            echo "evidence_reference=$(jq -r .evidence_reference <<<"$canonical_receipt")"
+            echo "image_ref=$(jq -r .deployed_relay_image_ref <<<"$canonical_receipt")"
+            echo "receipt_sha=$computed_sha"
+            echo "relay_pubkey=$(jq -r .relay_pubkey <<<"$canonical_receipt")"
+            echo "smoke_record_sha=$(jq -r .smoke_approval_record_sha256 <<<"$canonical_receipt")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify staging source and configuration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters"
+            exit 1
+          }
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+            echo "::error::source_sha must exactly equal github.sha"
+            exit 1
+          }
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]] || {
+            echo "::error::checkout does not match github.sha"
+            exit 1
+          }
+          [[ "$RELAY_EVIDENCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::relay_evidence_run_id must be a positive integer"
+            exit 1
+          }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::version must be valid semver"
+            exit 1
+          }
+          [[ -n "$BASE_PRODUCT_NAME" ]] || {
+            echo "::error::PERSONAL_DESKTOP_PRODUCT_NAME is required in personal-staging"
+            exit 1
+          }
+          [[ "$BASE_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]+[A-Za-z0-9]$ ]] || {
+            echo "::error::PERSONAL_DESKTOP_BUNDLE_ID is missing or invalid"
+            exit 1
+          }
+          node --input-type=module <<'NODE'
+          const wss = new URL(process.env.BUZZ_RELAY_URL);
+          const https = new URL(process.env.BUZZ_RELAY_HTTP);
+          const cleanOrigin = (url, scheme) =>
+            url.protocol === scheme &&
+            !url.username && !url.password &&
+            (url.pathname === "/" || url.pathname === "") &&
+            !url.search && !url.hash;
+          if (!cleanOrigin(wss, "wss:") || !cleanOrigin(https, "https:") || wss.host !== https.host) {
+            console.error("staging relay URLs must be matching, credential-free WSS and HTTPS origins");
+            process.exit(1);
+          }
+          NODE
+
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RELAY_EVIDENCE_RUN_ID" \
+            > /tmp/personal-relay-workflow-run.json
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            '.head_sha == $source_sha
+              and .head_repository.full_name == $repository
+              and .event == "workflow_dispatch"
+              and .conclusion == "success"
+              and .path == ".github/workflows/personal-relay-image.yml"' \
+            /tmp/personal-relay-workflow-run.json >/dev/null || {
+              echo "::error::relay evidence run is not a successful matching relay publication"
+              exit 1
+            }
+
+      - name: Download matching relay evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: personal-relay-evidence-${{ github.sha }}
+          path: /tmp/personal-relay-evidence
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.relay_evidence_run_id }}
+
+      - name: Validate matching relay ledger and attestation evidence
+        id: relay
+        env:
+          DEPLOYED_RELAY_IMAGE_REF: ${{ steps.deployment.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          ledger=/tmp/personal-relay-evidence/personal-relay-release.json
+          test -s "$ledger"
+          test -s /tmp/personal-relay-evidence/personal-relay-attestation-verification.json
+          test -s /tmp/personal-relay-evidence/personal-relay-attestation-predicate.json
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$RELAY_EVIDENCE_RUN_ID"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_url "$run_url" \
+            --arg source_sha "$SOURCE_SHA" \
+            '.repository == $repository
+              and .source_sha == $source_sha
+              and .workflow_sha == $source_sha
+              and .workflow_run == $run_url
+              and (.image | test("^ghcr\\.io/justinharkelroad/[a-z0-9._-]+$"))
+              and (.digest | test("^sha256:[0-9a-f]{64}$"))
+              and .deployment_ref == (.image + "@" + .digest)' \
+            "$ledger" >/dev/null || {
+              echo "::error::relay evidence ledger does not match this staging source"
+              exit 1
+            }
+          [[ "$(jq -r .deployment_ref "$ledger")" == "$DEPLOYED_RELAY_IMAGE_REF" ]] || {
+            echo "::error::approved staging deployment digest does not match relay evidence"
+            exit 1
+          }
+          {
+            echo "digest=$(jq -r .digest "$ledger")"
+            echo "image=$(jq -r .image "$ledger")"
+            echo "image_ref=$(jq -r .deployment_ref "$ledger")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+
+      - name: Add Rust target
+        run: rustup target add "$TARGET"
+
+      - name: Patch staging artifact version
+        run: |
+          cd desktop
+          node scripts/set-version-from-tag.mjs "$VERSION"
+          cd src-tauri
+          cargo update --workspace
+
+      - name: Generate staging-only Tauri configuration
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+
+          const config = {
+            productName: `${process.env.BASE_PRODUCT_NAME} Staging`,
+            identifier: `${process.env.BASE_BUNDLE_ID}.staging`,
+            bundle: {
+              createUpdaterArtifacts: false,
+              macOS: { minimumSystemVersion: "10.15" },
+            },
+            plugins: { updater: { endpoints: [] } },
+          };
+          writeFileSync(
+            "desktop/src-tauri/tauri.personal-staging.conf.json",
+            `${JSON.stringify(config, null, 2)}\n`,
+          );
+          NODE
+
+      - name: Build matching sidecars
+        run: |
+          cargo build --release --locked --target "$TARGET" \
+            -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+
+      - name: Resolve mesh-llm revision
+        if: inputs.target == 'aarch64-apple-darwin'
+        id: mesh-rev
+        run: |
+          set -euo pipefail
+          revision=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          [[ -n "$revision" ]] || exit 1
+          {
+            echo "rev=$revision"
+            echo "short=${revision:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore mesh native cache
+        if: inputs.target == 'aarch64-apple-darwin'
+        id: mesh-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.cache/mesh-llama
+          key: personal-mesh-llama-${{ runner.os }}-metal-${{ steps.mesh-rev.outputs.rev }}
+
+      - name: Build mesh native libraries
+        if: inputs.target == 'aarch64-apple-darwin' && steps.mesh-cache.outputs.cache-hit != 'true'
+        env:
+          MESH_REV_SHORT: ${{ steps.mesh-rev.outputs.short }}
+        run: |
+          set -euo pipefail
+          cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
+          mesh_root=$(find "${CARGO_HOME:-$HOME/.cargo}/git/checkouts" -path "*/$MESH_REV_SHORT" -type d -name "$MESH_REV_SHORT" -print -quit)
+          [[ -n "$mesh_root" ]] || {
+            echo "::error::mesh-llm checkout not found"
+            exit 1
+          }
+          export LLAMA_STAGE_BACKEND=metal
+          export LLAMA_STAGE_BUILD_DIR="$GITHUB_WORKSPACE/.cache/mesh-llama/build-stage-abi-metal"
+          export CMAKE_OSX_DEPLOYMENT_TARGET=10.15
+          "$mesh_root/scripts/prepare-llama.sh" pinned
+          "$mesh_root/scripts/build-llama.sh" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+
+      - name: Save mesh native cache
+        if: inputs.target == 'aarch64-apple-darwin' && steps.mesh-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ github.workspace }}/.cache/mesh-llama
+          key: personal-mesh-llama-${{ runner.os }}-metal-${{ steps.mesh-rev.outputs.rev }}
+
+      - name: Build unsigned staging package
+        env:
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          LLAMA_STAGE_BACKEND: metal
+          LLAMA_STAGE_BUILD_DIR: ${{ github.workspace }}/.cache/mesh-llama/build-stage-abi-metal
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          SKIPPY_LLAMA_AUTO_BUILD: "0"
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+        run: |
+          set -euo pipefail
+          features=()
+          if [[ "$TARGET" == "aarch64-apple-darwin" ]]; then
+            features=(--features mesh-llm)
+          fi
+          cd desktop
+          pnpm tauri build --verbose --no-sign --target "$TARGET" \
+            "${features[@]}" --config src-tauri/tauri.personal-staging.conf.json
+
+      - name: Verify package and embedded ACP parity
+        id: artifacts
+        run: |
+          set -euo pipefail
+          bundle_dir="desktop/src-tauri/target/${TARGET}/release/bundle"
+          dmg=$(find "$bundle_dir/dmg" -name '*.dmg' -type f -print -quit)
+          app=$(find "$bundle_dir/macos" -maxdepth 1 -name '*.app' -type d -print -quit)
+          dmg_count=$(find "$bundle_dir/dmg" -name '*.dmg' -type f | wc -l | tr -d '[:space:]')
+          app_count=$(find "$bundle_dir/macos" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d '[:space:]')
+          [[ "$dmg_count" -eq 1 && "$app_count" -eq 1 ]] || {
+            echo "::error::expected exactly one DMG and one app bundle"
+            exit 1
+          }
+          source_acp="desktop/src-tauri/binaries/buzz-acp-${TARGET}"
+          embedded_acp=$(find "$app/Contents/MacOS" -maxdepth 1 -name 'buzz-acp*' -type f -print -quit)
+          embedded_acp_count=$(find "$app/Contents/MacOS" -maxdepth 1 -name 'buzz-acp*' -type f | wc -l | tr -d '[:space:]')
+          [[ -f "$source_acp" && "$embedded_acp_count" -eq 1 ]] || {
+            echo "::error::source or embedded buzz-acp is missing or ambiguous"
+            exit 1
+          }
+          source_acp_sha=$(shasum -a 256 "$source_acp" | awk '{print $1}')
+          embedded_acp_sha=$(shasum -a 256 "$embedded_acp" | awk '{print $1}')
+          [[ "$source_acp_sha" == "$embedded_acp_sha" ]] || {
+            echo "::error::embedded buzz-acp does not match the sidecar built from source"
+            exit 1
+          }
+          dmg_sha=$(shasum -a 256 "$dmg" | awk '{print $1}')
+          {
+            printf '%s  %s\n' "$dmg_sha" "$(basename "$dmg")"
+            printf '%s  %s\n' "$source_acp_sha" "buzz-acp-${TARGET}"
+          } > personal-desktop-checksums.txt
+          {
+            echo "acp_sha=$source_acp_sha"
+            echo "dmg=$dmg"
+            echo "dmg_sha=$dmg_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write non-secret staging ledger
+        env:
+          ACP_SHA: ${{ steps.artifacts.outputs.acp_sha }}
+          DMG_SHA: ${{ steps.artifacts.outputs.dmg_sha }}
+          RELAY_DIGEST: ${{ steps.relay.outputs.digest }}
+          RELAY_IMAGE: ${{ steps.relay.outputs.image }}
+          RELAY_IMAGE_REF: ${{ steps.relay.outputs.image_ref }}
+          RELAY_PUBKEY: ${{ steps.deployment.outputs.relay_pubkey }}
+          SMOKE_APPROVAL_RECORD_SHA: ${{ steps.deployment.outputs.smoke_record_sha }}
+          STAGING_DEPLOYMENT_EVIDENCE_REFERENCE: ${{ steps.deployment.outputs.evidence_reference }}
+          STAGING_DEPLOYMENT_RECEIPT_SHA: ${{ steps.deployment.outputs.receipt_sha }}
+        run: |
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg version "$VERSION" \
+            --arg target "$TARGET" \
+            --arg relay_wss "$BUZZ_RELAY_URL" \
+            --arg relay_https "$BUZZ_RELAY_HTTP" \
+            --arg relay_evidence_run_id "$RELAY_EVIDENCE_RUN_ID" \
+            --arg relay_image "$RELAY_IMAGE" \
+            --arg relay_digest "$RELAY_DIGEST" \
+            --arg relay_image_ref "$RELAY_IMAGE_REF" \
+            --arg relay_pubkey "$RELAY_PUBKEY" \
+            --arg staging_deployment_receipt_sha256 "$STAGING_DEPLOYMENT_RECEIPT_SHA" \
+            --arg staging_deployment_evidence_reference "$STAGING_DEPLOYMENT_EVIDENCE_REFERENCE" \
+            --arg smoke_approval_record_sha256 "$SMOKE_APPROVAL_RECORD_SHA" \
+            --arg dmg_sha "$DMG_SHA" \
+            --arg acp_sha "$ACP_SHA" \
+            --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{repository: $repository, source_sha: $source_sha, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha, version: $version, channel: "staging-only", target: $target, relay_wss: $relay_wss, relay_https: $relay_https, relay_evidence_run_id: $relay_evidence_run_id, relay_image: $relay_image, relay_digest: $relay_digest, relay_image_ref: $relay_image_ref, relay_pubkey: $relay_pubkey, staging_deployment_receipt_sha256: $staging_deployment_receipt_sha256, staging_deployment_evidence_reference: $staging_deployment_evidence_reference, smoke_approval_record_sha256: $smoke_approval_record_sha256, dmg_sha256: $dmg_sha, buzz_acp_sha256: $acp_sha, unsigned: true, updater_enabled: false, production_eligible: false, installed: false, published: false, workflow_run: $workflow_run}' \
+            > personal-desktop-staging.json
+
+      - name: Resolve staging artifact name
+        id: artifact-name
+        run: echo "name=personal-desktop-staging-${TARGET}-${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned staging package and evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: |
+            ${{ steps.artifacts.outputs.dmg }}
+            personal-desktop-checksums.txt
+            personal-desktop-staging.json
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest unsigned staging candidate
+    if: github.repository == 'justinharkelroad/buzz'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Download staging artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: /tmp/personal-desktop-staging
+
+      - name: Resolve DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          mapfile -t dmg_files < <(find /tmp/personal-desktop-staging -name '*.dmg' -type f)
+          [[ ${#dmg_files[@]} -eq 1 ]] || {
+            echo "::error::expected exactly one staging DMG"
+            exit 1
+          }
+          echo "path=${dmg_files[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest staging DMG provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: ${{ steps.dmg.outputs.path }}
+
+      - name: Verify repository-scoped attestation and inspect predicate
+        env:
+          DMG_PATH: ${{ steps.dmg.outputs.path }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "$DMG_PATH" \
+            -R "$GITHUB_REPOSITORY" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners \
+            --format json > personal-desktop-attestation-verification.json
+          jq -e 'length > 0' personal-desktop-attestation-verification.json >/dev/null
+          jq '[.[].verificationResult.statement.predicate]' \
+            personal-desktop-attestation-verification.json \
+            > personal-desktop-attestation-predicate.json
+
+      - name: Upload attestation inspection evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-desktop-staging-attestation-${{ inputs.target }}-${{ github.sha }}
+          path: |
+            personal-desktop-attestation-predicate.json
+            personal-desktop-attestation-verification.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        env:
+          RELAY_EVIDENCE_RUN_ID: ${{ inputs.relay_evidence_run_id }}
+        run: |
+          {
+            echo "### Personal desktop staging candidate"
+            echo
+            echo "Source: \`$GITHUB_SHA\`"
+            echo
+            echo "Relay evidence run: \`$RELAY_EVIDENCE_RUN_ID\`"
+            echo
+            echo "This is unsigned, staging-only, and not eligible for production installation."
+            echo
+            echo "This workflow does not install, publish an updater feed, deploy, or change hosted Buzz."
+          } >> "$GITHUB_STEP_SUMMARY"

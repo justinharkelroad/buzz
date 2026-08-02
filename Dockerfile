@@ -170,6 +170,24 @@ COPY --from=builder /build/target/release/buzz-relay /usr/local/bin/buzz-relay
 COPY --from=builder /build/target/release/buzz-admin /usr/local/bin/buzz-admin
 COPY --from=builder /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
 
+# Railway mounts the personal relay's Git volume as root. This opt-in target
+# starts through a fixed-path wrapper that adjusts only /data/git and then
+# drops to UID/GID 1000. The normal runtime targets remain non-root.
+FROM runtime-base AS runtime-personal
+USER root:root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=stripped-binaries /build/target/release/buzz-relay /usr/local/bin/buzz-relay
+COPY --from=stripped-binaries /build/target/release/buzz-admin /usr/local/bin/buzz-admin
+COPY --from=stripped-binaries /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
+COPY --chmod=0755 deploy/personal-relay/git-volume-entrypoint.sh /usr/local/bin/personal-relay-entrypoint
+COPY --chmod=0755 deploy/personal-relay/migrate.sh /usr/local/bin/personal-relay-migrate
+ENV BUZZ_GIT_REPO_PATH=/data/git \
+    HOME=/var/lib/buzz
+ENTRYPOINT ["/usr/local/bin/personal-relay-entrypoint"]
+CMD ["/usr/local/bin/buzz-relay"]
+
 # Keep the stripped runtime as the final/default Dockerfile target so existing
 # `docker build .` callers and release tags retain their current behavior.
 FROM runtime-base AS runtime
