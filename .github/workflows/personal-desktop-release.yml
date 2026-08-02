@@ -290,7 +290,8 @@ jobs:
       - name: Build matching sidecars
         run: |
           cargo build --release --locked --target "$TARGET" \
-            -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+            -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp \
+            -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
 
       - name: Resolve mesh-llm revision

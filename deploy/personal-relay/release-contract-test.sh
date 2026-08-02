@@ -5,6 +5,8 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 receipt="$repo_root/deploy/personal-relay/staging-deployment-receipt.example.json"
 hash_helper="$repo_root/deploy/personal-relay/canonical-json-sha256.sh"
 desktop_workflow="$repo_root/.github/workflows/personal-desktop-release.yml"
+bundle_script="$repo_root/scripts/bundle-sidecars.sh"
+tauri_config="$repo_root/desktop/src-tauri/tauri.conf.json"
 release_runbook="$repo_root/docs/personal-relay-release.md"
 deploy_runbook="$repo_root/deploy/personal-relay/README.md"
 
@@ -22,5 +24,8 @@ actual=$(bash "$hash_helper" "$receipt")
 grep -Fq 'canonical-json-sha256.sh' "$desktop_workflow"
 grep -Fq 'canonical-json-sha256.sh approved-staging-deployment.json' "$release_runbook"
 grep -Fq 'canonical-json-sha256.sh approved-staging-deployment.json' "$deploy_runbook"
+grep -Fq -- '-p buzz-backend-kubernetes' "$desktop_workflow"
+grep -Fq 'SIDECARS+=(buzz-backend-kubernetes)' "$bundle_script"
+grep -Fq '"binaries/buzz-backend-kubernetes"' "$tauri_config"
 
 printf '%s\n' "personal relay release contracts passed"
