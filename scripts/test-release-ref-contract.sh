@@ -53,6 +53,43 @@ fi
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/release.yml"
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/docker.yml"
 grep -q 'test-release-ref-contract\.sh' "$repo_root/.github/workflows/ci.yml"
+
+# Pull requests may read public registry caches, but must never export to them.
+# Fork-owned repositories still see their own PRs as same-repository events, so
+# checking head.repo is not a sufficient write guard for Block-owned caches.
+while IFS=: read -r workflow line _; do
+  cache_to_block=$(awk -v start="$line" '
+    NR < start { next }
+    NR == start {
+      prefix = $0
+      sub(/[^ ].*$/, "", prefix)
+      indent = length(prefix)
+      print
+      next
+    }
+    {
+      prefix = $0
+      sub(/[^ ].*$/, "", prefix)
+      if ($0 !~ /^[[:space:]]*$/ && length(prefix) <= indent) {
+        exit
+      }
+      print
+    }
+  ' "$workflow")
+  cache_to_scalar=${cache_to_block#*:}
+  cache_to_scalar=$(printf '%s' "$cache_to_scalar" | tr -d '[:space:]')
+  cache_to_scalar=${cache_to_scalar#|}
+  if [[ "$cache_to_scalar" == *"type=registry"* ]]; then
+    canonical_prefix="\${{github.event_name!='pull_request'&&"
+    canonical_suffix="||''}}"
+    if [[ "$cache_to_scalar" != "$canonical_prefix"* ]] ||
+      [[ "$cache_to_scalar" != *"$canonical_suffix" ]]; then
+      echo "registry cache-to must use the canonical non-PR guard: $workflow:$line" >&2
+      exit 1
+    fi
+  fi
+done < <(rg -n --no-heading '^[[:space:]]+cache-to:' "$repo_root/.github/workflows")
+
 "$repo_root/scripts/test-signed-canary-contract.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
 grep -q 'actions/create-github-app-token@' "$auto_tag"
