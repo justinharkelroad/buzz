@@ -388,13 +388,71 @@ CREATE TABLE workflow_runs (
     completed_at        TIMESTAMPTZ,
     error_message       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    webhook_idempotency_key VARCHAR(256),
+    webhook_payload_hash BYTEA,
+    webhook_credential_salt BYTEA,
+    webhook_credential_hash BYTEA,
+    webhook_channel_id  UUID,
+    webhook_definition  JSONB,
+    webhook_definition_hash BYTEA,
+    webhook_execution_lease_id UUID,
+    webhook_execution_lease_expires_at TIMESTAMPTZ,
     PRIMARY KEY (community_id, id),
     FOREIGN KEY (community_id, workflow_id)
-        REFERENCES workflows (community_id, id) ON DELETE CASCADE
+        REFERENCES workflows (community_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (community_id, webhook_channel_id)
+        REFERENCES channels (community_id, id),
+    CHECK (
+        (webhook_idempotency_key IS NULL) = (webhook_payload_hash IS NULL)
+        AND (webhook_idempotency_key IS NULL) = (webhook_credential_salt IS NULL)
+        AND (webhook_idempotency_key IS NULL) = (webhook_credential_hash IS NULL)
+        AND (webhook_idempotency_key IS NULL) = (webhook_channel_id IS NULL)
+        AND (webhook_idempotency_key IS NULL) = (webhook_definition IS NULL)
+        AND (webhook_idempotency_key IS NULL) = (webhook_definition_hash IS NULL)
+    ),
+    CHECK (
+        webhook_idempotency_key IS NULL
+        OR webhook_idempotency_key ~ '^[A-Za-z0-9:_-]+$'
+    ),
+    CHECK (webhook_payload_hash IS NULL OR length(webhook_payload_hash) = 32),
+    CHECK (webhook_credential_salt IS NULL OR length(webhook_credential_salt) = 16),
+    CHECK (webhook_credential_hash IS NULL OR length(webhook_credential_hash) = 32),
+    CHECK (webhook_definition_hash IS NULL OR length(webhook_definition_hash) = 32),
+    CHECK (
+        (webhook_execution_lease_id IS NULL)
+            = (webhook_execution_lease_expires_at IS NULL)
+    ),
+    CHECK (
+        webhook_execution_lease_id IS NULL OR webhook_idempotency_key IS NOT NULL
+    )
 );
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE UNIQUE INDEX idx_workflow_runs_webhook_idempotency
+    ON workflow_runs (community_id, workflow_id, webhook_idempotency_key)
+    WHERE webhook_idempotency_key IS NOT NULL;
+
+CREATE FUNCTION prevent_keyed_workflow_run_delete()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.webhook_idempotency_key IS NOT NULL THEN
+        RAISE EXCEPTION
+            'cannot delete durable keyed webhook workflow run %/%',
+            OLD.workflow_id,
+            OLD.webhook_idempotency_key
+            USING ERRCODE = '23503';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER trg_prevent_keyed_workflow_run_delete
+    BEFORE DELETE ON workflow_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_keyed_workflow_run_delete();
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 -- token-hash lookup scoped: approval token grants cannot act on another

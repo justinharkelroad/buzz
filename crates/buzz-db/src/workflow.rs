@@ -222,6 +222,75 @@ pub struct WorkflowRunRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Durable webhook identity and run state for one idempotent webhook request.
+#[derive(Debug, Clone)]
+pub struct WebhookWorkflowRunRecord {
+    /// The underlying workflow run.
+    pub run: WorkflowRunRecord,
+    /// Caller-provided idempotency key, scoped by community and workflow.
+    pub idempotency_key: String,
+    /// SHA-256 digest of the exact webhook request body.
+    pub payload_hash: Vec<u8>,
+    /// Per-run salt for the immutable replay credential verifier.
+    pub credential_salt: Vec<u8>,
+    /// One-way verifier for the webhook credential accepted at run creation.
+    pub credential_hash: Vec<u8>,
+    /// Immutable channel authority snapshot captured when the run was created.
+    pub channel_id: Uuid,
+    /// Immutable workflow definition used if a pending handoff is recovered.
+    pub definition: serde_json::Value,
+    /// Definition hash captured with [`Self::definition`].
+    pub definition_hash: Vec<u8>,
+}
+
+/// Result of atomically claiming a webhook idempotency key.
+#[derive(Debug, Clone)]
+pub enum WebhookWorkflowRunClaim {
+    /// This caller created the run and may compete for its execution lease.
+    Created(WebhookWorkflowRunRecord),
+    /// The same key and payload already name a run; an expired pending lease may
+    /// be reclaimed, but a running or terminal run must not restart.
+    Existing(WebhookWorkflowRunRecord),
+    /// The key already exists with a different payload hash.
+    PayloadConflict(WebhookWorkflowRunRecord),
+}
+
+/// Immutable inputs used to create or resolve one keyed webhook run.
+#[derive(Debug, Clone, Copy)]
+pub struct WebhookWorkflowRunClaimRequest<'a> {
+    /// Community resolved from the request host.
+    pub community_id: CommunityId,
+    /// Webhook workflow UUID from the route.
+    pub workflow_id: Uuid,
+    /// Channel authority snapshot captured for this run.
+    pub channel_id: Uuid,
+    /// Workflow definition snapshot used for crash recovery.
+    pub definition: &'a serde_json::Value,
+    /// Hash paired with the immutable definition snapshot.
+    pub definition_hash: &'a [u8],
+    /// Caller-provided idempotency key.
+    pub idempotency_key: &'a str,
+    /// SHA-256 digest of the exact request body.
+    pub payload_hash: &'a [u8],
+    /// Per-run salt for the immutable replay credential verifier.
+    pub credential_salt: &'a [u8],
+    /// One-way verifier for the webhook credential accepted at run creation.
+    pub credential_hash: &'a [u8],
+    /// Immutable trigger context derived from the exact request body.
+    pub trigger_context: Option<&'a serde_json::Value>,
+}
+
+/// Fenced lease authorizing one process to start a pending webhook run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookWorkflowRunExecutionLease {
+    /// Durable run that may be started.
+    pub run_id: Uuid,
+    /// Unique fencing token required for the pending-to-running transition.
+    pub lease_id: Uuid,
+    /// Database time after which an exact webhook replay may reclaim the run.
+    pub expires_at: DateTime<Utc>,
+}
+
 /// A winning scheduled workflow fire claim.
 ///
 /// The primary identity is `(workflow_id, scheduled_for)`. `community_id` is
@@ -821,6 +890,249 @@ pub async fn create_workflow_run(
     Ok(id)
 }
 
+/// Atomically create or resolve a webhook workflow run by its durable key.
+///
+/// The uniqueness boundary is `(community_id, workflow_id, idempotency_key)`.
+/// A reused key with a different payload is returned as
+/// [`WebhookWorkflowRunClaim::PayloadConflict`] and never creates a second run.
+/// Creation alone does not authorize execution; callers must separately acquire
+/// a fenced lease with [`claim_webhook_workflow_run_execution`].
+pub async fn claim_webhook_workflow_run(
+    pool: &PgPool,
+    request: WebhookWorkflowRunClaimRequest<'_>,
+) -> Result<WebhookWorkflowRunClaim> {
+    let WebhookWorkflowRunClaimRequest {
+        community_id,
+        workflow_id,
+        channel_id,
+        definition,
+        definition_hash,
+        idempotency_key,
+        payload_hash,
+        credential_salt,
+        credential_hash,
+        trigger_context,
+    } = request;
+    let id = Uuid::new_v4();
+    let inserted = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        INSERT INTO workflow_runs (
+            community_id,
+            id,
+            workflow_id,
+            status,
+            current_step,
+            execution_trace,
+            trigger_context,
+            webhook_idempotency_key,
+            webhook_payload_hash,
+            webhook_credential_salt,
+            webhook_credential_hash,
+            webhook_channel_id,
+            webhook_definition,
+            webhook_definition_hash
+        )
+        VALUES ($1, $2, $3, 'pending', 0, '[]', $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (community_id, workflow_id, webhook_idempotency_key)
+            WHERE webhook_idempotency_key IS NOT NULL
+        DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(workflow_id)
+    .bind(trigger_context)
+    .bind(idempotency_key)
+    .bind(payload_hash)
+    .bind(credential_salt)
+    .bind(credential_hash)
+    .bind(channel_id)
+    .bind(definition)
+    .bind(definition_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    let record = get_webhook_workflow_run(pool, community_id, workflow_id, idempotency_key)
+        .await?
+        .ok_or_else(|| {
+            DbError::NotFound(format!(
+                "webhook workflow run {workflow_id}/{idempotency_key}"
+            ))
+        })?;
+
+    if inserted.is_some() {
+        return Ok(WebhookWorkflowRunClaim::Created(record));
+    }
+    if record.payload_hash.as_slice() != payload_hash {
+        return Ok(WebhookWorkflowRunClaim::PayloadConflict(record));
+    }
+    Ok(WebhookWorkflowRunClaim::Existing(record))
+}
+
+/// Fetch one webhook run by community, workflow, and caller idempotency key.
+pub async fn get_webhook_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<WebhookWorkflowRunRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT community_id, id, workflow_id, status::text AS status,
+               trigger_event_id, current_step, execution_trace, trigger_context,
+               started_at, completed_at, error_message, created_at,
+               webhook_idempotency_key, webhook_payload_hash,
+               webhook_credential_salt, webhook_credential_hash,
+               webhook_channel_id, webhook_definition, webhook_definition_hash
+        FROM workflow_runs
+        WHERE community_id = $1
+          AND workflow_id = $2
+          AND webhook_idempotency_key = $3
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(workflow_id)
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(row_to_webhook_run_record).transpose()
+}
+
+/// Claim a time-bounded lease to start one pending webhook workflow run.
+///
+/// The update is atomic, so concurrent requests have at most one winner. An
+/// exact replay may reclaim a lease after expiry, recovering a process crash
+/// between durable run creation and task start.
+pub async fn claim_webhook_workflow_run_execution(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    lease_seconds: i64,
+) -> Result<Option<WebhookWorkflowRunExecutionLease>> {
+    if lease_seconds <= 0 {
+        return Err(DbError::InvalidData(
+            "webhook execution lease must be positive".to_owned(),
+        ));
+    }
+    let lease_id = Uuid::new_v4();
+    let row = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET webhook_execution_lease_id = $3,
+            webhook_execution_lease_expires_at =
+                NOW() + ($4::bigint * INTERVAL '1 second')
+        WHERE community_id = $1
+          AND id = $2
+          AND webhook_idempotency_key IS NOT NULL
+          AND status = 'pending'
+          AND (
+              webhook_execution_lease_expires_at IS NULL
+              OR webhook_execution_lease_expires_at <= NOW()
+          )
+        RETURNING id, webhook_execution_lease_id, webhook_execution_lease_expires_at
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(lease_id)
+    .bind(lease_seconds)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        Ok(WebhookWorkflowRunExecutionLease {
+            run_id: row.try_get("id")?,
+            lease_id: row.try_get("webhook_execution_lease_id")?,
+            expires_at: row.try_get("webhook_execution_lease_expires_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Consume the current lease and atomically transition its pending run to running.
+///
+/// Returns `false` for an expired, superseded, already-started, or wrong-tenant
+/// token. This is the execution fence: a delayed stale process cannot begin
+/// workflow effects after another replay has reclaimed the run.
+pub async fn start_webhook_workflow_run_execution(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    lease_id: Uuid,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'running',
+            started_at = COALESCE(started_at, NOW()),
+            webhook_execution_lease_id = NULL,
+            webhook_execution_lease_expires_at = NULL
+        WHERE community_id = $1
+          AND id = $2
+          AND status = 'pending'
+          AND webhook_execution_lease_id = $3
+          AND webhook_execution_lease_expires_at > NOW()
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(lease_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+/// Atomically terminalize a pending keyed webhook run that is no longer
+/// authorized to start.
+///
+/// A running run is never modified: once execution has crossed the start fence,
+/// callers must not guess whether side effects happened. Returns `true` only
+/// when this call changed a pending run to cancelled.
+pub async fn cancel_pending_webhook_workflow_run_execution(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    reason: &str,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, NOW()),
+            error_message = $3,
+            webhook_execution_lease_id = NULL,
+            webhook_execution_lease_expires_at = NULL
+        WHERE community_id = $1
+          AND id = $2
+          AND webhook_idempotency_key IS NOT NULL
+          AND status = 'pending'
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(reason)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+impl crate::Db {
+    /// Atomically cancel a pending keyed webhook run that may no longer start.
+    pub async fn cancel_pending_webhook_workflow_run_execution(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        reason: &str,
+    ) -> Result<bool> {
+        cancel_pending_webhook_workflow_run_execution(&self.pool, community_id, run_id, reason)
+            .await
+    }
+}
+
 /// Fetch a single workflow run by ID, scoped to its community.
 pub async fn get_workflow_run(
     pool: &PgPool,
@@ -1169,6 +1481,27 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         completed_at: row.try_get("completed_at")?,
         error_message: row.try_get("error_message")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn row_to_webhook_run_record(row: sqlx::postgres::PgRow) -> Result<WebhookWorkflowRunRecord> {
+    let idempotency_key = row.try_get("webhook_idempotency_key")?;
+    let payload_hash = row.try_get("webhook_payload_hash")?;
+    let credential_salt = row.try_get("webhook_credential_salt")?;
+    let credential_hash = row.try_get("webhook_credential_hash")?;
+    let channel_id = row.try_get("webhook_channel_id")?;
+    let definition = row.try_get("webhook_definition")?;
+    let definition_hash = row.try_get("webhook_definition_hash")?;
+    let run = row_to_run_record(row)?;
+    Ok(WebhookWorkflowRunRecord {
+        run,
+        idempotency_key,
+        payload_hash,
+        credential_salt,
+        credential_hash,
+        channel_id,
+        definition,
+        definition_hash,
     })
 }
 
@@ -1888,6 +2221,365 @@ mod tests {
         assert_eq!(
             winners, 1,
             "exactly one task must win the claim race for (workflow_id, scheduled_for)"
+        );
+    }
+
+    /// A webhook key is durable within one community/workflow, binds one exact
+    /// body hash, and does not collide with the same workflow UUID in another
+    /// community.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_idempotency_is_payload_bound_and_community_confined() {
+        let pool = setup_pool().await;
+        let community_a = make_community(&pool).await;
+        let community_b = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        let channel_a = Uuid::new_v4();
+        let channel_b = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community_a, workflow_id, channel_a, "webhook-A").await;
+        insert_workflow_with_ids(&pool, community_b, workflow_id, channel_b, "webhook-B").await;
+
+        let key = "agency-brain:synthetic-1";
+        let hash_a = Sha256::digest(b"{\"message\":\"one\"}");
+        let trigger_a = serde_json::json!({"channel_id": channel_a.to_string()});
+        let definition = serde_json::json!({"trigger":{"on":"webhook"},"steps":[]});
+        let definition_hash =
+            Sha256::digest(serde_json::to_vec(&definition).expect("serialize definition")).to_vec();
+        let credential_salt = [0x11u8; 16];
+        let credential_hash = [0x22u8; 32];
+        let first = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community_a,
+                workflow_id,
+                channel_id: channel_a,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: key,
+                payload_hash: hash_a.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger_a),
+            },
+        )
+        .await
+        .expect("first claim");
+        let first_id = match first {
+            WebhookWorkflowRunClaim::Created(record) => {
+                assert_eq!(record.channel_id, channel_a);
+                record.run.id
+            }
+            other => panic!("first claim must create, got {other:?}"),
+        };
+
+        let replay = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community_a,
+                workflow_id,
+                channel_id: channel_a,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: key,
+                payload_hash: hash_a.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger_a),
+            },
+        )
+        .await
+        .expect("same-payload replay");
+        match replay {
+            WebhookWorkflowRunClaim::Existing(record) => {
+                assert_eq!(record.run.id, first_id, "replay must resolve original run")
+            }
+            other => panic!("same-payload replay must resolve existing, got {other:?}"),
+        }
+
+        let hash_b = Sha256::digest(b"{\"message\":\"different\"}");
+        let conflict = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community_a,
+                workflow_id,
+                channel_id: channel_a,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: key,
+                payload_hash: hash_b.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger_a),
+            },
+        )
+        .await
+        .expect("different-payload replay");
+        match conflict {
+            WebhookWorkflowRunClaim::PayloadConflict(record) => {
+                assert_eq!(
+                    record.run.id, first_id,
+                    "conflict must identify original run"
+                )
+            }
+            other => panic!("different payload must conflict, got {other:?}"),
+        }
+
+        let trigger_b = serde_json::json!({"channel_id": channel_b.to_string()});
+        let other_community = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community_b,
+                workflow_id,
+                channel_id: channel_b,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: key,
+                payload_hash: hash_a.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger_b),
+            },
+        )
+        .await
+        .expect("other-community claim");
+        match other_community {
+            WebhookWorkflowRunClaim::Created(record) => {
+                assert_ne!(record.run.id, first_id, "community B needs its own run")
+            }
+            other => panic!("community B must not collide with A, got {other:?}"),
+        }
+
+        let moved_channel = make_channel(&pool, community_a, &[0xb2; 32]).await;
+        sqlx::query("UPDATE workflows SET channel_id = $1 WHERE community_id = $2 AND id = $3")
+            .bind(moved_channel)
+            .bind(community_a.as_uuid())
+            .bind(workflow_id)
+            .execute(&pool)
+            .await
+            .expect("move workflow channel");
+        let after_move = get_webhook_workflow_run(&pool, community_a, workflow_id, key)
+            .await
+            .expect("load run after workflow move")
+            .expect("run exists after workflow move");
+        assert_eq!(
+            after_move.channel_id, channel_a,
+            "run authority must remain bound to its immutable creation channel"
+        );
+        assert_eq!(
+            after_move.definition, definition,
+            "run recovery must retain its immutable creation definition"
+        );
+        assert_eq!(after_move.definition_hash, definition_hash);
+        assert_eq!(
+            Sha256::digest(
+                serde_json::to_vec(&after_move.definition).expect("serialize stored definition")
+            )
+            .as_slice(),
+            after_move.definition_hash,
+            "JSONB round-trip must preserve the canonical execution snapshot hash"
+        );
+
+        let direct_delete_error =
+            sqlx::query("DELETE FROM workflow_runs WHERE community_id = $1 AND id = $2")
+                .bind(community_a.as_uuid())
+                .bind(first_id)
+                .execute(&pool)
+                .await
+                .expect_err("direct keyed-run deletion must be blocked");
+        assert_eq!(
+            direct_delete_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23503")
+        );
+
+        let workflow_delete_error =
+            sqlx::query("DELETE FROM workflows WHERE community_id = $1 AND id = $2")
+                .bind(community_a.as_uuid())
+                .bind(workflow_id)
+                .execute(&pool)
+                .await
+                .expect_err("workflow cascade must not erase a keyed run");
+        assert_eq!(
+            workflow_delete_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("23503")
+        );
+        assert!(
+            get_webhook_workflow_run(&pool, community_a, workflow_id, key)
+                .await
+                .expect("load guarded keyed run")
+                .is_some(),
+            "failed delete attempts must preserve the durable identity"
+        );
+    }
+
+    /// A process crash after durable run creation but before task start is
+    /// recovered by an expired-lease replay. Concurrent replays have one lease
+    /// winner, and the superseded token cannot cross the pending-to-running
+    /// fence.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_execution_lease_recovers_pre_spawn_crash_and_fences_stale_holder() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        insert_workflow_with_ids(&pool, community, workflow_id, channel_id, "webhook-lease").await;
+        let trigger = serde_json::json!({"channel_id": channel_id.to_string()});
+        let hash = Sha256::digest(b"{\"message\":\"lease\"}");
+        let definition = serde_json::json!({"trigger":{"on":"webhook"},"steps":[]});
+        let definition_hash =
+            Sha256::digest(serde_json::to_vec(&definition).expect("serialize definition")).to_vec();
+        let credential_salt = [0x33u8; 16];
+        let credential_hash = [0x44u8; 32];
+        let claim = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community,
+                workflow_id,
+                channel_id,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: "agency-brain:lease-1",
+                payload_hash: hash.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger),
+            },
+        )
+        .await
+        .expect("create keyed run");
+        let run_id = match claim {
+            WebhookWorkflowRunClaim::Created(record) => record.run.id,
+            other => panic!("first claim must create, got {other:?}"),
+        };
+
+        let stale_lease = claim_webhook_workflow_run_execution(&pool, community, run_id, 60)
+            .await
+            .expect("claim initial lease")
+            .expect("initial lease wins");
+        assert!(
+            claim_webhook_workflow_run_execution(&pool, community, run_id, 60)
+                .await
+                .expect("second active-lease claim")
+                .is_none(),
+            "an active lease must have exactly one holder"
+        );
+
+        // Simulate the holder crashing before tokio::spawn starts and its
+        // durable handoff lease subsequently expiring.
+        sqlx::query(
+            "UPDATE workflow_runs SET webhook_execution_lease_expires_at = NOW() - INTERVAL '1 second' WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("expire crashed holder lease");
+
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let (claim_a, claim_b) = tokio::join!(
+            claim_webhook_workflow_run_execution(&pool_a, community, run_id, 60),
+            claim_webhook_workflow_run_execution(&pool_b, community, run_id, 60),
+        );
+        let winners: Vec<_> = [
+            claim_a.expect("concurrent claim A"),
+            claim_b.expect("concurrent claim B"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(winners.len(), 1, "concurrent recovery must have one winner");
+        let recovery_lease = &winners[0];
+        assert_ne!(recovery_lease.lease_id, stale_lease.lease_id);
+        assert!(
+            !start_webhook_workflow_run_execution(&pool, community, run_id, stale_lease.lease_id,)
+                .await
+                .expect("stale start check"),
+            "superseded lease token must be fenced"
+        );
+        assert!(
+            start_webhook_workflow_run_execution(
+                &pool,
+                community,
+                run_id,
+                recovery_lease.lease_id,
+            )
+            .await
+            .expect("recovery start"),
+            "current recovery lease must start the run"
+        );
+        assert!(
+            claim_webhook_workflow_run_execution(&pool, community, run_id, 60)
+                .await
+                .expect("post-start claim")
+                .is_none(),
+            "a running run cannot be claimed again"
+        );
+
+        let cancel_claim = claim_webhook_workflow_run(
+            &pool,
+            WebhookWorkflowRunClaimRequest {
+                community_id: community,
+                workflow_id,
+                channel_id,
+                definition: &definition,
+                definition_hash: &definition_hash,
+                idempotency_key: "agency-brain:lease-cancelled",
+                payload_hash: hash.as_slice(),
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: Some(&trigger),
+            },
+        )
+        .await
+        .expect("create pending run for cancellation");
+        let cancel_run_id = match cancel_claim {
+            WebhookWorkflowRunClaim::Created(record) => record.run.id,
+            other => panic!("cancellation claim must create, got {other:?}"),
+        };
+        let cancel_lease =
+            claim_webhook_workflow_run_execution(&pool, community, cancel_run_id, 60)
+                .await
+                .expect("claim cancellation lease")
+                .expect("cancellation lease wins");
+        assert!(cancel_pending_webhook_workflow_run_execution(
+            &pool,
+            community,
+            cancel_run_id,
+            "authority denied",
+        )
+        .await
+        .expect("cancel pending run"));
+        assert!(
+            !start_webhook_workflow_run_execution(
+                &pool,
+                community,
+                cancel_run_id,
+                cancel_lease.lease_id,
+            )
+            .await
+            .expect("cancelled start check"),
+            "cancellation must fence a previously-issued lease"
+        );
+        let cancelled = get_webhook_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            "agency-brain:lease-cancelled",
+        )
+        .await
+        .expect("load cancelled run")
+        .expect("cancelled run exists");
+        assert_eq!(cancelled.run.status, RunStatus::Cancelled);
+        assert_eq!(
+            cancelled.run.error_message.as_deref(),
+            Some("authority denied")
         );
     }
 

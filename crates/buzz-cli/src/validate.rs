@@ -25,6 +25,22 @@ pub fn validate_uuid(s: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Validate a webhook idempotency key accepted by the relay.
+pub fn validate_idempotency_key(s: &str) -> Result<(), CliError> {
+    if s.is_empty()
+        || s.len() > 256
+        || !s
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+    {
+        return Err(CliError::Usage(
+            "idempotency key must be 1-256 ASCII letters, digits, colons, underscores, or hyphens"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate 64-character lowercase hex string (event_id, pubkey).
 pub fn validate_hex64(s: &str) -> Result<(), CliError> {
     if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -218,6 +234,17 @@ mod tests {
     fn validate_uuid_empty() {
         let err = validate_uuid("").unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn validate_idempotency_key_accepts_reconciler_keys() {
+        assert!(validate_idempotency_key("agency-brain:run_123-4").is_ok());
+    }
+
+    #[test]
+    fn validate_idempotency_key_rejects_spaces_and_empty_values() {
+        assert!(validate_idempotency_key("").is_err());
+        assert!(validate_idempotency_key("run with spaces").is_err());
     }
 
     // --- validate_hex64 ---

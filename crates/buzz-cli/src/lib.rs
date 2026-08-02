@@ -917,6 +917,9 @@ pub enum WorkflowsCmd {
         /// Workflow UUID
         #[arg(long)]
         workflow: String,
+        /// Resolve one durable webhook run by its idempotency key
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
