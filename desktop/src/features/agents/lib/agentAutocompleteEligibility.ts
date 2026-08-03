@@ -1,4 +1,4 @@
-import type { Channel, RelayAgent } from "@/shared/api/types";
+import type { Channel, ChannelType, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
@@ -61,6 +61,38 @@ export function isAgentIdentityInManagedList(
   return (
     candidate.isAgent !== true ||
     managedAgentPubkeys.has(normalizePubkey(candidate.pubkey))
+  );
+}
+
+/**
+ * Whether relay membership grants a verified foreign agent access to mention
+ * autocomplete in the channel currently being composed into.
+ *
+ * This is intentionally narrower than general relay-directory discovery:
+ * membership must come from the active channel, the identity must already be
+ * classified as an agent by authoritative member/profile data, and DMs never
+ * grant this access. Runtime ACP policy remains responsible for deciding
+ * whether the resulting p-tag is actionable by that agent.
+ */
+export function isVerifiedAgentMemberOfActiveRegularChannel({
+  channelId,
+  channelType,
+  isAgent,
+  isMember,
+  isVerifiedAgent,
+}: {
+  channelId: string | null;
+  channelType: ChannelType | null | undefined;
+  isAgent: boolean;
+  isMember: boolean;
+  isVerifiedAgent: boolean;
+}) {
+  return (
+    Boolean(channelId) &&
+    (channelType === "stream" || channelType === "forum") &&
+    isAgent &&
+    isMember &&
+    isVerifiedAgent
   );
 }
 

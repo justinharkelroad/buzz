@@ -28,6 +28,8 @@ const CASEY_PROFILE_PUBKEY =
   "1111111111111111111111111111111111111111111111111111111111111111";
 const PROFILE_ONLY_AGENT_PUBKEY =
   "8f83d6b7f3d74f7d933ae3a54dd8c6cc85c7f98e531c16e5a827b953441a8d67";
+const EXPLICIT_POLICY_AGENT_PUBKEY =
+  "7777777777777777777777777777777777777777777777777777777777777777";
 const OWNED_AGENT_PROFILE_PUBKEY =
   "1212121212121212121212121212121212121212121212121212121212121212";
 const SYSTEM_MESSAGE_KIND = 40099;
@@ -209,7 +211,7 @@ test("@ trigger prioritizes channel members before runnable personas and other m
 
   const dropdown = autocomplete(page);
   await expect(dropdown).toBeVisible();
-  await expect(dropdown.getByText("alice")).toHaveCount(0);
+  await expect(dropdown.getByText("alice")).toBeVisible();
   await expect(dropdown.getByText("bob")).toBeVisible();
   await expect(dropdown.getByText("Fizz")).toBeVisible();
   await expect(dropdown.getByText("charlie")).toBeVisible();
@@ -225,6 +227,7 @@ test("@ trigger prioritizes channel members before runnable personas and other m
 
   const suggestions = dropdown.locator("button");
   const suggestionText = await suggestions.allInnerTexts();
+  const aliceIndex = suggestionText.findIndex((text) => text.includes("alice"));
   const fizzIndex = suggestionText.findIndex((text) => text.includes("Fizz"));
   const bobIndex = suggestionText.findIndex((text) => text.includes("bob"));
   const charlieIndex = suggestionText.findIndex((text) =>
@@ -233,10 +236,12 @@ test("@ trigger prioritizes channel members before runnable personas and other m
   const outsiderIndex = suggestionText.findIndex((text) =>
     text.includes("outsider"),
   );
+  expect(aliceIndex).toBeGreaterThanOrEqual(0);
   expect(fizzIndex).toBeGreaterThanOrEqual(0);
   expect(bobIndex).toBeGreaterThanOrEqual(0);
   expect(charlieIndex).toBeGreaterThanOrEqual(0);
   expect(outsiderIndex).toEqual(-1);
+  expect(aliceIndex).toBeLessThan(fizzIndex);
   expect(bobIndex).toBeLessThan(fizzIndex);
   expect(fizzIndex).toBeLessThan(charlieIndex);
 });
@@ -754,7 +759,7 @@ test("managed relay-profile agents with member roles use the agent composer styl
   await expect(agentMentionChip).toHaveText("charlie");
 });
 
-test("other-owned agents without a shared channel are hidden from mentions", async ({
+test("foreign verified agents in the active regular channel can be selected and emit their exact p-tag", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -766,32 +771,242 @@ test("other-owned agents without a shared channel are hidden from mentions", asy
         isAgent: true,
       },
     ],
-    userSearchDelayMs: 1_000,
+    relayAgents: [
+      {
+        pubkey: PROFILE_ONLY_AGENT_PUBKEY,
+        name: "mira",
+        respondTo: "allowlist",
+        respondToAllowlist: [MOCK_VIEWER_PUBKEY],
+      },
+    ],
   });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
 
+  const message = "Ask @mira for the active-channel handoff";
   const input = page.getByTestId("message-input");
-  await input.fill("@mira");
+  await input.fill("Ask @mira");
 
   const dropdown = autocomplete(page);
-  await expect(dropdown).not.toBeVisible();
-  await expect(input.locator(".mention-chip")).toHaveCount(0);
+  const miraRow = dropdown.locator("button", { hasText: "mira" });
+  await expect(miraRow).toBeVisible();
+  await expect(miraRow.getByTestId("mention-agent-icon")).toBeVisible();
+  await miraRow.click();
+  await page.keyboard.type("for the active-channel handoff");
+
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "Ask mira for the active-channel handoff",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate((content) => {
+        const event = (
+          window as Window & {
+            __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
+              content: string;
+              kind: number;
+              tags: string[][];
+            }>;
+          }
+        ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
+          (candidate) => candidate.content === content,
+        );
+        return {
+          kind: event?.kind ?? null,
+          pTags: event?.tags.filter((tag) => tag[0] === "p") ?? [],
+        };
+      }, message),
+    )
+    .toEqual({
+      kind: 9,
+      pTags: [["p", PROFILE_ONLY_AGENT_PUBKEY]],
+    });
 });
 
-test("own profile-only agents are hidden from channel mentions", async ({
+test("verified foreign members with explicit directory exclusions stay hidden in the active channel", async ({
   page,
 }) => {
-  await installMockBridge(page, { userSearchDelayMs: 1_000 });
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: EXPLICIT_POLICY_AGENT_PUBKEY,
+        displayName: "nova",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+    relayAgents: [
+      {
+        pubkey: PROFILE_ONLY_AGENT_PUBKEY,
+        name: "mira",
+        respondTo: "owner-only",
+        channelNames: ["general"],
+      },
+      {
+        pubkey: EXPLICIT_POLICY_AGENT_PUBKEY,
+        name: "nova",
+        respondTo: "allowlist",
+        respondToAllowlist: [TEST_IDENTITIES.outsider.pubkey],
+        channelNames: ["general"],
+      },
+    ],
+  });
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
+  const channelId = await page
+    .getByTestId("channel-general")
+    .getAttribute("data-channel-id");
+  if (!channelId) throw new Error("general channel is missing its id");
+  await page.evaluate(
+    async ({ activeChannelId, pubkey }) => {
+      const bridgeWindow = window as Window & {
+        __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+          command: string,
+          payload?: Record<string, unknown>,
+        ) => Promise<unknown>;
+        __BUZZ_E2E_QUERY_CLIENT__?: {
+          invalidateQueries: () => Promise<void>;
+        };
+      };
+      const invoke = bridgeWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+      if (!invoke) throw new Error("Mock bridge is not installed.");
+      await invoke("add_channel_members", {
+        channelId: activeChannelId,
+        pubkeys: [pubkey],
+        role: "bot",
+      });
+      await bridgeWindow.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries();
+    },
+    { activeChannelId: channelId, pubkey: EXPLICIT_POLICY_AGENT_PUBKEY },
+  );
+  await expect(page.getByTestId("channel-members-trigger")).toHaveAttribute(
+    "aria-label",
+    "View channel members (5)",
+  );
+
+  await page.getByTestId("message-input").fill("@");
+
+  const dropdown = autocomplete(page);
+  await expect(dropdown).toBeVisible();
+  await expect(dropdown.getByText("bob", { exact: true })).toBeVisible();
+  await expect(dropdown.getByText("mira", { exact: true })).toHaveCount(0);
+  await expect(dropdown.getByText("nova", { exact: true })).toHaveCount(0);
+});
+
+test("foreign verified agents in an active forum can be selected and submitted as a forum mention", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "alice",
+        respondTo: "allowlist",
+        respondToAllowlist: [MOCK_VIEWER_PUBKEY],
+        channelNames: ["watercooler"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-watercooler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("watercooler");
+  await page.getByRole("button", { name: "Start a new post..." }).click();
+
+  const composer = page.locator("form").filter({
+    has: page.getByTestId("send-message"),
+  });
+  const editor = composer.locator(
+    '.rich-text-composer [contenteditable="true"]',
+  );
+  await expect(editor).toBeVisible();
+  await editor.fill("Ask @ali");
+
+  const dropdown = composer.getByTestId("mention-autocomplete");
+  const aliceRow = dropdown.locator("button", { hasText: "alice" });
+  await expect(aliceRow).toBeVisible();
+  await expect(aliceRow.getByTestId("mention-agent-icon")).toBeVisible();
+  await aliceRow.click();
+  await page.keyboard.type("for the forum handoff");
+  await expect(editor).toContainText("Ask @alice for the forum handoff");
+
+  const baselineCommands = await readCommandPayloadLog(page);
+  await composer.getByTestId("send-message").click();
+
+  await expect
+    .poll(
+      async () =>
+        (await readCommandPayloadLog(page))
+          .slice(baselineCommands.length)
+          .filter((entry) => entry.command === "send_channel_message").length,
+    )
+    .toBe(1);
+  const sendCommands = (await readCommandPayloadLog(page))
+    .slice(baselineCommands.length)
+    .filter((entry) => entry.command === "send_channel_message");
+  expect(sendCommands).toEqual([
+    expect.objectContaining({
+      command: "send_channel_message",
+      payload: expect.objectContaining({
+        kind: 45001,
+        mentionPubkeys: [TEST_IDENTITIES.alice.pubkey],
+      }),
+    }),
+  ]);
+});
+
+test("foreign verified agents outside the active channel stay hidden", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: PROFILE_ONLY_AGENT_PUBKEY,
+        displayName: "mira",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+      {
+        pubkey: CASEY_PROFILE_PUBKEY,
+        displayName: "milo",
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
 
   const input = page.getByTestId("message-input");
-  await input.fill("@mira");
+  await input.fill("@mi");
 
-  await expect(autocomplete(page)).toHaveCount(0);
+  const dropdown = autocomplete(page);
+  await expect(dropdown.getByText("milo")).toBeVisible();
+  await expect(dropdown.getByText("mira")).toHaveCount(0);
+});
+
+test("foreign verified member agents stay hidden in DMs", async ({ page }) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: OUT_OF_CHANNEL_MANAGED_AGENT_PUBKEY,
+        name: "alina",
+        status: "stopped",
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-alice-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("alice-tyler");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("@ali");
+
+  const dropdown = autocomplete(page);
+  await expect(dropdown.getByText("alina")).toBeVisible();
+  await expect(dropdown.getByText("alice")).toHaveCount(0);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
 });
 
 test("managed relay agents are visible in channel mentions regardless of relay policy", async ({
@@ -826,7 +1041,7 @@ test("managed relay agents are visible in channel mentions regardless of relay p
   await expect(dropdown.getByText("agent")).toBeVisible();
 });
 
-test("relay-only agents stay hidden from channel mentions even when allowlisted", async ({
+test("relay-only agents outside the active channel stay hidden even when allowlisted", async ({
   page,
 }) => {
   await installMockBridge(page, {

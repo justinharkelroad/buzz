@@ -1,5 +1,6 @@
 {
   "environment": "personal-staging",
+  "admin_bypass_settings_receipt_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
   "https_origin": "https://CHANGE_ME_STAGING_RELAY_HOST",
   "wss_origin": "wss://CHANGE_ME_STAGING_RELAY_HOST",
   "hosted_https_origin": "https://CHANGE_ME_HOSTED_BUZZ_HOST",
@@ -9,11 +10,25 @@
     "https://CHANGE_ME_PERSONAL_PRODUCTION_HOST"
   ],
   "deployed_relay_image_ref": "ghcr.io/justinharkelroad/buzz-relay-personal@sha256:CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_DIGEST",
+  "relay_source_sha": "CHANGE_ME_40_CHARACTER_LOWERCASE_GIT_SHA",
+  "gate1_workflow_sha": "CHANGE_ME_40_CHARACTER_LOWERCASE_PROTECTED_MAIN_GIT_SHA",
+  "gate1_evidence_run_id": 123456789,
+  "gate1_evidence_run_attempt": 1,
+  "gate1_evidence_artifact_id": 123456789,
+  "gate1_evidence_artifact_name": "personal-relay-gate1-receipt-CHANGE_ME_SOURCE_SHA-CHANGE_ME_DIGEST_HEX-CHANGE_ME_RUN_ID-1",
+  "gate1_evidence_artifact_digest": "sha256:CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
+  "gate1_evidence_expires_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
+  "gate1_receipt_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
+  "gate1_attestation_bundle_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
   "relay_pubkey": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_PUBLIC_KEY",
   "smoke_approval_record_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
   "smoke_passed": true,
   "smoke_completed_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
-  "approved_by": "CHANGE_ME_REVIEWER",
+  "approved_by": {
+    "login": "CHANGE_ME_GITHUB_LOGIN",
+    "id": 123456789,
+    "node_id": "CHANGE_ME_GITHUB_NODE_ID"
+  },
   "approved_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
   "evidence_reference": "CHANGE_ME_REVIEW_OR_TICKET_REFERENCE"
 }

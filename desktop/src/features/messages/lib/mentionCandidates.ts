@@ -23,6 +23,8 @@ export type MentionCandidate = {
   secondaryLabel?: string | null;
   ownerPubkey?: string | null;
   isAgent: boolean;
+  /** Agent classification came from authoritative member/profile data. */
+  isVerifiedAgent?: boolean;
   isManagedAgent?: boolean;
   isGlobalSearchResult?: boolean;
 };

@@ -1,0 +1,2351 @@
+name: Personal Relay Gate 1 Receipt
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact source SHA of the published personal relay candidate"
+        required: true
+        type: string
+      image_name:
+        description: "Exact candidate image name (ghcr.io/justinharkelroad/...)"
+        required: true
+        default: ghcr.io/justinharkelroad/buzz-relay-personal
+        type: string
+      image_digest:
+        description: "Exact merged candidate digest (sha256:...)"
+        required: true
+        type: string
+      approval_sha256:
+        description: "Canonical SHA-256 of the reviewed Gate 1 approval JSON committed on main"
+        required: true
+        type: string
+      confirmation:
+        description: "Enter ISSUE_PERSONAL_RELAY_GATE1_RECEIPT"
+        required: true
+        type: string
+
+concurrency:
+  group: personal-relay-gate1-${{ inputs.source_sha || github.sha }}-${{ inputs.image_digest || github.event_name }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  contract:
+    name: Gate 1 receipt contract
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate Gate 1 receipt fixtures and workflow contract
+        run: |
+          set -euo pipefail
+          bash ./deploy/personal-relay/gate1-receipt-test.sh
+          bash ./deploy/personal-relay/release-contract-test.sh
+
+      - name: Stage changed Gate 1 approvals for proactive secret scanning
+        id: changed-approvals
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          scan_dir=/tmp/personal-relay-gate1-pr-approvals
+          mkdir -p "$scan_dir"
+          count=0
+          while IFS= read -r -d '' path; do
+            [[ "$path" =~ ^deploy/personal-relay/gate1-approvals/[0-9a-f]{40}-[0-9a-f]{64}\.json$ ]]
+            [[ -f "$path" && ! -L "$path" ]]
+            git ls-files --error-unmatch "$path" >/dev/null
+            jq -e . "$path" >/dev/null
+            cp -- "$path" "$scan_dir/${path##*/}"
+            count=$((count + 1))
+          done < <(git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" "$HEAD_SHA" -- 'deploy/personal-relay/gate1-approvals/**')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Create trusted empty Trivy configuration outside the checkout
+        if: steps.changed-approvals.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          [[ ! -e trivyignores && ! -L trivyignores ]]
+          for policy_path in \
+            /tmp/personal-relay-trivy-config.yaml \
+            /tmp/personal-relay-trivy-ignore \
+            /tmp/personal-relay-trivy-secret.yaml; do
+            [[ ! -e "$policy_path" && ! -L "$policy_path" ]]
+          done
+          install -m 600 /dev/null /tmp/personal-relay-trivy-config.yaml
+          install -m 600 /dev/null /tmp/personal-relay-trivy-ignore
+          install -m 600 /dev/null /tmp/personal-relay-trivy-secret.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-config.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-secret.yaml
+
+      - name: Scan changed Gate 1 approvals for secrets
+        if: steps.changed-approvals.outputs.count != '0'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-pr-approvals
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-pr-approval-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Validate proactive approval secret-scan report
+        if: steps.changed-approvals.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          report=/tmp/personal-relay-gate1-pr-approval-secret.json
+          bound_report=/tmp/personal-relay-gate1-pr-approval-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+
+  source-tests:
+    name: Unprivileged exact-source authorization tests
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: buzz
+          POSTGRES_PASSWORD: buzz_dev
+          POSTGRES_USER: buzz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U buzz -d buzz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      BUZZ_TEST_DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+      DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      REDIS_URL: redis://localhost:6379
+      REF_PROTECTED: ${{ github.ref_protected }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Checkout only the exact published source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify unprivileged source-test invocation
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_NAME" =~ ^ghcr\.io/justinharkelroad/[a-z0-9._-]+$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "ISSUE_PERSONAL_RELAY_GATE1_RECEIPT" ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$SOURCE_SHA" ]]
+
+      - name: Activate exact source Hermit toolchain
+        uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Run exact relay and ACP authorization acceptance tests
+        run: |
+          set -euo pipefail
+          require_exact_test() {
+            local package=$1
+            local full_name=$2
+            local mode=$3
+            local list_file
+            local match_count
+            list_file=$(mktemp /tmp/personal-relay-gate1-test-list.XXXXXXXX)
+            if [[ "$mode" == ignored ]]; then
+              cargo test --locked -p "$package" "$full_name" -- \
+                --ignored --exact --list --format terse > "$list_file"
+            else
+              [[ "$mode" == normal ]]
+              cargo test --locked -p "$package" "$full_name" -- \
+                --exact --list --format terse > "$list_file"
+            fi
+            match_count=$(grep -Fxc -- "${full_name}: test" "$list_file" || true)
+            rm -f "$list_file"
+            [[ "$match_count" == 1 ]] || {
+              echo "::error::expected exactly one listed Rust test for ${package}:${full_name}; found ${match_count}"
+              exit 1
+            }
+          }
+          cargo run --locked -p buzz-admin -- migrate
+          relay_test=workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member
+          require_exact_test buzz-relay "$relay_test" ignored
+          cargo test --locked -p buzz-relay \
+            "$relay_test" \
+            -- --ignored --exact --test-threads=1
+          acp_tests=(
+            trusted_relay_workflow_uses_attributed_owner_for_author_gate
+            forged_workflow_marker_cannot_replace_actual_signer
+            relay_signed_non_workflow_event_cannot_replace_actual_signer
+            missing_trusted_relay_identity_fails_closed_to_actual_signer
+            invalid_signature_fails_closed_to_actual_signer
+            wrong_kind_fails_closed_to_actual_signer
+            duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer
+            test_allowlist_accepts_explicit_external_pubkey
+            test_allowlist_rejects_non_sibling_not_in_allowlist
+            test_owner_only_rejects_stranger_so_no_steer
+            test_dm_rejects_allowlisted_external_pubkey
+          )
+          for test_name in "${acp_tests[@]}"; do
+            full_name="author_gate_tests::${test_name}"
+            require_exact_test buzz-acp "$full_name" normal
+            cargo test --locked -p buzz-acp "$full_name" -- --exact
+          done
+
+  source-proof:
+    name: Trusted exact-source result seal
+    if: github.event_name == 'workflow_dispatch' && needs.source-tests.result == 'success'
+    needs: source-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    env:
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+      BASH_ENV: ""
+      CONFIRMATION: ${{ inputs.confirmation }}
+      ENV: ""
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      REF_PROTECTED: ${{ github.ref_protected }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+    steps:
+      - name: Checkout only the protected Gate 1 verifier
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify clean source-proof invocation
+        id: identity
+        env:
+          SOURCE_TESTS_RESULT: ${{ needs.source-tests.result }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$SOURCE_TESTS_RESULT" == "success" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_NAME" =~ ^ghcr\.io/justinharkelroad/[a-z0-9._-]+$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "ISSUE_PERSONAL_RELAY_GATE1_RECEIPT" ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+          git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA"
+          echo "artifact_name=personal-relay-gate1-source-tests-${SOURCE_SHA}-${GITHUB_RUN_ID}-1" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and validate GitHub-controlled source-test result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          proof_dir=/tmp/personal-relay-gate1-source-proof
+          install -d -m 0700 "$proof_dir"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            > /tmp/personal-relay-gate1-source-run.raw.json
+          jq -e \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg workflow_sha "$GITHUB_SHA" '
+              .id == $run_id
+              and .run_attempt == 1
+              and .event == "workflow_dispatch"
+              and .head_sha == $workflow_sha
+              and .head_branch == "main"
+              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .repository.full_name == "justinharkelroad/buzz"
+            ' /tmp/personal-relay-gate1-source-run.raw.json >/dev/null
+          jq '{
+            id,
+            run_attempt,
+            event,
+            head_sha,
+            head_branch,
+            path,
+            repository: {full_name: .repository.full_name}
+          }' /tmp/personal-relay-gate1-source-run.raw.json \
+            > "$proof_dir/source-test-run.json"
+
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1/jobs?per_page=100" \
+            > /tmp/personal-relay-gate1-source-job-pages.json
+          jq '[.[] | .jobs[] | select(.name == "Unprivileged exact-source authorization tests")]' \
+            /tmp/personal-relay-gate1-source-job-pages.json \
+            > /tmp/personal-relay-gate1-source-jobs.json
+          [[ "$(jq 'length' /tmp/personal-relay-gate1-source-jobs.json)" == 1 ]]
+          jq -e \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg workflow_sha "$GITHUB_SHA" '
+              .[0]
+              | .run_id == $run_id
+              and .head_sha == $workflow_sha
+              and .name == "Unprivileged exact-source authorization tests"
+              and .status == "completed"
+              and .conclusion == "success"
+              and (.id | type == "number" and . >= 1 and floor == .)
+              and (.steps | type == "array" and length > 0)
+              and all(.steps[]?; .status == "completed" and .conclusion == "success")
+              and ([.steps[]? | select(
+                .name == "Checkout only the exact published source"
+                and .status == "completed" and .conclusion == "success")] | length) == 1
+              and ([.steps[]? | select(
+                .name == "Verify unprivileged source-test invocation"
+                and .status == "completed" and .conclusion == "success")] | length) == 1
+              and ([.steps[]? | select(
+                .name == "Activate exact source Hermit toolchain"
+                and .status == "completed" and .conclusion == "success")] | length) == 1
+              and ([.steps[]? | select(
+                .name == "Run exact relay and ACP authorization acceptance tests"
+                and .status == "completed" and .conclusion == "success")] | length) == 1
+            ' /tmp/personal-relay-gate1-source-jobs.json >/dev/null
+          jq '.[0] | {
+            id,
+            run_id,
+            head_sha,
+            name,
+            status,
+            conclusion,
+            started_at,
+            completed_at,
+            steps: [.steps[] | {name, status, conclusion, number}]
+          }' /tmp/personal-relay-gate1-source-jobs.json \
+            > "$proof_dir/source-test-job.json"
+          workflow_path=.github/workflows/personal-relay-gate1.yml
+          [[ -f "$workflow_path" && ! -L "$workflow_path" ]]
+          git cat-file -e "${GITHUB_SHA}:${workflow_path}"
+          git show "${GITHUB_SHA}:${workflow_path}" > "$proof_dir/protected-workflow.yml"
+          ruby -ryaml -e '
+            workflow = YAML.safe_load_file(ARGV.fetch(0), aliases: true)
+            job = workflow.fetch("jobs").fetch("source-tests")
+            abort "source-tests must not declare job outputs" if job.key?("outputs")
+            abort "source-tests permissions changed" unless job.fetch("permissions") == {"contents" => "read"}
+            steps = job.fetch("steps")
+            names = steps.map { |step| step.fetch("name") }
+            expected = [
+              "Checkout only the exact published source",
+              "Verify unprivileged source-test invocation",
+              "Activate exact source Hermit toolchain",
+              "Run exact relay and ACP authorization acceptance tests"
+            ]
+            abort "source-tests steps differ from the sealed contract" unless names == expected
+            abort "candidate execution must be the final workflow step" unless steps.last.fetch("name") == expected.last
+            abort "source-tests must not publish an artifact" if steps.any? { |step| step.fetch("uses", "").include?("upload-artifact") }
+            abort "source-tests must not write workflow outputs" if steps.any? { |step| step.fetch("run", "").include?("GITHUB_OUTPUT") }
+            run = steps.last.fetch("run")
+            commands = [
+              "cargo run --locked -p buzz-admin -- migrate",
+              "cargo test --locked -p buzz-relay",
+              "workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member",
+              "cargo test --locked -p buzz-acp \"$full_name\" -- --exact",
+              "require_exact_test()",
+              "--list --format terse",
+              "grep -Fxc --",
+              "expected exactly one listed Rust test",
+              "require_exact_test buzz-relay \"$relay_test\" ignored",
+              "require_exact_test buzz-acp \"$full_name\" normal"
+            ]
+            abort "source-tests command contract is incomplete" unless commands.all? { |command| run.include?(command) }
+          ' "$proof_dir/protected-workflow.yml"
+
+      - name: Re-run trusted non-candidate Gate 1 contract validation
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          proof_dir=/tmp/personal-relay-gate1-source-proof
+          bash ./deploy/personal-relay/gate1-receipt-test.sh \
+            > "$proof_dir/trusted-gate1-receipt-fixtures.log" 2>&1
+          bash ./deploy/personal-relay/release-contract-test.sh \
+            > "$proof_dir/trusted-release-contract-fixtures.log" 2>&1
+
+      - name: Seal exact control-plane source-test result binding
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          proof_dir=/tmp/personal-relay-gate1-source-proof
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source_job_sha256 "$(sha256sum "$proof_dir/source-test-job.json" | awk '{print $1}')" \
+            --arg source_run_sha256 "$(sha256sum "$proof_dir/source-test-run.json" | awk '{print $1}')" \
+            --arg workflow_file_sha256 "$(sha256sum "$proof_dir/protected-workflow.yml" | awk '{print $1}')" \
+            --arg receipt_fixtures_sha256 "$(sha256sum "$proof_dir/trusted-gate1-receipt-fixtures.log" | awk '{print $1}')" \
+            --arg contract_fixtures_sha256 "$(sha256sum "$proof_dir/trusted-release-contract-fixtures.log" | awk '{print $1}')" \
+            --slurpfile source_job "$proof_dir/source-test-job.json" '
+            {
+              schema: "personal-relay-gate1-source-result/v2",
+              evidence_model: "github-controlled-protected-job-conclusion",
+              repository: $repository,
+              source_sha: $source_sha,
+              workflow_sha: $workflow_sha,
+              workflow_ref: $workflow_ref,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              candidate_output_trusted: false,
+              protected_workflow_sha256: $workflow_file_sha256,
+              run_metadata_sha256: $source_run_sha256,
+              source_test_job_metadata_sha256: $source_job_sha256,
+              source_test_job: {
+                id: $source_job[0].id,
+                name: "Unprivileged exact-source authorization tests",
+                status: "completed",
+                conclusion: "success",
+                execution_step: (
+                  $source_job[0].steps
+                  | map(select(.name == "Run exact relay and ACP authorization acceptance tests"))[0]
+                )
+              },
+              test_contract: {
+                commands: [
+                  {
+                    id: "buzz-admin-migrate",
+                    argv: ["cargo", "run", "--locked", "-p", "buzz-admin", "--", "migrate"]
+                  },
+                  {
+                    id: "buzz-relay-workflow-owner-attribution",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member", "--", "--ignored", "--exact", "--test-threads=1"]
+                  },
+                  {
+                    id: "author_gate_tests::trusted_relay_workflow_uses_attributed_owner_for_author_gate",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::trusted_relay_workflow_uses_attributed_owner_for_author_gate", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::forged_workflow_marker_cannot_replace_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::forged_workflow_marker_cannot_replace_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::relay_signed_non_workflow_event_cannot_replace_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::relay_signed_non_workflow_event_cannot_replace_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::missing_trusted_relay_identity_fails_closed_to_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::missing_trusted_relay_identity_fails_closed_to_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::invalid_signature_fails_closed_to_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::invalid_signature_fails_closed_to_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::wrong_kind_fails_closed_to_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::wrong_kind_fails_closed_to_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::test_allowlist_accepts_explicit_external_pubkey",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_allowlist_accepts_explicit_external_pubkey", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::test_allowlist_rejects_non_sibling_not_in_allowlist",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_allowlist_rejects_non_sibling_not_in_allowlist", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::test_owner_only_rejects_stranger_so_no_steer",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_owner_only_rejects_stranger_so_no_steer", "--", "--exact"]
+                  },
+                  {
+                    id: "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey",
+                    argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey", "--", "--exact"]
+                  }
+                ]
+              },
+              trusted_validation: {
+                gate1_receipt_fixtures: "passed",
+                gate1_receipt_fixtures_log_sha256: $receipt_fixtures_sha256,
+                release_contract_fixtures: "passed",
+                release_contract_fixtures_log_sha256: $contract_fixtures_sha256
+              }
+            }
+          ' > "$proof_dir/source-test-result.json"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              (keys | sort) == ([
+                "schema", "evidence_model", "repository", "source_sha", "workflow_sha",
+                "workflow_ref", "run_id", "run_attempt", "candidate_output_trusted",
+                "protected_workflow_sha256", "run_metadata_sha256",
+                "source_test_job_metadata_sha256", "source_test_job", "test_contract",
+                "trusted_validation"
+              ] | sort)
+              and .schema == "personal-relay-gate1-source-result/v2"
+              and .evidence_model == "github-controlled-protected-job-conclusion"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .workflow_sha == $workflow_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .candidate_output_trusted == false
+              and (.protected_workflow_sha256 | test("^[0-9a-f]{64}$"))
+              and (.run_metadata_sha256 | test("^[0-9a-f]{64}$"))
+              and (.source_test_job_metadata_sha256 | test("^[0-9a-f]{64}$"))
+              and (.source_test_job | keys | sort) == (["id", "name", "status", "conclusion", "execution_step"] | sort)
+              and (.source_test_job.id | type == "number" and . >= 1 and floor == .)
+              and .source_test_job.name == "Unprivileged exact-source authorization tests"
+              and .source_test_job.status == "completed"
+              and .source_test_job.conclusion == "success"
+              and (.source_test_job.execution_step | keys | sort) == (["name", "status", "conclusion", "number"] | sort)
+              and .source_test_job.execution_step.name == "Run exact relay and ACP authorization acceptance tests"
+              and .source_test_job.execution_step.status == "completed"
+              and .source_test_job.execution_step.conclusion == "success"
+              and (.source_test_job.execution_step.number | type == "number" and . >= 1 and floor == .)
+              and (.test_contract | keys) == ["commands"]
+              and (.test_contract.commands | length) == 9
+              and ([.test_contract.commands[].id] | unique | length) == 9
+              and all(.test_contract.commands[];
+                (keys | sort) == ["argv", "id"]
+                and (.id | type == "string" and length > 0)
+                and (.argv | type == "array" and length > 0)
+                and all(.argv[]; type == "string" and length > 0)
+              )
+              and (.trusted_validation | keys | sort) == ([
+                "gate1_receipt_fixtures", "gate1_receipt_fixtures_log_sha256",
+                "release_contract_fixtures", "release_contract_fixtures_log_sha256"
+              ] | sort)
+              and .trusted_validation.gate1_receipt_fixtures == "passed"
+              and .trusted_validation.release_contract_fixtures == "passed"
+              and (.trusted_validation.gate1_receipt_fixtures_log_sha256 | test("^[0-9a-f]{64}$"))
+              and (.trusted_validation.release_contract_fixtures_log_sha256 | test("^[0-9a-f]{64}$"))
+            ' "$proof_dir/source-test-result.json" >/dev/null
+          jq -e '
+            (keys | sort) == ([
+              "id", "run_id", "head_sha", "name", "status",
+              "conclusion", "started_at", "completed_at", "steps"
+            ] | sort)
+            and (.steps | type == "array" and length > 0)
+            and all(.steps[];
+              (keys | sort) == ["conclusion", "name", "number", "status"]
+              and .status == "completed"
+              and .conclusion == "success"
+            )
+          ' "$proof_dir/source-test-job.json" >/dev/null
+          jq -e '
+            (keys | sort) == ([
+              "id", "run_attempt", "event", "head_sha", "head_branch", "path", "repository"
+            ] | sort)
+            and (.repository | keys) == ["full_name"]
+          ' "$proof_dir/source-test-run.json" >/dev/null
+
+      - name: Create fail-closed source-proof secret-scan policy
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          policy_root=/tmp/personal-relay-gate1-source-proof-policy
+          [[ ! -e "$policy_root" && ! -L "$policy_root" ]]
+          install -d -m 0700 "$policy_root"
+          printf '{}\n' > "$policy_root/trivy.yaml"
+          install -m 0600 /dev/null "$policy_root/trivy.ignore"
+          printf '{}\n' > "$policy_root/secret.yaml"
+          chmod 0400 "$policy_root/trivy.yaml" "$policy_root/trivy.ignore" "$policy_root/secret.yaml"
+
+      - name: Scan sealed source-test proof for secrets before upload
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-gate1-source-proof-policy/trivy.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-gate1-source-proof-policy/trivy.ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-gate1-source-proof-policy/secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-source-proof
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-source-proof-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-gate1-source-proof-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-gate1-source-proof-policy/trivy.ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret source-test proof report
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          [[ "$(cat /tmp/personal-relay-gate1-source-proof-policy/trivy.yaml)" == "{}" ]]
+          [[ ! -s /tmp/personal-relay-gate1-source-proof-policy/trivy.ignore ]]
+          [[ "$(cat /tmp/personal-relay-gate1-source-proof-policy/secret.yaml)" == "{}" ]]
+          report=/tmp/personal-relay-gate1-source-proof-secret.json
+          bound_report=/tmp/personal-relay-gate1-source-proof-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+          install -m 0444 "$report" \
+            /tmp/personal-relay-gate1-source-proof/personal-relay-gate1-source-proof-secret.json
+
+      - name: Upload one clean sealed source-test result directory
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: /tmp/personal-relay-gate1-source-proof
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Validate sealed source-test artifact outputs
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+
+  image-validation:
+    name: Unprivileged exact-image validation
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+      packages: read
+    env:
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      DOCKER_CONFIG: /tmp/personal-relay-gate1-image-docker-config
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      REF_PROTECTED: ${{ github.ref_protected }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+      deployment_ref: ${{ steps.identity.outputs.deployment_ref }}
+    steps:
+      - name: Checkout only the protected Gate 1 verifier
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify protected-main image-validation invocation
+        id: identity
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_NAME" =~ ^ghcr\.io/justinharkelroad/[a-z0-9._-]+$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "ISSUE_PERSONAL_RELAY_GATE1_RECEIPT" ]]
+          git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || {
+            echo "::error::published source is not an ancestor of the protected verifier commit"
+            exit 1
+          }
+          deployment_ref="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          {
+            echo "deployment_ref=$deployment_ref"
+            echo "artifact_name=personal-relay-gate1-image-validation-${SOURCE_SHA}-${IMAGE_DIGEST#sha256:}-${GITHUB_RUN_ID}-1"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/personal-relay-gate1-image-proof
+
+      - name: Authenticate read-only to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+          install -d -m 0700 "$DOCKER_CONFIG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Independently verify exact merged-image provenance
+        env:
+          DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          proof_dir=/tmp/personal-relay-gate1-image-proof
+          gh attestation verify --hostname github.com "oci://${DEPLOYMENT_REF}" \
+            -R "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref refs/heads/main \
+            --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-relay-image.yml \
+            --signer-digest "$SOURCE_SHA" \
+            --deny-self-hosted-runners \
+            --format json > "$proof_dir/release-provenance-verification.json"
+          jq -e \
+            --arg image "$IMAGE_NAME" \
+            --arg digest "${IMAGE_DIGEST#sha256:}" '
+              length > 0
+              and all(.[].verificationResult.statement;
+                .predicateType == "https://slsa.dev/provenance/v1"
+                and any(.subject[]?; .name == $image and .digest.sha256 == $digest)
+              )
+            ' "$proof_dir/release-provenance-verification.json" >/dev/null
+
+      - name: Reverify relay runtime and both required binaries
+        env:
+          DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
+        run: |
+          set -euo pipefail
+          proof_dir=/tmp/personal-relay-gate1-image-proof
+          docker pull "$DEPLOYMENT_REF"
+          bash ./deploy/personal-relay/runtime-contract-test.sh "$DEPLOYMENT_REF" \
+            2>&1 | tee "$proof_dir/runtime-contract.log"
+          grep -Fx "personal relay runtime contract passed: $DEPLOYMENT_REF" \
+            "$proof_dir/runtime-contract.log" >/dev/null
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg deployment_ref "$DEPLOYMENT_REF" \
+            --arg log_sha256 "$(sha256sum "$proof_dir/runtime-contract.log" | awk '{print $1}')" '
+            {
+              source_sha: $source_sha,
+              deployment_ref: $deployment_ref,
+              runtime_contract: "passed",
+              binaries: {buzz_admin: true, buzz_relay: true},
+              log_sha256: $log_sha256
+            }
+          ' > "$proof_dir/runtime-verification.json"
+
+      - name: Create trusted empty Trivy configuration outside the checkout
+        run: |
+          set -euo pipefail
+          [[ ! -e trivyignores && ! -L trivyignores ]]
+          for policy_path in \
+            /tmp/personal-relay-trivy-config.yaml \
+            /tmp/personal-relay-trivy-ignore \
+            /tmp/personal-relay-trivy-secret.yaml; do
+            [[ ! -e "$policy_path" && ! -L "$policy_path" ]]
+          done
+          install -m 600 /dev/null /tmp/personal-relay-trivy-config.yaml
+          install -m 600 /dev/null /tmp/personal-relay-trivy-ignore
+          install -m 600 /dev/null /tmp/personal-relay-trivy-secret.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-config.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-secret.yaml
+
+      - name: Scan exact AMD64 image for embedded secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_PLATFORM: linux/amd64
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          image-ref: ${{ steps.identity.outputs.deployment_ref }}
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-amd64.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Scan exact ARM64 image for embedded secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_PLATFORM: linux/arm64
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          image-ref: ${{ steps.identity.outputs.deployment_ref }}
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-arm64.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret reports to both exact architectures
+        env:
+          DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
+        run: |
+          set -euo pipefail
+          proof_dir=/tmp/personal-relay-gate1-image-proof
+          for arch in amd64 arm64; do
+            report="$proof_dir/personal-relay-trivy-secret-${arch}.json"
+            bound_report="/tmp/personal-relay-trivy-secret-${arch}-bound.json"
+            jq '. + {Trivy: {Version: "0.70.0"}}' \
+              "$report" > "$bound_report"
+            install -m 0600 "$bound_report" "$report"
+            jq -e \
+              --arg arch "$arch" \
+              --arg deployment_ref "$DEPLOYMENT_REF" \
+              --arg source_sha "$SOURCE_SHA" '
+                .SchemaVersion == 2
+                and .ArtifactName == $deployment_ref
+                and .ArtifactType == "container_image"
+                and .Trivy.Version == "0.70.0"
+                and (.Metadata.RepoDigests | index($deployment_ref)) != null
+                and .Metadata.ImageConfig.architecture == $arch
+                and .Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha
+                and ([.Results[]? | .Secrets[]?] | length) == 0
+              ' "$report" >/dev/null
+          done
+          jq -n \
+            --arg deployment_ref "$DEPLOYMENT_REF" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg amd64_sha "$(sha256sum "$proof_dir/personal-relay-trivy-secret-amd64.json" | awk '{print $1}')" \
+            --arg arm64_sha "$(sha256sum "$proof_dir/personal-relay-trivy-secret-arm64.json" | awk '{print $1}')" '
+            {
+              deployment_ref: $deployment_ref,
+              source_sha: $source_sha,
+              scanner: {name: "Trivy", version: "0.70.0", scanners: ["secret"]},
+              architectures: [
+                {architecture: "amd64", secrets_found: 0, report_sha256: $amd64_sha},
+                {architecture: "arm64", secrets_found: 0, report_sha256: $arm64_sha}
+              ]
+            }
+          ' > "$proof_dir/secret-scan-proof.json"
+
+      - name: Scan sealed image-validation evidence for secrets before upload
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-image-proof
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-image-proof-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret image-validation evidence report
+        run: |
+          set -euo pipefail
+          [[ "$(cat /tmp/personal-relay-trivy-config.yaml)" == "{}" ]]
+          [[ ! -s /tmp/personal-relay-trivy-ignore ]]
+          [[ "$(cat /tmp/personal-relay-trivy-secret.yaml)" == "{}" ]]
+          report=/tmp/personal-relay-gate1-image-proof-secret.json
+          bound_report=/tmp/personal-relay-gate1-image-proof-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+          install -m 0444 "$report" \
+            /tmp/personal-relay-gate1-image-proof/personal-relay-gate1-image-proof-secret.json
+
+      - name: Remove temporary GHCR credentials before artifact upload
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ -d "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+          docker logout ghcr.io || true
+          if [[ -e "$DOCKER_CONFIG/config.json" || -L "$DOCKER_CONFIG/config.json" ]]; then
+            [[ -f "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+            shred -u "$DOCKER_CONFIG/config.json"
+          fi
+          [[ ! -e "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+          rmdir "$DOCKER_CONFIG"
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+
+      - name: Upload one sealed image-validation proof directory
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: /tmp/personal-relay-gate1-image-proof
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Validate sealed image-validation artifact outputs
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+
+  validate:
+    name: Protected validation and sealed receipt
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - source-proof
+      - image-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: personal-relay-gate1
+    permissions:
+      actions: read
+      contents: read
+    env:
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      REF_PROTECTED: ${{ github.ref_protected }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.identity.outputs.validation_artifact_name }}
+      deployment_ref: ${{ steps.identity.outputs.deployment_ref }}
+      image: ${{ steps.identity.outputs.image }}
+      image_digest_hex: ${{ steps.identity.outputs.image_digest_hex }}
+      receipt_sha256: ${{ steps.receipt.outputs.receipt_sha256 }}
+    steps:
+      - name: Checkout only the protected Gate 1 verifier and reviewed approval
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify protected invocation and committed approval
+        id: identity
+        env:
+          APPROVED_IMAGE_DIGEST: ${{ vars.PERSONAL_GATE1_APPROVED_IMAGE_DIGEST }}
+          APPROVED_SOURCE_SHA: ${{ vars.PERSONAL_GATE1_APPROVED_SOURCE_SHA }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          ENVIRONMENT_APPROVAL_SHA256: ${{ vars.PERSONAL_GATE1_APPROVAL_SHA256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE_NAME" =~ ^ghcr\.io/justinharkelroad/[a-z0-9._-]+$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CONFIRMATION" == "ISSUE_PERSONAL_RELAY_GATE1_RECEIPT" ]]
+          git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || {
+            echo "::error::published source is not an ancestor of the protected Gate 1 verifier"
+            exit 1
+          }
+          [[ "$APPROVED_SOURCE_SHA" == "$SOURCE_SHA" ]]
+          [[ "$APPROVED_IMAGE_DIGEST" == "$IMAGE_DIGEST" ]]
+          [[ "$ENVIRONMENT_APPROVAL_SHA256" == "$APPROVAL_SHA256" ]]
+
+          approval_path="deploy/personal-relay/gate1-approvals/${SOURCE_SHA}-${IMAGE_DIGEST#sha256:}.json"
+          [[ -f "$approval_path" && ! -L "$approval_path" ]]
+          git ls-files --error-unmatch "$approval_path" >/dev/null
+          git cat-file -e "${GITHUB_SHA}:${approval_path}"
+          computed_sha=$(bash ./deploy/personal-relay/canonical-json-sha256.sh "$approval_path")
+          [[ "$computed_sha" == "$APPROVAL_SHA256" ]]
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image "$IMAGE_NAME" \
+            --arg image_digest "$IMAGE_DIGEST" '
+              .source_sha == $source_sha
+              and .image == $image
+              and .image_digest == $image_digest
+              and .deployment_ref == ($image + "@" + $image_digest)
+            ' "$approval_path" >/dev/null
+          cp "$approval_path" /tmp/personal-relay-gate1-approval.json
+          {
+            echo "approval_path=$approval_path"
+            echo "deployment_ref=${IMAGE_NAME}@${IMAGE_DIGEST}"
+            echo "image=$IMAGE_NAME"
+            echo "image_digest_hex=${IMAGE_DIGEST#sha256:}"
+            echo "validation_artifact_name=personal-relay-gate1-validation-${SOURCE_SHA}-${IMAGE_DIGEST#sha256:}-${GITHUB_RUN_ID}-1"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Capture exact run and protected environment evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            > /tmp/personal-relay-gate1-run.json
+          jq -e \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg workflow_sha "$GITHUB_SHA" '
+              .id == $run_id
+              and .run_attempt == 1
+              and .event == "workflow_dispatch"
+              and .head_sha == $workflow_sha
+              and .head_branch == "main"
+              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .repository.full_name == "justinharkelroad/buzz"
+              and (.triggering_actor.id | type == "number" and . >= 1)
+              and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}
+                == {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id})
+            ' /tmp/personal-relay-gate1-run.json >/dev/null
+
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            > /tmp/personal-relay-main-branch.json
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            > /tmp/personal-relay-main-effective-rule-pages.json
+          jq -S '
+            def canonical:
+              if type == "object" then
+                to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+              elif type == "array" then map(canonical)
+              else . end;
+            [.[][] | {
+              type,
+              parameters: (.parameters | canonical),
+              ruleset_id,
+              ruleset_source_type,
+              ruleset_source
+            }]
+            | sort_by(.ruleset_id // 0, .type, (.parameters | tojson), .ruleset_source_type, .ruleset_source)
+          ' \
+            /tmp/personal-relay-main-effective-rule-pages.json \
+            > /tmp/personal-relay-main-effective-rules.json
+          mapfile -t ruleset_ids < <(
+            jq -r '[.[] | .ruleset_id | select(type == "number" and . >= 1 and floor == .)] | unique | .[]' \
+              /tmp/personal-relay-main-effective-rules.json
+          )
+          ((${#ruleset_ids[@]} > 0))
+          ruleset_dir=/tmp/personal-relay-gate1-main-ruleset-details
+          mkdir "$ruleset_dir"
+          ruleset_details=()
+          for ruleset_id in "${ruleset_ids[@]}"; do
+            raw_ruleset="$ruleset_dir/${ruleset_id}.raw.json"
+            ruleset_detail="$ruleset_dir/${ruleset_id}.json"
+            [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$raw_ruleset"
+            jq -e --argjson ruleset_id "$ruleset_id" '
+              .id == $ruleset_id
+              and has("bypass_actors")
+              and (.bypass_actors | type == "array")
+            ' "$raw_ruleset" >/dev/null
+            jq -S '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$raw_ruleset" > "$ruleset_detail"
+            ruleset_details+=("$ruleset_detail")
+          done
+          jq -sS 'sort_by(.id)' "${ruleset_details[@]}" \
+            > /tmp/personal-relay-gate1-main-rulesets.json
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json /tmp/personal-relay-main-branch.json \
+            --rules-json /tmp/personal-relay-main-effective-rules.json \
+            --rulesets-json /tmp/personal-relay-gate1-main-rulesets.json \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-repository justinharkelroad/buzz >/dev/null
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-gate1" \
+            > /tmp/personal-relay-gate1-environment.raw.json
+          jq -S '{
+            id,
+            node_id,
+            name,
+            can_admins_bypass_exposed: has("can_admins_bypass"),
+            can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
+            protection_rules: [.protection_rules[]
+              | if .type == "required_reviewers" then {
+                  type,
+                  prevent_self_review,
+                  reviewers: [.reviewers[] | {
+                    type,
+                    reviewer: {
+                      login: (.reviewer.login // ""),
+                      id: .reviewer.id,
+                      node_id: .reviewer.node_id
+                    }
+                  }] | sort_by(.type, .reviewer.login, .reviewer.id, .reviewer.node_id)
+                } else {type} end
+            ] | sort_by(.type),
+            deployment_branch_policy
+          }' /tmp/personal-relay-gate1-environment.raw.json \
+            > /tmp/personal-relay-gate1-environment.json
+          jq -e '
+            .name == "personal-relay-gate1"
+            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
+              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
+            and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
+            and any(.protection_rules[]?;
+              .type == "required_reviewers"
+              and .prevent_self_review == true
+              and (.reviewers | type == "array" and length > 0)
+            )
+          ' /tmp/personal-relay-gate1-environment.json >/dev/null
+
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-gate1/deployment-branch-policies?per_page=100" \
+            > /tmp/personal-relay-gate1-branch-policy-pages.json
+          jq '{
+            total_count: ([.[] | .branch_policies[]] | length),
+            branch_policies: [.[] | .branch_policies[] | {id, node_id, name}]
+          }' /tmp/personal-relay-gate1-branch-policy-pages.json \
+            > /tmp/personal-relay-gate1-branch-policies.json
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and (.branch_policies[0] | keys | sort) == ["id", "name", "node_id"]
+            and (.branch_policies[0].id | type == "number" and . >= 1 and floor == .)
+            and (.branch_policies[0].node_id | type == "string" and length > 0)
+            and .branch_policies[0].name == "main"
+          ' /tmp/personal-relay-gate1-branch-policies.json >/dev/null
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            > /tmp/personal-relay-gate1-environment-approvals.raw.json
+          jq '[.[] | {
+            state,
+            environments: [.environments[]? | {id, name}],
+            user: (.user | {login, id, node_id})
+          }]' /tmp/personal-relay-gate1-environment-approvals.raw.json \
+            > /tmp/personal-relay-gate1-environment-approvals.json
+          triggering_id=$(jq -r .triggering_actor.id /tmp/personal-relay-gate1-run.json)
+          jq -e --argjson triggering_id "$triggering_id" '
+            any(.[];
+              .state == "approved"
+              and (.user.id | type == "number" and . >= 1 and . != $triggering_id)
+              and (.user.node_id | type == "string" and length > 0)
+              and any(.environments[]?; .name == "personal-relay-gate1")
+            )
+          ' /tmp/personal-relay-gate1-environment-approvals.json >/dev/null
+
+      - name: Download exact sealed unprivileged proof artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_ARTIFACT_DIGEST: ${{ needs.image-validation.outputs.artifact_digest }}
+          IMAGE_ARTIFACT_ID: ${{ needs.image-validation.outputs.artifact_id }}
+          IMAGE_ARTIFACT_NAME: ${{ needs.image-validation.outputs.artifact_name }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.source-proof.outputs.artifact_digest }}
+          SOURCE_ARTIFACT_ID: ${{ needs.source-proof.outputs.artifact_id }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.source-proof.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$SOURCE_ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$SOURCE_ARTIFACT_NAME" \
+            --digest "$SOURCE_ARTIFACT_DIGEST" \
+            --output-dir /tmp/personal-relay-gate1-source-proof \
+            --metadata-output /tmp/personal-relay-gate1-source-artifact.json \
+            --archive-output /tmp/personal-relay-gate1-source-proof.zip
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$IMAGE_ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$IMAGE_ARTIFACT_NAME" \
+            --digest "$IMAGE_ARTIFACT_DIGEST" \
+            --output-dir /tmp/personal-relay-gate1-image-proof \
+            --metadata-output /tmp/personal-relay-gate1-image-artifact.json \
+            --archive-output /tmp/personal-relay-gate1-image-proof.zip
+          source_proof=/tmp/personal-relay-gate1-source-proof
+          source_result="$source_proof/source-test-result.json"
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              (keys | sort) == ([
+                "schema", "evidence_model", "repository", "source_sha", "workflow_sha",
+                "workflow_ref", "run_id", "run_attempt", "candidate_output_trusted",
+                "protected_workflow_sha256", "run_metadata_sha256",
+                "source_test_job_metadata_sha256", "source_test_job", "test_contract",
+                "trusted_validation"
+              ] | sort)
+              and .schema == "personal-relay-gate1-source-result/v2"
+              and .evidence_model == "github-controlled-protected-job-conclusion"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .workflow_sha == $workflow_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .candidate_output_trusted == false
+              and .source_test_job.name == "Unprivileged exact-source authorization tests"
+              and .source_test_job.status == "completed"
+              and .source_test_job.conclusion == "success"
+              and .source_test_job.execution_step.name == "Run exact relay and ACP authorization acceptance tests"
+              and .source_test_job.execution_step.status == "completed"
+              and .source_test_job.execution_step.conclusion == "success"
+              and (.test_contract.commands | length) == 9
+              and .trusted_validation.gate1_receipt_fixtures == "passed"
+              and .trusted_validation.release_contract_fixtures == "passed"
+            ' "$source_result" >/dev/null
+          jq -e \
+            --arg source_sha "$GITHUB_SHA" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .run_id == $run_id
+              and .head_sha == $source_sha
+              and .name == "Unprivileged exact-source authorization tests"
+              and .status == "completed"
+              and .conclusion == "success"
+              and all(.steps[]; .status == "completed" and .conclusion == "success")
+            ' "$source_proof/source-test-job.json" >/dev/null
+          jq -e \
+            --arg source_sha "$GITHUB_SHA" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              .id == $run_id
+              and .run_attempt == 1
+              and .event == "workflow_dispatch"
+              and .head_sha == $source_sha
+              and .head_branch == "main"
+              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .repository.full_name == "justinharkelroad/buzz"
+            ' "$source_proof/source-test-run.json" >/dev/null
+          [[ "$(sha256sum "$source_proof/source-test-job.json" | awk '{print $1}')" \
+            == "$(jq -r .source_test_job_metadata_sha256 "$source_result")" ]]
+          [[ "$(sha256sum "$source_proof/source-test-run.json" | awk '{print $1}')" \
+            == "$(jq -r .run_metadata_sha256 "$source_result")" ]]
+          [[ "$(sha256sum "$source_proof/protected-workflow.yml" | awk '{print $1}')" \
+            == "$(jq -r .protected_workflow_sha256 "$source_result")" ]]
+          [[ "$(sha256sum "$source_proof/trusted-gate1-receipt-fixtures.log" | awk '{print $1}')" \
+            == "$(jq -r .trusted_validation.gate1_receipt_fixtures_log_sha256 "$source_result")" ]]
+          [[ "$(sha256sum "$source_proof/trusted-release-contract-fixtures.log" | awk '{print $1}')" \
+            == "$(jq -r .trusted_validation.release_contract_fixtures_log_sha256 "$source_result")" ]]
+          cmp -s "$source_proof/protected-workflow.yml" .github/workflows/personal-relay-gate1.yml
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg deployment_ref "${IMAGE_NAME}@${IMAGE_DIGEST}" '
+              .source_sha == $source_sha and .deployment_ref == $deployment_ref
+            ' /tmp/personal-relay-gate1-image-proof/runtime-verification.json >/dev/null
+
+      - name: Download exact approved release evidence archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          approval=/tmp/personal-relay-gate1-approval.json
+          release_run_id=$(jq -r .release_run_id "$approval")
+          release_run_attempt=$(jq -r .release_run_attempt "$approval")
+          artifact_id=$(jq -r .release_evidence_artifact_id "$approval")
+          artifact_name=$(jq -r .release_evidence_artifact_name "$approval")
+          artifact_digest=$(jq -r .release_evidence_artifact_digest "$approval")
+          artifact_expires_at=$(jq -r .release_evidence_expires_at "$approval")
+          [[ "$release_run_attempt" == 1 ]]
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$release_run_id/attempts/$release_run_attempt" \
+            > /tmp/personal-relay-release-run.json
+          jq -e \
+            --argjson run_id "$release_run_id" \
+            --argjson run_attempt "$release_run_attempt" \
+            --arg source_sha "$SOURCE_SHA" '
+              .id == $run_id
+              and .run_attempt == $run_attempt
+              and .event == "workflow_dispatch"
+              and .status == "completed"
+              and .conclusion == "success"
+              and .head_sha == $source_sha
+              and .head_branch == "main"
+              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .repository.full_name == "justinharkelroad/buzz"
+            ' /tmp/personal-relay-release-run.json >/dev/null
+
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$artifact_id" \
+            --run-id "$release_run_id" \
+            --name "$artifact_name" \
+            --digest "$artifact_digest" \
+            --expires-at "$artifact_expires_at" \
+            --output-dir /tmp/personal-relay-release-evidence \
+            --metadata-output /tmp/personal-relay-release-artifact.json \
+            --archive-output /tmp/personal-relay-release-evidence.zip
+          jq -e --arg expires_at "$artifact_expires_at" '
+            .expired == false and .expires_at == $expires_at
+          ' /tmp/personal-relay-release-artifact.json >/dev/null
+
+          ledger=/tmp/personal-relay-release-evidence/personal-relay-release.json
+          authorization_artifact_id=$(jq -er '.release_approval.evidence_artifact.id' "$ledger")
+          authorization_artifact_name=$(jq -er '.release_approval.evidence_artifact.name' "$ledger")
+          authorization_artifact_digest=$(jq -er '.release_approval.evidence_artifact.digest' "$ledger")
+          authorization_artifact_expires_at=$(jq -er '.release_approval.evidence_artifact.expires_at' "$ledger")
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$authorization_artifact_id" \
+            --run-id "$release_run_id" \
+            --name "$authorization_artifact_name" \
+            --digest "$authorization_artifact_digest" \
+            --expires-at "$authorization_artifact_expires_at" \
+            --output-dir /tmp/personal-relay-release-authorization-proof \
+            --metadata-output /tmp/personal-relay-release-authorization-artifact.json \
+            --archive-output /tmp/personal-relay-release-authorization-proof.zip
+          jq -e --arg expires_at "$authorization_artifact_expires_at" '
+            .expired == false and .expires_at == $expires_at
+          ' /tmp/personal-relay-release-authorization-artifact.json >/dev/null
+          expected_authorization_files=(
+            personal-relay-release-approval-history.json
+            personal-relay-release-authorization.json
+            personal-relay-release-branch-policies.json
+            personal-relay-release-environment.json
+            personal-relay-release-main-branch.json
+            personal-relay-release-main-effective-rules.json
+            personal-relay-release-main-rulesets.json
+            personal-relay-release-reviewer.json
+            personal-relay-release-run-identity.json
+          )
+          mapfile -t actual_authorization_files < <(
+            find /tmp/personal-relay-release-authorization-proof \
+              -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          [[ "${actual_authorization_files[*]}" == "${expected_authorization_files[*]}" ]]
+          [[ -z "$(find /tmp/personal-relay-release-authorization-proof -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+          for proof_name in "${expected_authorization_files[@]}"; do
+            cmp -s \
+              "/tmp/personal-relay-release-authorization-proof/$proof_name" \
+              "/tmp/personal-relay-release-evidence/$proof_name"
+          done
+
+      - name: Stage all JSON inputs for an independent secret scan
+        run: |
+          set -euo pipefail
+          scan_dir=/tmp/personal-relay-gate1-json-scan-input
+          mkdir -p "$scan_dir"
+          cp /tmp/personal-relay-gate1-approval.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-run.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-environment.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-branch-policies.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-environment-approvals.json "$scan_dir/"
+          cp /tmp/personal-relay-main-branch.json "$scan_dir/"
+          cp /tmp/personal-relay-main-effective-rules.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-main-rulesets.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-source-artifact.json "$scan_dir/"
+          cp /tmp/personal-relay-gate1-image-artifact.json "$scan_dir/"
+          cp /tmp/personal-relay-release-run.json "$scan_dir/"
+          cp /tmp/personal-relay-release-artifact.json "$scan_dir/"
+          cp /tmp/personal-relay-release-authorization-artifact.json "$scan_dir/"
+          cp -R /tmp/personal-relay-gate1-source-proof "$scan_dir/source-proof"
+          cp -R /tmp/personal-relay-gate1-image-proof "$scan_dir/image-proof"
+          cp -R /tmp/personal-relay-release-evidence "$scan_dir/release-evidence"
+          cp -R /tmp/personal-relay-release-authorization-proof "$scan_dir/release-authorization-proof"
+
+      - name: Create trusted empty Trivy configuration outside the checkout
+        run: |
+          set -euo pipefail
+          [[ ! -e trivyignores && ! -L trivyignores ]]
+          for policy_path in \
+            /tmp/personal-relay-trivy-config.yaml \
+            /tmp/personal-relay-trivy-ignore \
+            /tmp/personal-relay-trivy-secret.yaml; do
+            [[ ! -e "$policy_path" && ! -L "$policy_path" ]]
+          done
+          install -m 600 /dev/null /tmp/personal-relay-trivy-config.yaml
+          install -m 600 /dev/null /tmp/personal-relay-trivy-ignore
+          install -m 600 /dev/null /tmp/personal-relay-trivy-secret.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-config.yaml
+          printf '{}\n' > /tmp/personal-relay-trivy-secret.yaml
+
+      - name: Scan approval and all staged JSON evidence for secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-json-scan-input
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-approval-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret staged-JSON proof
+        run: |
+          set -euo pipefail
+          report=/tmp/personal-relay-gate1-approval-secret.json
+          bound_report=/tmp/personal-relay-gate1-approval-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+          jq -n \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg approval_sha256 "$APPROVAL_SHA256" \
+            --arg report_sha256 "$(sha256sum "$report" | awk '{print $1}')" '
+            {
+              source_sha: $source_sha,
+              approval_sha256: $approval_sha256,
+              scanner: {name: "Trivy", version: "0.70.0", scanners: ["secret"]},
+              secrets_found: 0,
+              report_sha256: $report_sha256
+            }
+          ' > /tmp/personal-relay-gate1-approval-secret-scan-proof.json
+
+      - name: Validate all exact evidence and issue a non-deploying receipt
+        id: receipt
+        env:
+          IMAGE_ARTIFACT_DIGEST: ${{ needs.image-validation.outputs.artifact_digest }}
+          IMAGE_ARTIFACT_ID: ${{ needs.image-validation.outputs.artifact_id }}
+          IMAGE_ARTIFACT_NAME: ${{ needs.image-validation.outputs.artifact_name }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.source-proof.outputs.artifact_digest }}
+          SOURCE_ARTIFACT_ID: ${{ needs.source-proof.outputs.artifact_id }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.source-proof.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          evaluated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          bash ./deploy/personal-relay/gate1-receipt.sh validate \
+            --evidence-dir /tmp/personal-relay-release-evidence \
+            --approval /tmp/personal-relay-gate1-approval.json \
+            --expected-approval-sha256 "$APPROVAL_SHA256" \
+            --release-provenance-verification /tmp/personal-relay-gate1-image-proof/release-provenance-verification.json \
+            --environment-config /tmp/personal-relay-gate1-environment.json \
+            --environment-branch-policies /tmp/personal-relay-gate1-branch-policies.json \
+            --environment-approvals /tmp/personal-relay-gate1-environment-approvals.json \
+            --main-branch-metadata /tmp/personal-relay-main-branch.json \
+            --main-effective-rules /tmp/personal-relay-main-effective-rules.json \
+            --main-rulesets /tmp/personal-relay-gate1-main-rulesets.json \
+            --authorization-artifact-id "$SOURCE_ARTIFACT_ID" \
+            --authorization-artifact-name "$SOURCE_ARTIFACT_NAME" \
+            --authorization-artifact-digest "$SOURCE_ARTIFACT_DIGEST" \
+            --source-test-result /tmp/personal-relay-gate1-source-proof/source-test-result.json \
+            --runtime-verification /tmp/personal-relay-gate1-image-proof/runtime-verification.json \
+            --runtime-log /tmp/personal-relay-gate1-image-proof/runtime-contract.log \
+            --image-validation-artifact-id "$IMAGE_ARTIFACT_ID" \
+            --image-validation-artifact-name "$IMAGE_ARTIFACT_NAME" \
+            --image-validation-artifact-digest "$IMAGE_ARTIFACT_DIGEST" \
+            --secret-scan-proof /tmp/personal-relay-gate1-image-proof/secret-scan-proof.json \
+            --approval-secret-scan-proof /tmp/personal-relay-gate1-approval-secret-scan-proof.json \
+            --secret-report-amd64 /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-amd64.json \
+            --secret-report-arm64 /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-arm64.json \
+            --approval-secret-report /tmp/personal-relay-gate1-approval-secret.json \
+            --gate1-run-metadata /tmp/personal-relay-gate1-run.json \
+            --gate1-workflow-run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --gate1-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --gate1-workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --gate1-workflow-sha "$GITHUB_SHA" \
+            --gate1-ref-protected "$REF_PROTECTED" \
+            --evaluated-at "$evaluated_at" \
+            --output /tmp/personal-relay-gate1-receipt.json
+          receipt_sha=$(bash ./deploy/personal-relay/canonical-json-sha256.sh /tmp/personal-relay-gate1-receipt.json)
+          echo "receipt_sha256=$receipt_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Seal validation evidence into one dedicated directory
+        env:
+          IMAGE_ARTIFACT_DIGEST: ${{ needs.image-validation.outputs.artifact_digest }}
+          IMAGE_ARTIFACT_ID: ${{ needs.image-validation.outputs.artifact_id }}
+          IMAGE_ARTIFACT_NAME: ${{ needs.image-validation.outputs.artifact_name }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.source-proof.outputs.artifact_digest }}
+          SOURCE_ARTIFACT_ID: ${{ needs.source-proof.outputs.artifact_id }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.source-proof.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          stage=/tmp/personal-relay-gate1-validation-evidence
+          mkdir -p "$stage"
+          cp /tmp/personal-relay-gate1-receipt.json "$stage/"
+          cp /tmp/personal-relay-gate1-approval.json "$stage/"
+          cp /tmp/personal-relay-gate1-run.json "$stage/"
+          cp /tmp/personal-relay-gate1-environment.json "$stage/"
+          cp /tmp/personal-relay-gate1-branch-policies.json "$stage/"
+          cp /tmp/personal-relay-gate1-environment-approvals.json "$stage/"
+          cp /tmp/personal-relay-main-branch.json "$stage/"
+          cp /tmp/personal-relay-main-effective-rules.json "$stage/"
+          cp /tmp/personal-relay-gate1-main-rulesets.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-main-branch.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-main-effective-rules.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-main-rulesets.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-environment.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-branch-policies.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-approval-history.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-run-identity.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-reviewer.json "$stage/"
+          cp /tmp/personal-relay-release-evidence/personal-relay-release-authorization.json "$stage/"
+          cp /tmp/personal-relay-gate1-approval-secret-scan-proof.json "$stage/"
+          cp /tmp/personal-relay-gate1-approval-secret.json "$stage/"
+          cp /tmp/personal-relay-gate1-source-artifact.json "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof.zip "$stage/"
+          cp /tmp/personal-relay-gate1-image-artifact.json "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof.zip "$stage/"
+          cp /tmp/personal-relay-release-run.json "$stage/"
+          cp /tmp/personal-relay-release-artifact.json "$stage/"
+          cp /tmp/personal-relay-release-evidence.zip "$stage/"
+          cp /tmp/personal-relay-release-authorization-artifact.json "$stage/"
+          cp /tmp/personal-relay-release-authorization-proof.zip "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/source-test-result.json "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/source-test-job.json "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/source-test-run.json "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/protected-workflow.yml "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/trusted-gate1-receipt-fixtures.log "$stage/"
+          cp /tmp/personal-relay-gate1-source-proof/trusted-release-contract-fixtures.log "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/runtime-verification.json "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/runtime-contract.log "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/release-provenance-verification.json "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/secret-scan-proof.json "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-amd64.json "$stage/"
+          cp /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-arm64.json "$stage/"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg gate1_workflow_sha "$GITHUB_SHA" \
+            --argjson gate1_run_id "$GITHUB_RUN_ID" \
+            --argjson gate1_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg deployment_ref "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --arg receipt_sha256 "${{ steps.receipt.outputs.receipt_sha256 }}" \
+            --argjson source_artifact_id "$SOURCE_ARTIFACT_ID" \
+            --arg source_artifact_name "$SOURCE_ARTIFACT_NAME" \
+            --arg source_artifact_digest "$SOURCE_ARTIFACT_DIGEST" \
+            --argjson image_artifact_id "$IMAGE_ARTIFACT_ID" \
+            --arg image_artifact_name "$IMAGE_ARTIFACT_NAME" \
+            --arg image_artifact_digest "$IMAGE_ARTIFACT_DIGEST" \
+            --slurpfile receipt /tmp/personal-relay-gate1-receipt.json '
+            {
+              repository: $repository,
+              source_sha: $source_sha,
+              gate1_workflow_sha: $gate1_workflow_sha,
+              gate1_run_id: $gate1_run_id,
+              gate1_run_attempt: $gate1_run_attempt,
+              deployment_ref: $deployment_ref,
+              receipt_sha256: $receipt_sha256,
+              source_tests_artifact: {id: $source_artifact_id, name: $source_artifact_name, digest: $source_artifact_digest},
+              image_validation_artifact: {id: $image_artifact_id, name: $image_artifact_name, digest: $image_artifact_digest},
+              release_main_protection: $receipt[0].release_evidence.main_protection,
+              validation_complete: true,
+              deployed: false
+            }
+          ' > "$stage/personal-relay-gate1-validation-ledger.json"
+
+      - name: Scan sealed protected-validation evidence for secrets before upload
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-validation-evidence
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-validation-evidence-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-trivy-config.yaml
+          trivyignores: /tmp/personal-relay-trivy-ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret protected-validation evidence report
+        run: |
+          set -euo pipefail
+          [[ "$(cat /tmp/personal-relay-trivy-config.yaml)" == "{}" ]]
+          [[ ! -s /tmp/personal-relay-trivy-ignore ]]
+          [[ "$(cat /tmp/personal-relay-trivy-secret.yaml)" == "{}" ]]
+          report=/tmp/personal-relay-gate1-validation-evidence-secret.json
+          bound_report=/tmp/personal-relay-gate1-validation-evidence-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+          install -m 0444 "$report" \
+            /tmp/personal-relay-gate1-validation-evidence/personal-relay-gate1-validation-evidence-secret.json
+
+      - name: Upload one sealed protected-validation directory
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.validation_artifact_name }}
+          path: /tmp/personal-relay-gate1-validation-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Validate sealed protected-validation artifact outputs
+        env:
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+
+  attest:
+    name: Protected receipt-only attestation
+    if: github.event_name == 'workflow_dispatch'
+    needs:
+      - source-proof
+      - image-validation
+      - validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: personal-relay-gate1
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: read
+    env:
+      APPROVAL_SHA256: ${{ inputs.approval_sha256 }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      REF_PROTECTED: ${{ github.ref_protected }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Checkout only the protected receipt verifier
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify receipt-only attestation invocation
+        env:
+          APPROVED_IMAGE_DIGEST: ${{ vars.PERSONAL_GATE1_APPROVED_IMAGE_DIGEST }}
+          APPROVED_SOURCE_SHA: ${{ vars.PERSONAL_GATE1_APPROVED_SOURCE_SHA }}
+          ENVIRONMENT_APPROVAL_SHA256: ${{ vars.PERSONAL_GATE1_APPROVAL_SHA256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+          [[ "$APPROVED_SOURCE_SHA" == "$SOURCE_SHA" ]]
+          [[ "$APPROVED_IMAGE_DIGEST" == "$IMAGE_DIGEST" ]]
+          [[ "$ENVIRONMENT_APPROVAL_SHA256" == "$APPROVAL_SHA256" ]]
+
+      - name: Download exact sealed validation artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATION_ARTIFACT_DIGEST: ${{ needs.validate.outputs.artifact_digest }}
+          VALIDATION_ARTIFACT_ID: ${{ needs.validate.outputs.artifact_id }}
+          VALIDATION_ARTIFACT_NAME: ${{ needs.validate.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$VALIDATION_ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$VALIDATION_ARTIFACT_NAME" \
+            --digest "$VALIDATION_ARTIFACT_DIGEST" \
+            --output-dir /tmp/personal-relay-gate1-validation-evidence \
+            --metadata-output /tmp/personal-relay-gate1-validation-artifact.json \
+            --archive-output /tmp/personal-relay-gate1-validation-evidence.zip
+
+      - name: Revalidate exact receipt, expiry, proof identities, and run-level approval evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_ARTIFACT_DIGEST: ${{ needs.image-validation.outputs.artifact_digest }}
+          IMAGE_ARTIFACT_ID: ${{ needs.image-validation.outputs.artifact_id }}
+          IMAGE_ARTIFACT_NAME: ${{ needs.image-validation.outputs.artifact_name }}
+          RECEIPT_SHA256: ${{ needs.validate.outputs.receipt_sha256 }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.source-proof.outputs.artifact_digest }}
+          SOURCE_ARTIFACT_ID: ${{ needs.source-proof.outputs.artifact_id }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.source-proof.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          dir=/tmp/personal-relay-gate1-validation-evidence
+          receipt="$dir/personal-relay-gate1-receipt.json"
+          [[ -f "$receipt" && ! -L "$receipt" ]]
+          computed_sha=$(bash ./deploy/personal-relay/canonical-json-sha256.sh "$receipt")
+          [[ "$computed_sha" == "$RECEIPT_SHA256" ]]
+          release_branch="$dir/personal-relay-release-main-branch.json"
+          release_rules="$dir/personal-relay-release-main-effective-rules.json"
+          release_rulesets="$dir/personal-relay-release-main-rulesets.json"
+          release_environment="$dir/personal-relay-release-environment.json"
+          release_branch_policies="$dir/personal-relay-release-branch-policies.json"
+          release_approval_history="$dir/personal-relay-release-approval-history.json"
+          release_run_identity="$dir/personal-relay-release-run-identity.json"
+          release_reviewer="$dir/personal-relay-release-reviewer.json"
+          release_authorization="$dir/personal-relay-release-authorization.json"
+          for release_proof in \
+            "$release_branch" "$release_rules" "$release_rulesets" \
+            "$release_environment" "$release_branch_policies" \
+            "$release_approval_history" "$release_run_identity" \
+            "$release_reviewer" "$release_authorization"; do
+            [[ -f "$release_proof" && ! -L "$release_proof" ]]
+            jq -e . "$release_proof" >/dev/null
+          done
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$release_branch" \
+            --rules-json "$release_rules" \
+            --rulesets-json "$release_rulesets" \
+            --expected-sha "$SOURCE_SHA" \
+            --expected-repository justinharkelroad/buzz >/dev/null
+          release_branch_sha=$(sha256sum "$release_branch" | awk '{print $1}')
+          release_rules_sha=$(sha256sum "$release_rules" | awk '{print $1}')
+          release_rulesets_sha=$(sha256sum "$release_rulesets" | awk '{print $1}')
+          release_environment_sha=$(sha256sum "$release_environment" | awk '{print $1}')
+          release_branch_policies_sha=$(sha256sum "$release_branch_policies" | awk '{print $1}')
+          release_approval_history_sha=$(sha256sum "$release_approval_history" | awk '{print $1}')
+          release_run_identity_sha=$(sha256sum "$release_run_identity" | awk '{print $1}')
+          release_reviewer_sha=$(sha256sum "$release_reviewer" | awk '{print $1}')
+          release_authorization_sha=$(sha256sum "$release_authorization" | awk '{print $1}')
+          release_run_id=$(jq -er '.release_evidence.workflow_run_id' "$receipt")
+          [[ "$release_run_id" =~ ^[1-9][0-9]*$ ]]
+          jq -e '
+            type == "object"
+            and .name == "personal-relay-release"
+            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
+              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 1
+            and ([.protection_rules[] | select(.type == "required_reviewers")][0].prevent_self_review == true)
+            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers | length) == 1
+            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[0].type == "User")
+            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[0].reviewer | keys) == ["id", "login", "node_id"]
+          ' "$release_environment" >/dev/null
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and (.branch_policies[0] | keys) == ["id", "name", "node_id"]
+            and .branch_policies[0].name == "main"
+          ' "$release_branch_policies" >/dev/null
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --argjson run_id "$release_run_id" '
+              .id == $run_id
+              and .run_attempt == 1
+              and .head_branch == "main"
+              and .head_sha == $source_sha
+              and .event == "workflow_dispatch"
+              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .repository.full_name == $repository
+            ' "$release_run_identity" >/dev/null
+          jq -e '
+            type == "object"
+            and keys == ["reviewer", "type"]
+            and .type == "User"
+            and (.reviewer | keys) == ["id", "login", "node_id"]
+          ' "$release_reviewer" >/dev/null
+          jq -e \
+            --slurpfile environment "$release_environment" \
+            --slurpfile run "$release_run_identity" \
+            --slurpfile reviewer "$release_reviewer" '
+              type == "array"
+              and length == 1
+              and .[0].state == "approved"
+              and (.[0].environments | length) == 1
+              and .[0].environments[0].name == "personal-relay-release"
+              and .[0].user == $reviewer[0].reviewer
+              and any($environment[0].protection_rules[] | select(.type == "required_reviewers") | .reviewers[];
+                .type == "User" and .reviewer == $reviewer[0].reviewer)
+              and $reviewer[0].reviewer.id != $run[0].actor.id
+              and $reviewer[0].reviewer.node_id != $run[0].actor.node_id
+              and $reviewer[0].reviewer.id != $run[0].triggering_actor.id
+              and $reviewer[0].reviewer.node_id != $run[0].triggering_actor.node_id
+            ' "$release_approval_history" >/dev/null
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image_name "$IMAGE_NAME" \
+            --arg candidate_tag "sha-${SOURCE_SHA}" \
+            --arg workflow_ref "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" \
+            --argjson run_id "$release_run_id" \
+            --arg branch_sha "$release_branch_sha" \
+            --arg rules_sha "$release_rules_sha" \
+            --arg rulesets_sha "$release_rulesets_sha" \
+            --arg environment_sha "$release_environment_sha" \
+            --arg branch_policies_sha "$release_branch_policies_sha" \
+            --arg approval_history_sha "$release_approval_history_sha" \
+            --arg run_identity_sha "$release_run_identity_sha" \
+            --arg reviewer_sha "$release_reviewer_sha" \
+            --slurpfile environment "$release_environment" '
+              keys == ["admin_bypass_api_state", "admin_bypass_settings_receipt_sha256", "approval_history_sha256", "branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "reviewer_sha256", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+              and .schema == "personal-relay-release-authorization/v2"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .image_name == $image_name
+              and .candidate_tag == $candidate_tag
+              and .branch == "main"
+              and .ref_protected == true
+              and .workflow_sha == $source_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .branch_metadata_sha256 == $branch_sha
+              and .effective_rules_sha256 == $rules_sha
+              and .rulesets_sha256 == $rulesets_sha
+              and .environment_sha256 == $environment_sha
+              and .branch_policies_sha256 == $branch_policies_sha
+              and .approval_history_sha256 == $approval_history_sha
+              and .run_identity_sha256 == $run_identity_sha
+              and .reviewer_sha256 == $reviewer_sha
+              and ((.admin_bypass_api_state == "disabled"
+                  and $environment[0].can_admins_bypass_exposed == true
+                  and $environment[0].can_admins_bypass == false)
+                or (.admin_bypass_api_state == "not-exposed"
+                  and $environment[0].can_admins_bypass_exposed == false
+                  and $environment[0].can_admins_bypass == null))
+              and (.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
+            ' "$release_authorization" >/dev/null
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$dir/personal-relay-main-branch.json" \
+            --rules-json "$dir/personal-relay-main-effective-rules.json" \
+            --rulesets-json "$dir/personal-relay-gate1-main-rulesets.json" \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-repository justinharkelroad/buzz >/dev/null
+          branch_metadata_sha=$(sha256sum "$dir/personal-relay-main-branch.json" | awk '{print $1}')
+          effective_rules_sha=$(sha256sum "$dir/personal-relay-main-effective-rules.json" | awk '{print $1}')
+          rulesets_sha=$(sha256sum "$dir/personal-relay-gate1-main-rulesets.json" | awk '{print $1}')
+          now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image "$IMAGE_NAME" \
+            --arg image_digest "$IMAGE_DIGEST" \
+            --arg approval_sha "$APPROVAL_SHA256" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg branch_metadata_sha "$branch_metadata_sha" \
+            --arg effective_rules_sha "$effective_rules_sha" \
+            --arg rulesets_sha "$rulesets_sha" \
+            --arg release_branch_sha "$release_branch_sha" \
+            --arg release_rules_sha "$release_rules_sha" \
+            --arg release_rulesets_sha "$release_rulesets_sha" \
+            --arg release_environment_sha "$release_environment_sha" \
+            --arg release_branch_policies_sha "$release_branch_policies_sha" \
+            --arg release_approval_history_sha "$release_approval_history_sha" \
+            --arg release_run_identity_sha "$release_run_identity_sha" \
+            --arg release_reviewer_sha "$release_reviewer_sha" \
+            --arg release_authorization_sha "$release_authorization_sha" \
+            --arg release_authorization_artifact_name "personal-relay-release-approval-${SOURCE_SHA}-${release_run_id}-1" \
+            --arg now "$now" \
+            --argjson source_artifact_id "$SOURCE_ARTIFACT_ID" \
+            --arg source_artifact_name "$SOURCE_ARTIFACT_NAME" \
+            --arg source_artifact_digest "$SOURCE_ARTIFACT_DIGEST" \
+            --argjson image_artifact_id "$IMAGE_ARTIFACT_ID" \
+            --arg image_artifact_name "$IMAGE_ARTIFACT_NAME" \
+            --arg image_artifact_digest "$IMAGE_ARTIFACT_DIGEST" '
+              .source_sha == $source_sha
+              and .image == $image
+              and .image_digest == $image_digest
+              and .deployment_ref == ($image + "@" + $image_digest)
+              and .approval.canonical_sha256 == $approval_sha
+              and .gate1_workflow.sha == $workflow_sha
+              and .gate1_workflow.ref == $workflow_ref
+              and .gate1_workflow.run == $workflow_run
+              and .gate1_workflow.run_attempt == 1
+              and .release_evidence.main_protection.branch == "main"
+              and .release_evidence.main_protection.commit_sha == $source_sha
+              and .release_evidence.main_protection.ref_protected == true
+              and .release_evidence.main_protection.branch_metadata_sha256 == $release_branch_sha
+              and .release_evidence.main_protection.effective_rules_sha256 == $release_rules_sha
+              and .release_evidence.main_protection.rulesets_sha256 == $release_rulesets_sha
+              and .release_evidence.release_approval.environment == "personal-relay-release"
+              and .release_evidence.release_approval.image_name == $image
+              and .release_evidence.release_approval.candidate_tag == ("sha-" + $source_sha)
+              and .release_evidence.release_approval.environment_sha256 == $release_environment_sha
+              and .release_evidence.release_approval.branch_policies_sha256 == $release_branch_policies_sha
+              and .release_evidence.release_approval.approval_history_sha256 == $release_approval_history_sha
+              and .release_evidence.release_approval.run_identity_sha256 == $release_run_identity_sha
+              and .release_evidence.release_approval.reviewer_sha256 == $release_reviewer_sha
+              and .release_evidence.release_approval.authorization_sha256 == $release_authorization_sha
+              and (.release_evidence.release_approval.admin_bypass_api_state == "disabled" or .release_evidence.release_approval.admin_bypass_api_state == "not-exposed")
+              and (.release_evidence.release_approval.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
+              and (.release_evidence.release_approval.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
+              and .release_evidence.release_approval.evidence_artifact.name == $release_authorization_artifact_name
+              and (.release_evidence.release_approval.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
+              and (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601) > ($now | fromdateiso8601)
+              and .main_protection == {
+                branch: "main",
+                commit_sha: $workflow_sha,
+                ref_protected: true,
+                branch_metadata_sha256: $branch_metadata_sha,
+                effective_rules_sha256: $effective_rules_sha,
+                rulesets_sha256: $rulesets_sha
+              }
+              and .acceptance_proofs.source_tests_artifact == {
+                id: $source_artifact_id, name: $source_artifact_name, digest: $source_artifact_digest
+              }
+              and .acceptance_proofs.image_validation_artifact == {
+                id: $image_artifact_id, name: $image_artifact_name, digest: $image_artifact_digest
+              }
+              and .findings.complete == true
+              and .deployment_eligible == true
+              and (.eligibility_expires_at | fromdateiso8601) > ($now | fromdateiso8601)
+              and (.release_evidence.expires_at | fromdateiso8601) > ($now | fromdateiso8601)
+              and (.eligibility_expires_at | fromdateiso8601) <= (.release_evidence.expires_at | fromdateiso8601)
+              and (.eligibility_expires_at | fromdateiso8601) <= (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601)
+              and .non_effects.actions_evidence_artifacts_published == true
+              and .non_effects.registry_package_published == false
+              and .non_effects.registry_package_mutated == false
+              and .non_effects.candidate_tag_mutated == false
+              and .non_effects.infrastructure_deployed == false
+              and .non_effects.production_cutover_authorized == false
+            ' "$receipt" >/dev/null
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            > /tmp/personal-relay-gate1-attest-run.raw.json
+          jq '{
+            id,
+            run_attempt,
+            event,
+            head_sha,
+            head_branch,
+            path,
+            repository: {full_name: .repository.full_name},
+            actor: (.actor | {login, id, node_id}),
+            triggering_actor: (.triggering_actor | {login, id, node_id})
+          }' /tmp/personal-relay-gate1-attest-run.raw.json \
+            > /tmp/personal-relay-gate1-attest-run.json
+          triggering_id=$(jq -r .triggering_actor.id /tmp/personal-relay-gate1-attest-run.json)
+          jq -e \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg workflow_sha "$GITHUB_SHA" '
+              .id == $run_id
+              and .run_attempt == 1
+              and .head_sha == $workflow_sha
+              and .head_branch == "main"
+              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}
+                == {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id})
+            ' /tmp/personal-relay-gate1-attest-run.json >/dev/null
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            > /tmp/personal-relay-gate1-attest-environment-approvals.raw.json
+          jq '[.[] | {
+            state,
+            environments: [.environments[]? | {id, name}],
+            user: (.user | {login, id, node_id})
+          }]' /tmp/personal-relay-gate1-attest-environment-approvals.raw.json \
+            > /tmp/personal-relay-gate1-attest-environment-approvals.json
+          jq -e --argjson triggering_id "$triggering_id" '
+            any(.[];
+              .state == "approved"
+              and (.user.id | type == "number" and . >= 1 and . != $triggering_id)
+              and (.user.node_id | type == "string" and length > 0)
+              and any(.environments[]?; .name == "personal-relay-gate1")
+            )
+          ' /tmp/personal-relay-gate1-attest-environment-approvals.json >/dev/null
+
+      - name: Re-fetch and byte-compare live protections immediately before attestation
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          sealed=/tmp/personal-relay-gate1-validation-evidence
+          live=/tmp/personal-relay-gate1-live-protection
+          [[ ! -e "$live" && ! -L "$live" ]]
+          install -d -m 0700 "$live"
+
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            > "$live/main-branch.json"
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            > "$live/main-effective-rule-pages.json"
+          jq -S '
+            def canonical:
+              if type == "object" then
+                to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+              elif type == "array" then map(canonical)
+              else . end;
+            [.[][] | {
+              type,
+              parameters: (.parameters | canonical),
+              ruleset_id,
+              ruleset_source_type,
+              ruleset_source
+            }]
+            | sort_by(.ruleset_id // 0, .type, (.parameters | tojson), .ruleset_source_type, .ruleset_source)
+          ' \
+            "$live/main-effective-rule-pages.json" \
+            > "$live/main-effective-rules.json"
+          mapfile -t ruleset_ids < <(
+            jq -r '[.[] | .ruleset_id | select(type == "number" and . >= 1 and floor == .)] | unique | .[]' \
+              "$live/main-effective-rules.json"
+          )
+          ((${#ruleset_ids[@]} > 0))
+          install -d -m 0700 "$live/ruleset-details"
+          ruleset_details=()
+          for ruleset_id in "${ruleset_ids[@]}"; do
+            raw_ruleset="$live/ruleset-details/${ruleset_id}.raw.json"
+            ruleset_detail="$live/ruleset-details/${ruleset_id}.json"
+            [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$raw_ruleset"
+            jq -e --argjson ruleset_id "$ruleset_id" '
+              .id == $ruleset_id
+              and has("bypass_actors")
+              and (.bypass_actors | type == "array")
+            ' "$raw_ruleset" >/dev/null
+            jq -S '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$raw_ruleset" > "$ruleset_detail"
+            ruleset_details+=("$ruleset_detail")
+          done
+          jq -sS 'sort_by(.id)' "${ruleset_details[@]}" > "$live/main-rulesets.json"
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$live/main-branch.json" \
+            --rules-json "$live/main-effective-rules.json" \
+            --rulesets-json "$live/main-rulesets.json" \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-repository justinharkelroad/buzz >/dev/null
+
+          cmp -s "$live/main-branch.json" \
+            "$sealed/personal-relay-main-branch.json"
+          cmp -s "$live/main-effective-rules.json" \
+            "$sealed/personal-relay-main-effective-rules.json"
+          cmp -s "$live/main-rulesets.json" \
+            "$sealed/personal-relay-gate1-main-rulesets.json"
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-gate1" \
+            > "$live/environment.raw.json"
+          jq -S '{
+            id,
+            node_id,
+            name,
+            can_admins_bypass_exposed: has("can_admins_bypass"),
+            can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
+            protection_rules: [.protection_rules[]
+              | if .type == "required_reviewers" then {
+                  type,
+                  prevent_self_review,
+                  reviewers: [.reviewers[] | {
+                    type,
+                    reviewer: {
+                      login: (.reviewer.login // ""),
+                      id: .reviewer.id,
+                      node_id: .reviewer.node_id
+                    }
+                  }] | sort_by(.type, .reviewer.login, .reviewer.id, .reviewer.node_id)
+                } else {type} end
+            ] | sort_by(.type),
+            deployment_branch_policy
+          }' "$live/environment.raw.json" > "$live/environment.json"
+          jq -e '
+            .name == "personal-relay-gate1"
+            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
+              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
+            and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
+            and any(.protection_rules[]?;
+              .type == "required_reviewers"
+              and .prevent_self_review == true
+              and (.reviewers | type == "array" and length > 0)
+            )
+          ' "$live/environment.json" >/dev/null
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-gate1/deployment-branch-policies?per_page=100" \
+            > "$live/environment-branch-policy-pages.json"
+          jq '{
+            total_count: ([.[] | .branch_policies[]] | length),
+            branch_policies: [.[] | .branch_policies[] | {id, node_id, name}]
+          }' "$live/environment-branch-policy-pages.json" \
+            > "$live/environment-branch-policies.json"
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and (.branch_policies[0] | keys | sort) == ["id", "name", "node_id"]
+            and (.branch_policies[0].id | type == "number" and . >= 1 and floor == .)
+            and (.branch_policies[0].node_id | type == "string" and length > 0)
+            and .branch_policies[0].name == "main"
+          ' "$live/environment-branch-policies.json" >/dev/null
+          jq -S . "$live/environment.json" > "$live/environment.canonical.json"
+          jq -S . "$sealed/personal-relay-gate1-environment.json" \
+            > "$live/sealed-environment.canonical.json"
+          cmp -s "$live/environment.canonical.json" "$live/sealed-environment.canonical.json"
+          jq -S '.branch_policies |= sort_by(.id, .node_id, .name)' \
+            "$live/environment-branch-policies.json" \
+            > "$live/environment-branch-policies.canonical.json"
+          jq -S '.branch_policies |= sort_by(.id, .node_id, .name)' \
+            "$sealed/personal-relay-gate1-branch-policies.json" \
+            > "$live/sealed-environment-branch-policies.canonical.json"
+          cmp -s "$live/environment-branch-policies.canonical.json" \
+            "$live/sealed-environment-branch-policies.canonical.json"
+          minimum_valid_until=$(( $(date -u '+%s') + 1500 ))
+          jq -e --argjson minimum_valid_until "$minimum_valid_until" '
+            (.eligibility_expires_at | fromdateiso8601) > $minimum_valid_until
+            and (.release_evidence.expires_at | fromdateiso8601) > $minimum_valid_until
+            and (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
+          ' "$sealed/personal-relay-gate1-receipt.json" >/dev/null
+
+      - name: Attest receipt as the exact image custom predicate
+        id: attest-receipt
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-name: ${{ inputs.image_name }}
+          subject-digest: ${{ inputs.image_digest }}
+          predicate-type: https://github.com/justinharkelroad/buzz/attestations/personal-relay-gate1/v1
+          predicate-path: /tmp/personal-relay-gate1-validation-evidence/personal-relay-gate1-receipt.json
+          push-to-registry: false
+          show-summary: false
+
+      - name: Verify exact custom receipt attestation without executing the image
+        env:
+          BUNDLE_PATH: ${{ steps.attest-receipt.outputs.bundle-path }}
+          DEPLOYMENT_REF: ${{ needs.validate.outputs.deployment_ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE_PATH" /tmp/personal-relay-gate1-attestation-bundle.json
+          export DOCKER_CONFIG=/tmp/personal-relay-gate1-attest-docker-config
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+          install -d -m 0700 "$DOCKER_CONFIG"
+          cleanup_registry_auth() {
+            if [[ -f "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]; then
+              shred -u "$DOCKER_CONFIG/config.json" || true
+            fi
+            rmdir "$DOCKER_CONFIG" 2>/dev/null || true
+          }
+          trap cleanup_registry_auth EXIT
+          registry_auth=$(printf '%s' "${GITHUB_ACTOR}:${GH_TOKEN}" | base64 | tr -d '\n')
+          jq -n --arg auth "$registry_auth" '{auths: {"ghcr.io": {auth: $auth}}}' \
+            > "$DOCKER_CONFIG/config.json"
+          unset registry_auth
+          gh attestation verify --hostname github.com "oci://${DEPLOYMENT_REF}" \
+            --bundle /tmp/personal-relay-gate1-attestation-bundle.json \
+            -R "$GITHUB_REPOSITORY" \
+            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-relay-gate1/v1 \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml \
+            --signer-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners \
+            --format json > /tmp/personal-relay-gate1-attestation-verification.json
+          jq -e \
+            --arg image "$IMAGE_NAME" \
+            --arg digest "${IMAGE_DIGEST#sha256:}" \
+            --slurpfile receipt /tmp/personal-relay-gate1-validation-evidence/personal-relay-gate1-receipt.json '
+              length == 1
+              and all(.[].verificationResult.statement;
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-relay-gate1/v1"
+                and any(.subject[]?; .name == $image and .digest.sha256 == $digest)
+                and .predicate == $receipt[0]
+              )
+            ' /tmp/personal-relay-gate1-attestation-verification.json >/dev/null
+          [[ -f "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+          shred -u "$DOCKER_CONFIG/config.json"
+          [[ ! -e "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+          rmdir "$DOCKER_CONFIG"
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+          trap - EXIT
+
+      - name: Seal final receipt and attestation evidence in one directory
+        env:
+          DEPLOYMENT_REF: ${{ needs.validate.outputs.deployment_ref }}
+          RECEIPT_SHA256: ${{ needs.validate.outputs.receipt_sha256 }}
+          VALIDATION_ARTIFACT_DIGEST: ${{ needs.validate.outputs.artifact_digest }}
+          VALIDATION_ARTIFACT_ID: ${{ needs.validate.outputs.artifact_id }}
+          VALIDATION_ARTIFACT_NAME: ${{ needs.validate.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          stage=/tmp/personal-relay-gate1-final-evidence
+          mkdir -p "$stage"
+          cp -R /tmp/personal-relay-gate1-validation-evidence/. "$stage/"
+          cp /tmp/personal-relay-gate1-validation-artifact.json "$stage/"
+          cp /tmp/personal-relay-gate1-validation-evidence.zip "$stage/"
+          cp /tmp/personal-relay-gate1-attest-run.json "$stage/"
+          cp /tmp/personal-relay-gate1-attest-environment-approvals.json "$stage/"
+          cp /tmp/personal-relay-gate1-attestation-bundle.json "$stage/"
+          cp /tmp/personal-relay-gate1-attestation-verification.json "$stage/"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg gate1_workflow_sha "$GITHUB_SHA" \
+            --argjson gate1_run_id "$GITHUB_RUN_ID" \
+            --argjson gate1_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg deployment_ref "$DEPLOYMENT_REF" \
+            --arg receipt_sha256 "$RECEIPT_SHA256" \
+            --argjson validation_artifact_id "$VALIDATION_ARTIFACT_ID" \
+            --arg validation_artifact_name "$VALIDATION_ARTIFACT_NAME" \
+            --arg validation_artifact_digest "$VALIDATION_ARTIFACT_DIGEST" \
+            --arg bundle_sha256 "$(sha256sum /tmp/personal-relay-gate1-attestation-bundle.json | awk '{print $1}')" \
+            --arg verification_sha256 "$(sha256sum /tmp/personal-relay-gate1-attestation-verification.json | awk '{print $1}')" \
+            --arg attestation_id "${{ steps.attest-receipt.outputs.attestation-id }}" \
+            --arg attestation_url "${{ steps.attest-receipt.outputs.attestation-url }}" '
+            {
+              repository: $repository,
+              source_sha: $source_sha,
+              gate1_workflow_sha: $gate1_workflow_sha,
+              gate1_run_id: $gate1_run_id,
+              gate1_run_attempt: $gate1_run_attempt,
+              deployment_ref: $deployment_ref,
+              receipt_sha256: $receipt_sha256,
+              validation_artifact: {
+                id: $validation_artifact_id,
+                name: $validation_artifact_name,
+                digest: $validation_artifact_digest
+              },
+              predicate_type: "https://github.com/justinharkelroad/buzz/attestations/personal-relay-gate1/v1",
+              attestation_id: $attestation_id,
+              attestation_url: $attestation_url,
+              bundle_sha256: $bundle_sha256,
+              verification_sha256: $verification_sha256,
+              deployment_eligible: true,
+              deployed: false
+            }
+          ' > "$stage/personal-relay-gate1-attestation-ledger.json"
+
+      - name: Create fail-closed final-evidence secret-scan policy
+        run: |
+          set -euo pipefail
+          policy_root=/tmp/personal-relay-gate1-final-evidence-policy
+          [[ ! -e "$policy_root" && ! -L "$policy_root" ]]
+          install -d -m 0700 "$policy_root"
+          printf '{}\n' > "$policy_root/trivy.yaml"
+          install -m 0600 /dev/null "$policy_root/trivy.ignore"
+          printf '{}\n' > "$policy_root/secret.yaml"
+          chmod 0400 "$policy_root/trivy.yaml" "$policy_root/trivy.ignore" "$policy_root/secret.yaml"
+
+      - name: Scan final Gate 1 attestation evidence for secrets before upload
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-gate1-final-evidence-policy/trivy.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-gate1-final-evidence-policy/trivy.ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-gate1-final-evidence-policy/secret.yaml
+        with:
+          cache: false
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-gate1-final-evidence
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-gate1-final-evidence-secret.json
+          exit-code: "1"
+          trivy-config: /tmp/personal-relay-gate1-final-evidence-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-gate1-final-evidence-policy/trivy.ignore
+          version: v0.70.0
+
+      - name: Bind zero-secret final Gate 1 evidence report
+        run: |
+          set -euo pipefail
+          [[ "$(cat /tmp/personal-relay-gate1-final-evidence-policy/trivy.yaml)" == "{}" ]]
+          [[ ! -s /tmp/personal-relay-gate1-final-evidence-policy/trivy.ignore ]]
+          [[ "$(cat /tmp/personal-relay-gate1-final-evidence-policy/secret.yaml)" == "{}" ]]
+          report=/tmp/personal-relay-gate1-final-evidence-secret.json
+          bound_report=/tmp/personal-relay-gate1-final-evidence-secret-bound.json
+          jq '. + {Trivy: {Version: "0.70.0"}}' \
+            "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]? | .Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+          install -m 0444 "$report" \
+            /tmp/personal-relay-gate1-final-evidence/personal-relay-gate1-final-evidence-secret.json
+
+      - name: Upload final Gate 1 receipt evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-gate1-receipt-${{ inputs.source_sha }}-${{ needs.validate.outputs.image_digest_hex }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/personal-relay-gate1-final-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        env:
+          DEPLOYMENT_REF: ${{ needs.validate.outputs.deployment_ref }}
+          RECEIPT_SHA256: ${{ needs.validate.outputs.receipt_sha256 }}
+        run: |
+          {
+            echo "### Personal relay Gate 1 receipt"
+            echo
+            echo "Exact image: \`$DEPLOYMENT_REF\`"
+            echo
+            echo "Canonical receipt SHA-256: \`$RECEIPT_SHA256\`"
+            echo
+            echo "This attested receipt permits only a separately authorized synthetic staging deployment."
+            echo
+            echo "No tag, package, infrastructure, desktop installation, hosted Buzz state, or production traffic was changed."
+          } >> "$GITHUB_STEP_SUMMARY"

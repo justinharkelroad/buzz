@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # Public Buzz relay image — published as ghcr.io/block/buzz:<tag>.
 #
@@ -28,7 +28,7 @@ ARG EXTRA_CA_CERTS=
 ARG NPM_REGISTRY=
 
 # ─── Stage 1: cargo-chef base ───────────────────────────────────────────────
-FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS chef
 # Trust an optional corporate-proxy CA before any network fetch (no-op if unset).
 ARG EXTRA_CA_CERTS
 COPY --chmod=0644 ${EXTRA_CA_CERTS:-Dockerfile} /tmp/extra-ca/src
@@ -81,7 +81,7 @@ RUN strip target/release/buzz-relay \
 # ─── Stage 4: web bundle (pnpm + vite) ──────────────────────────────────────
 # Independent of the Rust layers so a CSS change doesn't bust Rust cache and
 # vice versa.
-FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim AS web-builder
+FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7 AS web-builder
 WORKDIR /build
 # Trust an optional corporate-proxy CA so corepack + pnpm can fetch over an
 # intercepting TLS gateway (no-op if EXTRA_CA_CERTS is unset).
@@ -119,7 +119,7 @@ COPY admin-web/ admin-web/
 RUN pnpm -C web build && pnpm -C admin-web build
 
 # ─── Stage 5: shared runtime ────────────────────────────────────────────────
-FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
+FROM debian:${DEBIAN_VERSION}-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime-base
 
 # OCI annotations: required for GHCR to auto-link the image to this repo and
 # inherit its visibility. org.opencontainers.image.source is the load-bearing

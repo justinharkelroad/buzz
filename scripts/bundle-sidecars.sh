@@ -31,7 +31,7 @@ fi
 
 missing=()
 for bin in "${SIDECARS[@]}"; do
-    [[ -f "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
+    [[ -f "$SRC_DIR/${bin}${EXE}" && ! -L "$SRC_DIR/${bin}${EXE}" ]] || missing+=("${bin}${EXE}")
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Error: missing release binaries in $SRC_DIR: ${missing[*]}" >&2
@@ -41,14 +41,15 @@ fi
 
 mkdir -p "$BINARIES_DIR"
 for bin in "${SIDECARS[@]}"; do
+    source_binary="$SRC_DIR/${bin}${EXE}"
     destination="$BINARIES_DIR/${bin}-${TARGET}${EXE}"
-    cp "$SRC_DIR/${bin}${EXE}" "$destination"
-
-    # cp preserves the mode of an existing destination on macOS. Generated
-    # sidecar placeholders may not be executable, so make the bundled Unix
-    # binaries executable explicitly.
-    if [[ -z "$EXE" ]]; then
-        chmod 755 "$destination"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        if [[ ! -f "$destination" || -L "$destination" ]]; then
+            echo "Error: refusing to overwrite non-regular sidecar destination: $destination" >&2
+            exit 1
+        fi
     fi
+    install -m 0755 "$source_binary" "$destination"
+    [[ -f "$destination" && ! -L "$destination" && -x "$destination" ]]
 done
 echo "Sidecars bundled for $TARGET"

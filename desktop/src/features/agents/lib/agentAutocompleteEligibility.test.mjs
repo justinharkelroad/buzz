@@ -6,6 +6,7 @@ import {
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentIdentityInManagedList,
+  isVerifiedAgentMemberOfActiveRegularChannel,
   relayAgentIsSharedWithUser,
   shouldHideAgentFromMentions,
 } from "./agentAutocompleteEligibility.ts";
@@ -158,6 +159,67 @@ test("isAgentIdentityInManagedList: keeps people and only current managed agent 
       { isAgent: true, pubkey: PUB_B },
       managedAgentPubkeys,
     ),
+    false,
+  );
+});
+
+test("isVerifiedAgentMemberOfActiveRegularChannel: accepts a verified foreign member in stream and forum channels", () => {
+  for (const channelType of ["stream", "forum"]) {
+    assert.equal(
+      isVerifiedAgentMemberOfActiveRegularChannel({
+        channelId: "active-channel",
+        channelType,
+        isAgent: true,
+        isMember: true,
+        isVerifiedAgent: true,
+      }),
+      true,
+    );
+  }
+});
+
+test("isVerifiedAgentMemberOfActiveRegularChannel: rejects foreign agents in DMs or outside the active channel", () => {
+  assert.equal(
+    isVerifiedAgentMemberOfActiveRegularChannel({
+      channelId: "active-dm",
+      channelType: "dm",
+      isAgent: true,
+      isMember: true,
+      isVerifiedAgent: true,
+    }),
+    false,
+  );
+  assert.equal(
+    isVerifiedAgentMemberOfActiveRegularChannel({
+      channelId: "active-channel",
+      channelType: "stream",
+      isAgent: true,
+      isMember: false,
+      isVerifiedAgent: true,
+    }),
+    false,
+  );
+});
+
+test("isVerifiedAgentMemberOfActiveRegularChannel: rejects unverified agent classifications and unresolved channel context", () => {
+  assert.equal(
+    isVerifiedAgentMemberOfActiveRegularChannel({
+      channelId: "active-channel",
+      channelType: "stream",
+      isAgent: true,
+      isMember: true,
+      isVerifiedAgent: false,
+    }),
+    false,
+  );
+  assert.equal(
+    isVerifiedAgentMemberOfActiveRegularChannel({
+      channelId: null,
+      channelType: "stream",
+      isAgent: true,
+      isMember: true,
+      isVerifiedAgent: true,
+    }),
     false,
   );
 });

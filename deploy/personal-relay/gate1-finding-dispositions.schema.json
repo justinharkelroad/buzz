@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/justinharkelroad/buzz/deploy/personal-relay/gate1-finding-dispositions.schema.json",
+  "title": "Personal relay Gate 1 finding dispositions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "approval_type",
+    "repository",
+    "source_sha",
+    "image",
+    "image_digest",
+    "deployment_ref",
+    "release_run_id",
+    "release_run_attempt",
+    "release_evidence_artifact_id",
+    "release_evidence_artifact_name",
+    "release_evidence_artifact_digest",
+    "release_evidence_expires_at",
+    "release_ledger_sha256",
+    "scanner_databases_sha256",
+    "findings_inventory_sha256",
+    "dispositions",
+    "approved_by",
+    "approved_at",
+    "eligibility_expires_at",
+    "evidence_reference"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "approval_type": { "const": "personal-relay-gate1-finding-dispositions" },
+    "repository": { "const": "justinharkelroad/buzz" },
+    "source_sha": { "$ref": "#/$defs/gitSha" },
+    "image": {
+      "type": "string",
+      "pattern": "^ghcr\\.io/justinharkelroad/[a-z0-9._-]+$"
+    },
+    "image_digest": { "$ref": "#/$defs/sha256Digest" },
+    "deployment_ref": {
+      "type": "string",
+      "pattern": "^ghcr\\.io/justinharkelroad/[a-z0-9._-]+@sha256:[0-9a-f]{64}$"
+    },
+    "release_run_id": { "type": "integer", "minimum": 1 },
+    "release_run_attempt": { "const": 1 },
+    "release_evidence_artifact_id": { "type": "integer", "minimum": 1 },
+    "release_evidence_artifact_name": {
+      "type": "string",
+      "pattern": "^personal-relay-evidence-[0-9a-f]{40}$"
+    },
+    "release_evidence_artifact_digest": { "$ref": "#/$defs/sha256Digest" },
+    "release_evidence_expires_at": { "$ref": "#/$defs/timestamp" },
+    "release_ledger_sha256": { "$ref": "#/$defs/sha256" },
+    "scanner_databases_sha256": { "$ref": "#/$defs/sha256" },
+    "findings_inventory_sha256": { "$ref": "#/$defs/sha256" },
+    "dispositions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/disposition" }
+    },
+    "approved_by": { "$ref": "#/$defs/githubIdentity" },
+    "approved_at": { "$ref": "#/$defs/timestamp" },
+    "eligibility_expires_at": { "$ref": "#/$defs/timestamp" },
+    "evidence_reference": { "$ref": "#/$defs/evidenceReference" }
+  },
+  "$defs": {
+    "gitSha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sha256Digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "githubLogin": { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$" },
+    "githubIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["login", "id", "node_id"],
+      "properties": {
+        "login": { "$ref": "#/$defs/githubLogin" },
+        "id": { "type": "integer", "minimum": 1 },
+        "node_id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_=-]+$"
+        }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "evidenceReference": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9._:/@#~-]+$"
+    },
+    "findingIdentity": {
+      "type": "object",
+      "required": [
+        "architecture",
+        "report_kind",
+        "result_index",
+        "finding_index",
+        "target",
+        "class",
+        "type",
+        "vulnerability_id",
+        "severity",
+        "package_id",
+        "package_name",
+        "installed_version",
+        "fixed_version",
+        "finding_id"
+      ],
+      "properties": {
+        "architecture": { "enum": ["amd64", "arm64"] },
+        "report_kind": { "enum": ["container_image", "spdx"] },
+        "result_index": { "type": "integer", "minimum": 0 },
+        "finding_index": { "type": "integer", "minimum": 0 },
+        "target": { "type": "string" },
+        "class": { "type": "string" },
+        "type": { "type": "string" },
+        "vulnerability_id": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["HIGH", "CRITICAL"] },
+        "package_id": { "type": "string" },
+        "package_name": { "type": "string" },
+        "installed_version": { "type": "string" },
+        "fixed_version": { "const": "" },
+        "finding_id": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "disposition": {
+      "allOf": [
+        { "$ref": "#/$defs/findingIdentity" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "architecture",
+            "report_kind",
+            "result_index",
+            "finding_index",
+            "target",
+            "class",
+            "type",
+            "vulnerability_id",
+            "severity",
+            "package_id",
+            "package_name",
+            "installed_version",
+            "fixed_version",
+            "finding_id",
+            "decision",
+            "rationale",
+            "reviewed_by",
+            "reviewed_at",
+            "evidence_reference",
+            "expires_at"
+          ],
+          "properties": {
+            "architecture": true,
+            "report_kind": true,
+            "result_index": true,
+            "finding_index": true,
+            "target": true,
+            "class": true,
+            "type": true,
+            "vulnerability_id": true,
+            "severity": true,
+            "package_id": true,
+            "package_name": true,
+            "installed_version": true,
+            "fixed_version": true,
+            "finding_id": true,
+            "decision": { "enum": ["accepted-risk", "mitigated", "not-exploitable"] },
+            "rationale": { "type": "string", "minLength": 20, "maxLength": 2000 },
+            "reviewed_by": { "$ref": "#/$defs/githubIdentity" },
+            "reviewed_at": { "$ref": "#/$defs/timestamp" },
+            "evidence_reference": { "$ref": "#/$defs/evidenceReference" },
+            "expires_at": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/timestamp" }
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "decision": { "const": "accepted-risk" } } },
+              "then": { "properties": { "expires_at": { "$ref": "#/$defs/timestamp" } } },
+              "else": { "properties": { "expires_at": { "type": "null" } } }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
