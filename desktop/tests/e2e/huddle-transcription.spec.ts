@@ -194,7 +194,15 @@ test("keeps a newer huddle event over a delayed hydration snapshot", async ({
 });
 
 test("starts an agent DM huddle with the agent enrolled", async ({ page }) => {
-  await installMockBridge(page);
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "alice",
+        status: "running",
+      },
+    ],
+  });
   await page.goto("/");
   await page.getByTestId("channel-alice-tyler").click();
   await expect(page.getByTestId("chat-title")).toHaveText("alice-tyler");
