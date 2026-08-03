@@ -7,9 +7,14 @@ on:
       - "benchmarks/harbor-buzz-orchestra/**"
       - ".github/workflows/benchmark-harbor.yml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "benchmarks/harbor-buzz-orchestra/**"
       - ".github/workflows/benchmark-harbor.yml"
+
+concurrency:
+  group: harbor-buzz-orchestra-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,6 +22,7 @@ permissions:
 jobs:
   test:
     name: Python tests and lint
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
