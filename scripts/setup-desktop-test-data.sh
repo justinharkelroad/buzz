@@ -85,24 +85,30 @@ UUID_DM_ALICE_TYLER=$(uuid5_hex "buzz.channel.dm.alice-tyler")
 UUID_DM_BOB_TYLER=$(uuid5_hex "buzz.channel.dm.bob-tyler")
 UUID_DM_BOB_CHARLIE_TYLER=$(uuid5_hex "buzz.channel.dm.bob-charlie-tyler")
 
+# The immutable-DM constraints validate at transaction commit. Seed each DM
+# channel, its fixed-width pubkeys, and the SHA-256 of those pubkeys concatenated
+# in bytewise order as one transaction so the deferred checks see a complete set.
 run_sql "
+BEGIN;
+
 INSERT INTO channels
-  (community_id, id, name, channel_type, visibility, description, created_by, topic_required)
+  (community_id, id, name, channel_type, visibility, description, created_by, topic_required, participant_hash)
 VALUES
-  ('${COMMUNITY_ID}', '${UUID_GENERAL}', 'general', 'stream', 'open', 'General discussion for everyone', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_RANDOM}', 'random', 'stream', 'open', 'Off-topic, fun stuff', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_ENGINEERING}', 'engineering', 'stream', 'open', 'Engineering discussions', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_AGENTS}', 'agents', 'stream', 'open', 'AI agent testing and collaboration', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_WATERCOOLER}', 'watercooler', 'forum', 'open', 'Casual forum for async discussions', decode('${SYSTEM_PUBKEY}','hex'), true),
-  ('${COMMUNITY_ID}', '${UUID_ANNOUNCEMENTS}', 'announcements', 'forum', 'open', 'Company announcements', decode('${SYSTEM_PUBKEY}','hex'), true),
-  ('${COMMUNITY_ID}', '${UUID_DM_ALICE_TYLER}', 'alice-tyler', 'dm', 'private', 'DM between alice and tyler', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_DM_BOB_TYLER}', 'bob-tyler', 'dm', 'private', 'DM between bob and tyler', decode('${SYSTEM_PUBKEY}','hex'), false),
-  ('${COMMUNITY_ID}', '${UUID_DM_BOB_CHARLIE_TYLER}', 'bob-charlie-tyler', 'dm', 'private', 'Group DM: bob, charlie, tyler', decode('${SYSTEM_PUBKEY}','hex'), false)
+  ('${COMMUNITY_ID}', '${UUID_GENERAL}', 'general', 'stream', 'open', 'General discussion for everyone', decode('${SYSTEM_PUBKEY}','hex'), false, NULL),
+  ('${COMMUNITY_ID}', '${UUID_RANDOM}', 'random', 'stream', 'open', 'Off-topic, fun stuff', decode('${SYSTEM_PUBKEY}','hex'), false, NULL),
+  ('${COMMUNITY_ID}', '${UUID_ENGINEERING}', 'engineering', 'stream', 'open', 'Engineering discussions', decode('${SYSTEM_PUBKEY}','hex'), false, NULL),
+  ('${COMMUNITY_ID}', '${UUID_AGENTS}', 'agents', 'stream', 'open', 'AI agent testing and collaboration', decode('${SYSTEM_PUBKEY}','hex'), false, NULL),
+  ('${COMMUNITY_ID}', '${UUID_WATERCOOLER}', 'watercooler', 'forum', 'open', 'Casual forum for async discussions', decode('${SYSTEM_PUBKEY}','hex'), true, NULL),
+  ('${COMMUNITY_ID}', '${UUID_ANNOUNCEMENTS}', 'announcements', 'forum', 'open', 'Company announcements', decode('${SYSTEM_PUBKEY}','hex'), true, NULL),
+  ('${COMMUNITY_ID}', '${UUID_DM_ALICE_TYLER}', 'alice-tyler', 'dm', 'private', 'DM between alice and tyler', decode('${SYSTEM_PUBKEY}','hex'), false,
+    pg_catalog.sha256(decode('${ALICE_PUBKEY}${TYLER_PUBKEY}', 'hex'))),
+  ('${COMMUNITY_ID}', '${UUID_DM_BOB_TYLER}', 'bob-tyler', 'dm', 'private', 'DM between bob and tyler', decode('${SYSTEM_PUBKEY}','hex'), false,
+    pg_catalog.sha256(decode('${BOB_PUBKEY}${TYLER_PUBKEY}', 'hex'))),
+  ('${COMMUNITY_ID}', '${UUID_DM_BOB_CHARLIE_TYLER}', 'bob-charlie-tyler', 'dm', 'private', 'Group DM: bob, charlie, tyler', decode('${SYSTEM_PUBKEY}','hex'), false,
+    pg_catalog.sha256(decode('${CHARLIE_PUBKEY}${BOB_PUBKEY}${TYLER_PUBKEY}', 'hex')))
 ON CONFLICT DO NOTHING
 ;
-"
 
-run_sql "
 INSERT INTO channel_members
   (community_id, channel_id, pubkey, role, invited_by)
 VALUES
@@ -127,6 +133,8 @@ VALUES
   ('${COMMUNITY_ID}', '${UUID_AGENTS}', decode('${AGENT_PUBKEY}','hex'), 'bot', decode('${SYSTEM_PUBKEY}','hex'))
 ON CONFLICT DO NOTHING
 ;
+
+COMMIT;
 "
 
 echo "Desktop e2e data ready."

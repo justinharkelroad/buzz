@@ -24,25 +24,8 @@ export function usePrepareDmSendChannel(
   const upsertCachedChannel = useUpsertCachedChannel();
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
-  const managedAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (managedAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
-    [managedAgentsQuery.data],
-  );
-  const relayAgentsByPubkey = React.useMemo(
-    () =>
-      new Map(
-        (relayAgentsQuery.data ?? []).map((agent) => [
-          normalizePubkey(agent.pubkey),
-          agent,
-        ]),
-      ),
-    [relayAgentsQuery.data],
-  );
+  const refetchManagedAgents = managedAgentsQuery.refetch;
+  const refetchRelayAgents = relayAgentsQuery.refetch;
 
   return React.useCallback(
     async (additionalParticipantPubkeys: string[] = []) => {
@@ -59,6 +42,33 @@ export function usePrepareDmSendChannel(
       if (!requiresExpandedDm) {
         return activeChannel.id;
       }
+
+      // Persona mentions can provision a managed agent immediately before
+      // this callback runs. The callback belongs to the render that began the
+      // send, so query-derived ownership captured above may predate that
+      // provisioning even though the mutation has already refreshed the
+      // cache. Read both registries again at this authorization boundary.
+      // Failed refreshes deliberately produce empty/unknown classifications,
+      // preserving the delegated-agent guard's fail-closed behavior.
+      const [managedAgentsResult, relayAgentsResult] = await Promise.all([
+        refetchManagedAgents(),
+        refetchRelayAgents(),
+      ]);
+      const managedAgents = managedAgentsResult.isSuccess
+        ? managedAgentsResult.data
+        : [];
+      const relayAgents = relayAgentsResult.isSuccess
+        ? relayAgentsResult.data
+        : undefined;
+      const managedAgentPubkeys = new Set(
+        managedAgents.map((agent) => normalizePubkey(agent.pubkey)),
+      );
+      const relayAgentsByPubkey = new Map(
+        (relayAgents ?? []).map((agent) => [
+          normalizePubkey(agent.pubkey),
+          agent,
+        ]),
+      );
 
       const currentNormalizedPubkey = currentPubkey
         ? normalizePubkey(currentPubkey)
@@ -89,7 +99,7 @@ export function usePrepareDmSendChannel(
         hasDelegatedAgentRecipientConflict({
           currentPubkey,
           managedAgentPubkeys,
-          relayAgents: relayAgentsQuery.data,
+          relayAgents,
           requestedPubkeys: pubkeys,
           selectedRecipients: mentionedAgentRecipients,
         })
@@ -104,10 +114,9 @@ export function usePrepareDmSendChannel(
     [
       activeChannel,
       currentPubkey,
-      managedAgentPubkeys,
       openDmMutation.mutateAsync,
-      relayAgentsByPubkey,
-      relayAgentsQuery.data,
+      refetchManagedAgents,
+      refetchRelayAgents,
       upsertCachedChannel,
     ],
   );

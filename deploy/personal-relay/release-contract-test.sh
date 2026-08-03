@@ -25,6 +25,8 @@ release_runbook="$repo_root/docs/personal-relay-release.md"
 deploy_runbook="$repo_root/deploy/personal-relay/README.md"
 relay_env_example="$repo_root/deploy/personal-relay/env.example"
 relay_workflow="$repo_root/.github/workflows/personal-relay-image.yml"
+docker_workflow="$repo_root/.github/workflows/docker.yml"
+sprig_workflow="$repo_root/.github/workflows/sprig-image.yml"
 relay_dockerfile="$repo_root/Dockerfile"
 relay_entrypoint="$repo_root/deploy/personal-relay/git-volume-entrypoint.sh"
 relay_migrate="$repo_root/deploy/personal-relay/migrate.sh"
@@ -81,6 +83,90 @@ end
 RUBY
 }
 
+validate_workflow_action_references() {
+  ruby -rpsych - "$@" <<'RUBY'
+class ActionReferenceContractError < StandardError; end
+
+def require_action_reference(condition, message)
+  raise ActionReferenceContractError, message unless condition
+end
+
+def collect_action_references(node, location = [], references = [])
+  case node
+  when Hash
+    node.each do |key, value|
+      references << [location + [key], value] if key == "uses"
+      collect_action_references(value, location + [key], references)
+    end
+  when Array
+    node.each_with_index do |value, index|
+      collect_action_references(value, location + [index], references)
+    end
+  end
+  references
+end
+
+def validate_action_references!(workflow, label)
+  references = collect_action_references(workflow)
+  require_action_reference(!references.empty?, "workflow has no action references: #{label}")
+  references.each do |location, value|
+    require_action_reference(value.is_a?(String), "non-scalar uses value at #{label}:#{location.join('.')}")
+    require_action_reference(
+      !value.start_with?("./", "docker://"),
+      "local or Docker action is forbidden at #{label}:#{location.join('.')}"
+    )
+    require_action_reference(
+      value.match?(/\A[^\s@]+\/[^\s@]+@[0-9a-f]{40}\z/),
+      "action is not pinned by a full commit SHA at #{label}:#{location.join('.')}: #{value.inspect}"
+    )
+  end
+end
+
+ARGV.each do |path|
+  validate_action_references!(Psych.safe_load_file(path, aliases: false), path)
+end
+
+valid_fixture = Psych.safe_load(<<~YAML, aliases: false)
+  jobs:
+    test:
+      steps:
+        - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+YAML
+validate_action_references!(valid_fixture, "valid fixture")
+
+hostile_fixtures = {
+  "flow-map action" => <<~YAML,
+    jobs:
+      test:
+        steps:
+          - {uses: attacker/action@main}
+  YAML
+  "folded action" => <<~YAML,
+    jobs:
+      test:
+        steps:
+          - uses: >-
+              attacker/action@main
+  YAML
+  "quoted local action" => <<~YAML
+    jobs:
+      test:
+        steps:
+          - "uses": "./candidate-action"
+  YAML
+}
+
+hostile_fixtures.each do |label, yaml|
+  begin
+    validate_action_references!(Psych.safe_load(yaml, aliases: false), label)
+  rescue ActionReferenceContractError
+    next
+  end
+  raise ActionReferenceContractError, "hostile action-reference fixture was accepted: #{label}"
+end
+RUBY
+}
+
 validate_workflow_permissions() {
   ruby -rpsych - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
 relay, gate1, desktop = ARGV
@@ -129,6 +215,584 @@ expected.each do |path, expected_jobs|
   expected_jobs.each do |job_name, permissions|
     actual = jobs.fetch(job_name).fetch("permissions")
     abort "unexpected permission map for #{path} job #{job_name}: #{actual.inspect}" unless actual == permissions
+  end
+end
+RUBY
+}
+
+validate_pr_image_workflow_permissions() {
+  ruby -rpsych - "$docker_workflow" "$sprig_workflow" <<'RUBY'
+docker_path, sprig_path = ARGV
+checkout_action = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10"
+setup_buildx_action = "docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5"
+build_action = "docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf"
+trusted_event_guards = {
+  docker_path => "github.repository == 'block/buzz' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'))",
+  sprig_path => "github.repository == 'block/buzz' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))"
+}
+pull_request_guard = "github.event_name == 'pull_request' && github.event.pull_request.draft == false"
+pull_request_types = %w[opened synchronize reopened ready_for_review]
+matrix = {
+  "fail-fast" => false,
+  "matrix" => {
+    "include" => [
+      {"platform" => "linux/amd64", "runner" => "ubuntu-24.04", "arch" => "amd64"},
+      {"platform" => "linux/arm64", "runner" => "ubuntu-24.04-arm", "arch" => "arm64"}
+    ]
+  }
+}
+docker_merge_matrix = {
+  "fail-fast" => false,
+  "matrix" => {
+    "include" => [
+      {"variant" => "release", "tag_prefix" => ""},
+      {"variant" => "debug", "tag_prefix" => "debug-"}
+    ]
+  }
+}
+buildkit_config = "[worker.oci]\n  max-parallelism = 2\n"
+
+checkout_step = lambda do |fetch_depth|
+  inputs = {"persist-credentials" => false}
+  inputs = {"fetch-depth" => fetch_depth}.merge(inputs) unless fetch_depth.nil?
+  {"name" => "Checkout", "uses" => checkout_action, "with" => inputs}
+end
+setup_step = {
+  "name" => "Set up Docker Buildx",
+  "uses" => setup_buildx_action,
+  "with" => {"buildkitd-config-inline" => buildkit_config}
+}
+build_step = lambda do |name:, file:, outputs:, cache_from:, target: nil|
+  inputs = {"context" => ".", "file" => file}
+  inputs["target"] = target unless target.nil?
+  inputs.merge!({
+    "platforms" => "${{ matrix.platform }}",
+    "outputs" => outputs,
+    "cache-from" => cache_from
+  })
+  {"name" => name, "uses" => build_action, "with" => inputs}
+end
+
+docker_output = "type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=false"
+gateway_output = "type=image,name=ghcr.io/block/buzz-push-gateway,push-by-digest=true,name-canonical=true,push=false"
+
+expected_pr_jobs = {
+  [docker_path, "build-pr"] => {
+    "name" => "Build-only check (${{ matrix.platform }})",
+    "if" => pull_request_guard,
+    "runs-on" => "${{ matrix.runner }}",
+    "timeout-minutes" => 60,
+    "permissions" => {"contents" => "read"},
+    "strategy" => matrix,
+    "steps" => [
+      checkout_step.call(0),
+      setup_step,
+      build_step.call(
+        name: "Build release image without registry credentials",
+        file: "./Dockerfile",
+        target: "runtime",
+        outputs: docker_output,
+        cache_from: "type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}\n"
+      ),
+      build_step.call(
+        name: "Build debug image without registry credentials",
+        file: "./Dockerfile",
+        target: "runtime-debug",
+        outputs: docker_output,
+        cache_from: "type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}\n"
+      )
+    ]
+  },
+  [docker_path, "push-gateway-build-pr"] => {
+    "name" => "Build-only public push gateway (${{ matrix.platform }})",
+    "if" => pull_request_guard,
+    "runs-on" => "${{ matrix.runner }}",
+    "timeout-minutes" => 60,
+    "permissions" => {"contents" => "read"},
+    "strategy" => matrix,
+    "steps" => [
+      checkout_step.call(0),
+      setup_step,
+      build_step.call(
+        name: "Build without registry credentials",
+        file: "./Dockerfile.push-gateway",
+        outputs: gateway_output,
+        cache_from: "type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:${{ matrix.arch }}"
+      )
+    ]
+  },
+  [sprig_path, "build-pr"] => {
+    "name" => "Build-only check (${{ matrix.platform }})",
+    "if" => pull_request_guard,
+    "runs-on" => "${{ matrix.runner }}",
+    "timeout-minutes" => 60,
+    "permissions" => {"contents" => "read"},
+    "strategy" => matrix,
+    "steps" => [
+      checkout_step.call(nil),
+      setup_step,
+      build_step.call(
+        name: "Build without registry credentials",
+        file: "./Dockerfile.sprig",
+        outputs: docker_output,
+        cache_from: "type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}\n"
+      )
+    ]
+  }
+}
+
+docker_paths = [
+  "Dockerfile", "Dockerfile.push-gateway", ".dockerignore",
+  ".github/workflows/docker.yml", "Cargo.toml", "Cargo.lock",
+  "rust-toolchain.toml", "crates/**", "migrations/**", "admin-web/**",
+  "web/**", "package.json",
+  "pnpm-lock.yaml", "pnpm-workspace.yaml", "patches/**"
+]
+sprig_paths = [
+  "Dockerfile.sprig", "scripts/sprig-entrypoint.sh",
+  ".github/workflows/sprig-image.yml", "Cargo.toml", "Cargo.lock",
+  "rust-toolchain.toml", "crates/**"
+]
+
+expected_triggers = {
+  docker_path => {
+    "push" => {"branches" => ["main"], "tags" => ["relay-v[0-9]*"]},
+    "pull_request" => {"types" => pull_request_types, "paths" => docker_paths}
+  },
+  sprig_path => {
+    "push" => {
+      "branches" => ["main"], "tags" => ["sprig-v[0-9]*"],
+      "paths" => sprig_paths
+    },
+    "pull_request" => {"types" => pull_request_types, "paths" => sprig_paths},
+    "workflow_dispatch" => {}
+  }
+}
+
+expected_root_env = {
+  docker_path => {
+    "IMAGE_NAME" => "${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}"
+  },
+  sprig_path => {
+    "IMAGE_NAME" => "${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || 'ghcr.io/block/buzz-sprig' }}"
+  }
+}
+
+expected_permissions = {
+  docker_path => {
+    "build-pr" => {"contents" => "read"},
+    "build" => {"contents" => "read", "packages" => "write"},
+    "merge" => {
+      "attestations" => "write", "contents" => "read",
+      "id-token" => "write", "packages" => "write"
+    },
+    "push-gateway-build-pr" => {"contents" => "read"},
+    "push-gateway-build" => {"contents" => "read", "packages" => "write"},
+    "push-gateway-merge" => {
+      "attestations" => "write", "contents" => "read",
+      "id-token" => "write", "packages" => "write"
+    }
+  },
+  sprig_path => {
+    "build-pr" => {"contents" => "read"},
+    "build" => {"contents" => "read", "packages" => "write"},
+    "merge" => {
+      "attestations" => "write", "contents" => "read",
+      "id-token" => "write", "packages" => "write"
+    }
+  }
+}
+
+expected_trusted_needs = {
+  [docker_path, "merge"] => "build",
+  [docker_path, "push-gateway-merge"] => "push-gateway-build",
+  [sprig_path, "merge"] => "build"
+}
+
+docker_release_verifier_step = {
+  "name" => "Verify tag-bound release source",
+  "if" => "github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'",
+  "env" => {"INPUT_VERSION" => "${{ inputs.version }}"},
+  "run" => "VERSION=\"${INPUT_VERSION:-${GITHUB_REF_NAME#relay-v}}\"\nscripts/verify-release-ref.sh relay-v \"$VERSION\"\n"
+}
+expected_trusted_prefixes = {
+  [docker_path, "build"] => [checkout_step.call(0), docker_release_verifier_step],
+  [docker_path, "push-gateway-build"] => [checkout_step.call(0), docker_release_verifier_step]
+}
+expected_trusted_execution = {
+  [docker_path, "build"] => {"runs-on" => "${{ matrix.runner }}", "strategy" => matrix},
+  [docker_path, "merge"] => {"runs-on" => "ubuntu-24.04", "strategy" => docker_merge_matrix},
+  [docker_path, "push-gateway-build"] => {"runs-on" => "${{ matrix.runner }}", "strategy" => matrix},
+  [docker_path, "push-gateway-merge"] => {"runs-on" => "ubuntu-24.04"},
+  [sprig_path, "build"] => {"runs-on" => "${{ matrix.runner }}", "strategy" => matrix},
+  [sprig_path, "merge"] => {"runs-on" => "ubuntu-24.04"}
+}
+
+class ImageWorkflowContractError < StandardError; end
+
+def require_image_contract(condition, message)
+  raise ImageWorkflowContractError, message unless condition
+end
+
+def validate_image_workflow!(path:, workflow:, permission_map:, trusted_guard:, trusted_needs:,
+                             expected_trigger:, expected_env:, expected_pr_jobs:, trusted_prefixes:,
+                             trusted_execution:)
+  require_image_contract(
+    workflow.keys.sort_by(&:to_s) == ["name", true, "concurrency", "permissions", "env", "jobs"].sort_by(&:to_s),
+    "image workflow root key set drifted: #{path}"
+  )
+  require_image_contract(workflow["permissions"] == {}, "image workflow must deny permissions by default: #{path}")
+  require_image_contract(workflow["env"] == expected_env, "image workflow root environment drifted: #{path}")
+
+  triggers = workflow[true] || workflow["on"]
+  require_image_contract(triggers.is_a?(Hash), "image workflow trigger map is missing: #{path}")
+  require_image_contract(
+    triggers.keys.sort == %w[pull_request push workflow_dispatch],
+    "image workflow trigger set drifted: #{path}"
+  )
+  require_image_contract(triggers["push"] == expected_trigger.fetch("push"), "image workflow push trigger drifted: #{path}")
+  require_image_contract(
+    triggers["pull_request"] == expected_trigger.fetch("pull_request"),
+    "image workflow pull-request trigger drifted: #{path}"
+  )
+  if expected_trigger.key?("workflow_dispatch")
+    require_image_contract(
+      triggers["workflow_dispatch"] == expected_trigger.fetch("workflow_dispatch"),
+      "image workflow dispatch trigger drifted: #{path}"
+    )
+  else
+    dispatch = triggers["workflow_dispatch"]
+    require_image_contract(dispatch.is_a?(Hash) && dispatch.keys == ["inputs"], "Docker dispatch contract drifted: #{path}")
+    inputs = dispatch.fetch("inputs")
+    require_image_contract(inputs.keys == ["version"], "Docker dispatch input set drifted: #{path}")
+    version = inputs.fetch("version")
+    require_image_contract(
+      version.keys.sort == %w[description required] && version["required"] == true &&
+        version["description"].is_a?(String) && !version["description"].empty?,
+      "Docker dispatch version input drifted: #{path}"
+    )
+  end
+
+  jobs = workflow.fetch("jobs")
+  require_image_contract(
+    jobs.keys.sort == permission_map.keys.sort,
+    "image workflow job set changed without a permission review: #{path}"
+  )
+  privileged_job_names = permission_map.keys.reject { |job_name| job_name.end_with?("-pr") }
+  require_image_contract(
+    trusted_execution.keys.sort == privileged_job_names.sort,
+    "privileged image job execution-context review is incomplete: #{path}"
+  )
+
+  permission_map.each do |job_name, permissions|
+    job = jobs.fetch(job_name)
+    actual = job.fetch("permissions")
+    require_image_contract(
+      actual == permissions,
+      "unexpected permission map for #{path} job #{job_name}: #{actual.inspect}"
+    )
+
+    if job_name.end_with?("-pr")
+      expected_job = expected_pr_jobs.fetch([path, job_name])
+      require_image_contract(
+        job == expected_job,
+        "PR image job drifted from its exact credential-free build allowlist: #{path} #{job_name}"
+      )
+      serialized = job.inspect
+      forbidden_patterns = {
+        "secrets context" => /\bsecrets\s*(?:\.|\[)/i,
+        "GITHUB_TOKEN" => /\bGITHUB_TOKEN\b/,
+        "github token context" => /\bgithub\s*(?:\.\s*token|\[\s*['\"]token['\"]\s*\])/i,
+        "registry login" => /docker\/login-action@|\b(?:docker|podman|oras|crane|skopeo|helm)\s+login\b/i,
+        "write cache or artifact" => /\bcache-to\b|upload-artifact/i
+      }
+      forbidden_patterns.each do |label, pattern|
+        require_image_contract(
+          !serialized.match?(pattern),
+          "PR image job contains forbidden #{label}: #{path} #{job_name}"
+        )
+      end
+    else
+      require_image_contract(
+        job["if"] == trusted_guard,
+        "privileged image job lacks the trusted-event allowlist: #{path} #{job_name}"
+      )
+      expected_execution = trusted_execution.fetch(job_name)
+      require_image_contract(
+        job["runs-on"] == expected_execution.fetch("runs-on"),
+        "privileged image job runner drifted: #{path} #{job_name}"
+      )
+      if expected_execution.key?("strategy")
+        require_image_contract(
+          job["strategy"] == expected_execution.fetch("strategy"),
+          "privileged image job runner matrix drifted: #{path} #{job_name}"
+        )
+      else
+        require_image_contract(
+          !job.key?("strategy"),
+          "privileged image job gained an unreviewed runner matrix: #{path} #{job_name}"
+        )
+      end
+      if (expected_prefix = trusted_prefixes[job_name])
+        %w[defaults container services env].each do |key|
+          require_image_contract(
+            !job.key?(key),
+            "Docker privileged build must not override the verifier execution context with #{key}: #{job_name}"
+          )
+        end
+        steps = job.fetch("steps")
+        require_image_contract(
+          steps.first(expected_prefix.length) == expected_prefix,
+          "Docker privileged build must begin with credentialless checkout and the exact tag-bound verifier: #{job_name}"
+        )
+        risky_indexes = steps.each_index.select do |index|
+          step = steps.fetch(index)
+          action = step["uses"].to_s
+          serialized = step.inspect
+          action.start_with?("docker/login-action@", "docker/build-push-action@") ||
+            serialized.match?(/\bGITHUB_TOKEN\b|\bcache-to\b|push=|\b(?:docker|podman|oras|crane|skopeo|helm)\s+(?:login|push)\b/i)
+        end
+        require_image_contract(
+          risky_indexes.all? { |index| index >= expected_prefix.length },
+          "Docker tag-bound verifier must precede every credential or publish-capable step: #{job_name}"
+        )
+        status_override_indexes = steps.each_index.select do |index|
+          index >= expected_prefix.length &&
+            steps.fetch(index)["if"].to_s.match?(/\b(?:always|failure|cancelled|success)\s*\(/i)
+        end
+        require_image_contract(
+          status_override_indexes.empty?,
+          "Docker post-verifier steps must retain the implicit verifier success dependency: #{job_name}"
+        )
+        risky_indexes.each do |index|
+          require_image_contract(
+            !steps.fetch(index).key?("if"),
+            "Docker credential or publish-capable step may not override the verifier success dependency: #{job_name} step #{index}"
+          )
+        end
+      end
+    end
+  end
+
+  trusted_needs.each do |job_name, dependency|
+    actual = jobs.fetch(job_name).fetch("needs")
+    require_image_contract(
+      actual == dependency,
+      "privileged image merge dependency drifted: #{path} #{job_name}"
+    )
+  end
+end
+
+workflows = {
+  docker_path => Psych.safe_load_file(docker_path, aliases: false),
+  sprig_path => Psych.safe_load_file(sprig_path, aliases: false)
+}
+
+expected_permissions.each do |path, permission_map|
+  validate_image_workflow!(
+    path: path,
+    workflow: workflows.fetch(path),
+    permission_map: permission_map,
+    trusted_guard: trusted_event_guards.fetch(path),
+    trusted_needs: expected_trusted_needs.filter_map do |(candidate_path, job_name), dependency|
+      [job_name, dependency] if candidate_path == path
+    end.to_h,
+    expected_trigger: expected_triggers.fetch(path),
+    expected_env: expected_root_env.fetch(path),
+    expected_pr_jobs: expected_pr_jobs,
+    trusted_prefixes: expected_trusted_prefixes.filter_map do |(candidate_path, job_name), prefix|
+      [job_name, prefix] if candidate_path == path
+    end.to_h,
+    trusted_execution: expected_trusted_execution.filter_map do |(candidate_path, job_name), execution|
+      [job_name, execution] if candidate_path == path
+    end.to_h
+  )
+end
+
+def expect_image_contract_rejection(label)
+  yield
+rescue ImageWorkflowContractError, KeyError
+  return
+else
+  raise ImageWorkflowContractError, "hostile image-workflow mutation was accepted: #{label}"
+end
+
+expected_permissions.each do |path, permission_map|
+  base = workflows.fetch(path)
+  pr_job_name = permission_map.keys.find { |name| name.end_with?("-pr") }
+  arguments = {
+    path: path,
+    permission_map: permission_map,
+    trusted_guard: trusted_event_guards.fetch(path),
+    trusted_needs: expected_trusted_needs.filter_map do |(candidate_path, job_name), dependency|
+      [job_name, dependency] if candidate_path == path
+    end.to_h,
+    expected_trigger: expected_triggers.fetch(path),
+    expected_env: expected_root_env.fetch(path),
+    expected_pr_jobs: expected_pr_jobs,
+    trusted_prefixes: expected_trusted_prefixes.filter_map do |(candidate_path, job_name), prefix|
+      [job_name, prefix] if candidate_path == path
+    end.to_h,
+    trusted_execution: expected_trusted_execution.filter_map do |(candidate_path, job_name), execution|
+      [job_name, execution] if candidate_path == path
+    end.to_h
+  }
+
+  mutations = {
+    "bracket secret context" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name)["env"] = {
+        "LEAK" => "${{ secrets['PERSONAL_RULESET_EVIDENCE_TOKEN'] }}"
+      }
+    end,
+    "bracket github token context" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name)["env"] = {"LEAK" => "${{ github['token'] }}"}
+    end,
+    "multiline publishing output" => lambda do |workflow|
+      build = workflow.fetch("jobs").fetch(pr_job_name).fetch("steps").find do |step|
+        step["uses"].to_s.start_with?("docker/build-push-action@")
+      end
+      build.fetch("with")["outputs"] = "type=registry,name=hostile,push=true\ntype=image,push=false"
+    end,
+    "explicit push input" => lambda do |workflow|
+      build = workflow.fetch("jobs").fetch(pr_job_name).fetch("steps").find do |step|
+        step["uses"].to_s.start_with?("docker/build-push-action@")
+      end
+      build.fetch("with")["push"] = true
+    end,
+    "credential input" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name).fetch("steps").last.fetch("with")["password"] = "${{ secrets.PASSWORD }}"
+    end,
+    "login action" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name).fetch("steps") << {
+        "uses" => "docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee"
+      }
+    end,
+    "PR write permission" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name).fetch("permissions")["packages"] = "write"
+    end,
+    "PR guard drift" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name)["if"] = "github.event_name == 'pull_request'"
+    end,
+    "unpinned action" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(pr_job_name).fetch("steps").first["uses"] = "actions/checkout@v6"
+    end,
+    "pull_request_target trigger" => lambda do |workflow|
+      (workflow[true] || workflow["on"])["pull_request_target"] = {}
+    end
+  }
+
+  mutations.each do |label, mutate|
+    fixture = Marshal.load(Marshal.dump(base))
+    mutate.call(fixture)
+    expect_image_contract_rejection("#{File.basename(path)} #{label}") do
+      validate_image_workflow!(workflow: fixture, **arguments)
+    end
+  end
+end
+
+docker_arguments = {
+  path: docker_path,
+  permission_map: expected_permissions.fetch(docker_path),
+  trusted_guard: trusted_event_guards.fetch(docker_path),
+  trusted_needs: expected_trusted_needs.filter_map do |(candidate_path, job_name), dependency|
+    [job_name, dependency] if candidate_path == docker_path
+  end.to_h,
+  expected_trigger: expected_triggers.fetch(docker_path),
+  expected_env: expected_root_env.fetch(docker_path),
+  expected_pr_jobs: expected_pr_jobs,
+  trusted_prefixes: expected_trusted_prefixes.filter_map do |(candidate_path, job_name), prefix|
+    [job_name, prefix] if candidate_path == docker_path
+  end.to_h,
+  trusted_execution: expected_trusted_execution.filter_map do |(candidate_path, job_name), execution|
+    [job_name, execution] if candidate_path == docker_path
+  end.to_h
+}
+
+%w[build push-gateway-build].each do |job_name|
+  verifier_mutations = {
+    "verifier deletion" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(job_name).fetch("steps").delete_at(1)
+    end,
+    "verifier reordering" => lambda do |workflow|
+      steps = workflow.fetch("jobs").fetch(job_name).fetch("steps")
+      verifier = steps.delete_at(1)
+      login_index = steps.index { |step| step["uses"].to_s.start_with?("docker/login-action@") }
+      steps.insert(login_index + 1, verifier)
+    end,
+    "verifier command drift" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(job_name).fetch("steps").fetch(1)["run"] =
+        "scripts/verify-release-ref.sh relay-v \"$INPUT_VERSION\"\n"
+    end,
+    "verifier shell override" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(job_name)["defaults"] = {
+        "run" => {"shell" => "/usr/bin/true {0}"}
+      }
+    end,
+    "verifier environment override" => lambda do |workflow|
+      workflow.fetch("jobs").fetch(job_name)["env"] = {"BASH_ENV" => "./hostile.sh"}
+    end,
+    "unrecognized step always after verifier failure" => lambda do |workflow|
+      setup = workflow.fetch("jobs").fetch(job_name).fetch("steps").find do |step|
+        step["uses"].to_s.start_with?("docker/setup-buildx-action@")
+      end
+      setup["if"] = "${{ always() }}"
+    end,
+    "publish always after verifier failure" => lambda do |workflow|
+      login = workflow.fetch("jobs").fetch(job_name).fetch("steps").find do |step|
+        step["uses"].to_s.start_with?("docker/login-action@")
+      end
+      login["if"] = "${{ always() }}"
+    end
+  }
+
+  verifier_mutations.each do |label, mutate|
+    fixture = Marshal.load(Marshal.dump(workflows.fetch(docker_path)))
+    mutate.call(fixture)
+    expect_image_contract_rejection("docker.yml #{job_name} #{label}") do
+      validate_image_workflow!(workflow: fixture, **docker_arguments)
+    end
+  end
+end
+
+expected_trusted_execution.each do |(path, job_name), expected_execution|
+  arguments = {
+    path: path,
+    permission_map: expected_permissions.fetch(path),
+    trusted_guard: trusted_event_guards.fetch(path),
+    trusted_needs: expected_trusted_needs.filter_map do |(candidate_path, candidate_job), dependency|
+      [candidate_job, dependency] if candidate_path == path
+    end.to_h,
+    expected_trigger: expected_triggers.fetch(path),
+    expected_env: expected_root_env.fetch(path),
+    expected_pr_jobs: expected_pr_jobs,
+    trusted_prefixes: expected_trusted_prefixes.filter_map do |(candidate_path, candidate_job), prefix|
+      [candidate_job, prefix] if candidate_path == path
+    end.to_h,
+    trusted_execution: expected_trusted_execution.filter_map do |(candidate_path, candidate_job), execution|
+      [candidate_job, execution] if candidate_path == path
+    end.to_h
+  }
+
+  fixture = Marshal.load(Marshal.dump(workflows.fetch(path)))
+  fixture.fetch("jobs").fetch(job_name)["runs-on"] = "self-hosted"
+  expect_image_contract_rejection("#{File.basename(path)} #{job_name} self-hosted runner") do
+    validate_image_workflow!(workflow: fixture, **arguments)
+  end
+
+  fixture = Marshal.load(Marshal.dump(workflows.fetch(path)))
+  fixture.fetch("jobs").fetch(job_name)["if"] =
+    fixture.fetch("jobs").fetch(job_name).fetch("if").sub("github.repository == 'block/buzz' && ", "")
+  expect_image_contract_rejection("#{File.basename(path)} #{job_name} missing upstream repository guard") do
+    validate_image_workflow!(workflow: fixture, **arguments)
+  end
+
+  next unless expected_execution.key?("strategy")
+
+  fixture = Marshal.load(Marshal.dump(workflows.fetch(path)))
+  fixture.fetch("jobs").fetch(job_name).fetch("strategy").fetch("matrix").fetch("include").first["runner"] =
+    "self-hosted"
+  expect_image_contract_rejection("#{File.basename(path)} #{job_name} self-hosted matrix") do
+    validate_image_workflow!(workflow: fixture, **arguments)
   end
 end
 RUBY
@@ -2345,10 +3009,14 @@ if validate_workflow_yaml "$duplicate_yaml_fixture" >/dev/null 2>&1; then
 fi
 rm -f "$duplicate_yaml_fixture"
 trap - EXIT
-for workflow in "$relay_workflow" "$gate1_workflow" "$desktop_workflow"; do
+for workflow in "$relay_workflow" "$gate1_workflow" "$desktop_workflow" "$docker_workflow" "$sprig_workflow"; do
   validate_workflow_yaml "$workflow"
 done
+validate_workflow_action_references \
+  "$relay_workflow" "$gate1_workflow" "$desktop_workflow" \
+  "$docker_workflow" "$sprig_workflow"
 validate_workflow_permissions
+validate_pr_image_workflow_permissions
 validate_release_flow
 validate_desktop_flow
 validate_gate1_flow
@@ -2746,17 +3414,6 @@ if grep -Fq 'cargo test --locked -p buzz-acp author_gate_tests::' "$gate1_workfl
   printf '%s\n' "Gate 1 must not use the broad ACP author_gate_tests filter" >&2
   exit 1
 fi
-for workflow in "$relay_workflow" "$gate1_workflow" "$desktop_workflow"; do
-  if grep -En '^[[:space:]]*uses:[[:space:]]+(\./|docker://)' "$workflow"; then
-    printf '%s\n' "workflow contains a local or Docker action: $workflow" >&2
-    exit 1
-  fi
-  if grep -En '^[[:space:]]*uses:[[:space:]]+[^#[:space:]]+@' "$workflow" \
-    | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)'; then
-    printf '%s\n' "workflow contains an action that is not pinned by full commit SHA: $workflow" >&2
-    exit 1
-  fi
-done
 attest_job=$(awk '/^  attest:$/ { keep=1 } keep { print }' "$gate1_workflow")
 if grep -Eq 'cargo (run|test|build)|docker (pull|run)|runtime-contract-test\.sh' <<<"$attest_job"; then
   printf '%s\n' "OIDC-enabled Gate 1 attestation job must never execute candidate source or image code" >&2
@@ -2932,6 +3589,12 @@ for desktop_acceptance_contract in \
   'Any future production or promotion lane must exact-download'; do
   grep -Fq "$desktop_acceptance_contract" "$release_runbook"
   grep -Fq "$desktop_acceptance_contract" "$deploy_runbook"
+done
+for repository_writer_boundary in \
+  'Same-repository write access is a trust boundary' \
+  'must not receive repository write access' \
+  'cannot defend against a writer who edits both a workflow'; do
+  grep -Fq "$repository_writer_boundary" "$release_runbook"
 done
 [[ -f "$relay_env_example" && -r "$relay_env_example" && ! -L "$relay_env_example" ]]
 [[ $(grep -Ec '^BUZZ_RECONCILE_CHANNELS=' "$relay_env_example") -eq 1 ]]

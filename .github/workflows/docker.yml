@@ -16,13 +16,13 @@ name: Docker image
 # the relay image version tracks crates/buzz-relay/Cargo.toml, never desktop.
 #
 # Triggers:
-#   - push to main           → :main + :sha-<7>
-#                              + :debug-main + :debug-sha-<7>
-#   - push tags relay-v*.*.* → :{version} + :{major}.{minor} + :{major}
-#                              + matching :debug-* tags
-#                              (+ :latest/:debug-latest for stable releases)
-#   - pull_request           → build only (no push), cache is read-only
-#   - workflow_dispatch      → manual relay-tag rescue at the tag itself
+#   - block/buzz main push     -> :main + :sha-<7>
+#                                 + :debug-main + :debug-sha-<7>
+#   - block/buzz relay-v* tag  -> :{version} + :{major}.{minor} + :{major}
+#                                 + matching :debug-* tags
+#                                 (+ :latest/:debug-latest for stable releases)
+#   - pull_request             -> build only (no push), cache is read-only
+#   - block/buzz dispatch      -> manual relay-tag rescue at the tag itself
 #
 # Why workflow_dispatch carries a version input:
 #   Normal releases arrive through the push:tags trigger above. The input is
@@ -54,6 +54,8 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "migrations/**"
+      - "admin-web/**"
       - "web/**"
       - "package.json"
       - "pnpm-lock.yaml"
@@ -74,22 +76,76 @@ concurrency:
 permissions: {}
 
 env:
-  # Single source of truth for the image name. Set GHCR_IMAGE as a repo
-  # variable to override (e.g., for forks that want to push to their own
-  # namespace without forking this file).
+  # Single source of truth for the upstream image name. The privileged publish
+  # jobs are locked to block/buzz; fork pull requests remain build-only.
   IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}
 
 jobs:
+  build-pr:
+    name: Build-only check (${{ matrix.platform }})
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Build release image without registry credentials
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=false
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
+
+      - name: Build debug image without registry credentials
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-debug
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=false
+          cache-from: |
+            type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
+
   build:
     name: Build (${{ matrix.platform }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: >-
+      github.repository == 'block/buzz' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'))
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
       packages: write    # push to GHCR
-      id-token: write    # OIDC for build provenance attestation
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -128,7 +184,6 @@ jobs:
 
       - name: Log in to GHCR
         # Pull requests are build-only and must never write registry state.
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
@@ -145,15 +200,13 @@ jobs:
           # because metadata-action does NOT strip a `relay-v` prefix on its
           # own — it only strips refs/tags/, then runs the raw ref through
           # semver.valid(), which rejects "relay-v0.3.0". The match capture
-          # group feeds the bare version to the semver parser. value= supplies
-          # the version on a manual rescue dispatch (github.ref is `main`
-          # there, not the tag): it is already bare, so match no-ops (warns,
-          # value intact) and the bare version validates as-is. On push value=
-          # is empty, so the ref drives it and match strips relay-v — push
-          # behavior is unchanged. Pull requests get nothing (push: false
-          # below). :latest is intentionally absent — flavor.latest defaults to
-          # `auto`, which adds :latest for stable semver tags only (not
-          # prereleases, not main pushes).
+          # group feeds the bare version to the semver parser. A manual rescue
+          # dispatch runs at the exact relay tag and supplies the same bare
+          # version through inputs.version. On push value= is empty, so the ref
+          # drives it and match strips relay-v. Pull requests never enter this
+          # privileged job. :latest is intentionally absent; flavor.latest
+          # defaults to `auto`, which adds :latest for stable semver tags only
+          # (not prereleases or main pushes).
           tags: |
             type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
             type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
@@ -226,7 +279,10 @@ jobs:
 
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.repository == 'block/buzz' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'))
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
@@ -342,9 +398,50 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  push-gateway-build-pr:
+    name: Build-only public push gateway (${{ matrix.platform }})
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+      - name: Build without registry credentials
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile.push-gateway
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/block/buzz-push-gateway,push-by-digest=true,name-canonical=true,push=false
+          cache-from: type=registry,ref=ghcr.io/block/buzz-push-gateway-buildcache:${{ matrix.arch }}
+
   push-gateway-build:
     name: Build public push gateway (${{ matrix.platform }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    if: >-
+      github.repository == 'block/buzz' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'))
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -380,7 +477,6 @@ jobs:
             [worker.oci]
               max-parallelism = 2
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
@@ -422,7 +518,10 @@ jobs:
 
   push-gateway-merge:
     name: Publish public push gateway image
-    if: github.event_name != 'pull_request'
+    if: >-
+      github.repository == 'block/buzz' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'))
     runs-on: ubuntu-24.04
     needs: push-gateway-build
     timeout-minutes: 15

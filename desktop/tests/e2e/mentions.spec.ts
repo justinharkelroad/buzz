@@ -1060,6 +1060,15 @@ test("foreign verified member agents stay hidden in DMs", async ({ page }) => {
         status: "stopped",
       },
     ],
+    relayAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "alice",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        ownerPubkeyVerified: true,
+        respondTo: "anyone",
+      },
+    ],
   });
   await page.goto("/");
   await page.getByTestId("channel-alice-tyler").click();

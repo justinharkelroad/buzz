@@ -1376,9 +1376,12 @@ const mockDisplayNames = new Map<string, string>([
   [OUTSIDER_PUBKEY, "outsider"],
   [DEFAULT_REAL_IDENTITY.pubkey, DEFAULT_REAL_IDENTITY.username],
 ]);
+// Alice and Charlie are the bridge's ordinary human fixtures. Agent-specific
+// specs opt them into agent state explicitly through `relayAgents`,
+// `managedAgents`, or an agent search profile. Keeping them out of this base
+// set prevents the shared user directory from silently reclassifying normal
+// New Message recipients as foreign agents.
 const mockAgentPubkeys = new Set([
-  ALICE_PUBKEY,
-  CHARLIE_PUBKEY,
   PROFILE_ONLY_AGENT_PUBKEY,
   OWNED_RELAY_AGENT_PUBKEY,
 ]);
@@ -2147,6 +2150,7 @@ function resetMockRelayAgents(config?: E2eConfig) {
   }));
 
   for (const seed of config?.mock?.relayAgents ?? []) {
+    mockAgentPubkeys.add(normalizePubkey(seed.pubkey));
     const channels = mockChannels.filter((channel) => {
       return (
         seed.channelIds?.includes(channel.id) ||
@@ -3067,37 +3071,10 @@ function initializeMockHuddle(seed: MockHuddleSeed | undefined) {
   persistMockHuddle();
 }
 const openedExternalUrls: string[] = [];
-const defaultMockRelayAgents: RawRelayAgent[] = [
-  {
-    pubkey: ALICE_PUBKEY,
-    name: "alice",
-    agent_type: "goose",
-    channels: ["general", "agents"],
-    channel_ids: [
-      "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
-      "94a444a4-c0a3-5966-ab05-530c6ddc2301",
-    ],
-    capabilities: ["search", "summaries", "workflows"],
-    status: "online",
-    respond_to: "anyone",
-    respond_to_allowlist: [],
-    invocation_policy_known: true,
-    owner_pubkey: null,
-  },
-  {
-    pubkey: CHARLIE_PUBKEY,
-    name: "charlie",
-    agent_type: "codex",
-    channels: ["general"],
-    channel_ids: ["9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"],
-    capabilities: ["code", "reviews"],
-    status: "away",
-    respond_to: "anyone",
-    respond_to_allowlist: [],
-    invocation_policy_known: true,
-    owner_pubkey: null,
-  },
-];
+// Keep the base relay-agent registry disjoint from the named human fixtures.
+// Tests that exercise agents seed the exact identity, ownership, and audience
+// policy they need instead of inheriting an ambiguous Alice/Charlie default.
+const defaultMockRelayAgents: RawRelayAgent[] = [];
 let mockRelayAgents: RawRelayAgent[] = defaultMockRelayAgents.map((agent) => ({
   ...agent,
   channels: [...agent.channels],
@@ -3347,10 +3324,11 @@ const mockProfiles = new Map<string, RawProfile>([
     },
   ],
   // alice, bob, and charlie are intentionally NOT seeded here — they are
-  // covered by mockDisplayNames + mockAgentPubkeys and synthesised on demand
-  // by getMockProfileByPubkey. Static seeds would cause ensureMockProfile to
-  // return has_profile_event:true when alice/bob/charlie are used as the
-  // active first-run identity, incorrectly skipping onboarding page 1.
+  // covered by mockDisplayNames and synthesised on demand by
+  // getMockProfileByPubkey. Agent-specific tests opt their pubkeys into
+  // mockAgentPubkeys through explicit seeds. Static profiles would cause
+  // ensureMockProfile to return has_profile_event:true when alice/bob/charlie
+  // are used as the active first-run identity, incorrectly skipping page 1.
   [
     PROFILE_ONLY_AGENT_PUBKEY,
     {

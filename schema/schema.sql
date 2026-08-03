@@ -223,9 +223,8 @@ BEGIN
         COUNT(*)::integer,
         COALESCE(BOOL_AND(octet_length(pubkey) = 32), FALSE),
         COALESCE(BOOL_AND(role = 'member'), FALSE),
-        digest(
-            COALESCE(string_agg(pubkey, ''::bytea ORDER BY pubkey), ''::bytea),
-            'sha256'
+        pg_catalog.sha256(
+            COALESCE(string_agg(pubkey, ''::bytea ORDER BY pubkey), ''::bytea)
         )
     INTO member_count, pubkeys_valid, roles_valid, active_hash
     FROM channel_members

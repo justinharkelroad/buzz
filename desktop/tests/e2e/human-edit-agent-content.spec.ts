@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 // Fixed pubkey for the owned managed agent seeded in these tests.
 // Must not collide with any existing e2eBridge constant.
@@ -70,6 +70,19 @@ test.beforeEach(async ({ page }) => {
         personaId: "builtin:fizz",
         status: "running",
         // Seed into #agents so the bridge seeds a message from this agent.
+        channelNames: ["agents"],
+      },
+    ],
+    relayAgents: [
+      {
+        // Charlie authors the bridge's pre-seeded #agents message. Declare
+        // him as an agent owned by someone else so the negative ownership
+        // assertion exercises agent authorization, not ordinary-user rules.
+        pubkey: TEST_IDENTITIES.charlie.pubkey,
+        name: "charlie",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        ownerPubkeyVerified: true,
+        respondTo: "owner-only",
         channelNames: ["agents"],
       },
     ],
@@ -146,7 +159,7 @@ test("owner does NOT see Edit or Delete for an unowned agent's message", async (
   page,
 }) => {
   // "mock-agents-charlie" is seeded in #agents for CHARLIE_PUBKEY.
-  // Charlie is in mockAgentPubkeys but ownerPubkey is NOT the mock identity.
+  // The test bridge declares Charlie as an agent owned by the outsider.
   const charlieMessageId = "mock-agents-charlie";
 
   await page.goto("/");

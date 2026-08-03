@@ -945,6 +945,7 @@ mod tests {
 
         for required in [
             "LOCK TABLE channels IN SHARE ROW EXCLUSIVE MODE",
+            "pg_catalog.sha256(",
             "members.member_count NOT BETWEEN 2 AND 9",
             "NOT members.roles_valid",
             "members.active_hash IS DISTINCT FROM c.participant_hash",
@@ -956,6 +957,15 @@ mod tests {
         ] {
             assert!(sql.contains(required), "migration 0028 missing {required}");
         }
+        assert_eq!(
+            sql.matches("pg_catalog.sha256(").count(),
+            2,
+            "migration 0028 must use the search-path-independent core SHA-256 function for both participant-set checks",
+        );
+        assert!(
+            !sql.contains("digest("),
+            "migration 0028 must not depend on the pgcrypto extension schema"
+        );
 
         let desired = include_str!("../../../schema/schema.sql");
         for required in [
@@ -970,6 +980,53 @@ mod tests {
                 "desired schema missing {required}"
             );
         }
+
+        let dm_participant_assertion = split_sql_statements(desired)
+            .into_iter()
+            .find(|statement| {
+                normalize_sql(statement)
+                    .starts_with("create function assert_immutable_dm_participant_set(")
+            })
+            .expect("desired schema immutable-DM participant assertion function");
+        assert!(
+            dm_participant_assertion.contains("pg_catalog.sha256("),
+            "desired schema immutable-DM participant assertion must use the search-path-independent core SHA-256 function",
+        );
+        assert!(
+            !dm_participant_assertion.contains("digest("),
+            "desired schema must not depend on the pgcrypto extension schema for DM participant hashes"
+        );
+    }
+
+    #[test]
+    fn desktop_seed_obeys_immutable_dm_insert_contract() {
+        let seed = include_str!("../../../scripts/setup-desktop-test-data.sh");
+
+        assert!(
+            seed.contains("BEGIN;") && seed.contains("COMMIT;"),
+            "desktop channel/member fixtures must share one transaction so deferred DM checks see the complete participant set",
+        );
+        assert!(
+            seed.contains("topic_required, participant_hash"),
+            "desktop channel fixtures must explicitly populate participant_hash",
+        );
+        assert_eq!(
+            seed.matches("pg_catalog.sha256(").count(),
+            3,
+            "each seeded DM must have one core SHA-256 participant hash",
+        );
+        assert!(
+            seed.contains("${ALICE_PUBKEY}${TYLER_PUBKEY}"),
+            "alice/tyler fixture hash must cover both participants in bytewise order",
+        );
+        assert!(
+            seed.contains("${BOB_PUBKEY}${TYLER_PUBKEY}"),
+            "bob/tyler fixture hash must cover both participants in bytewise order",
+        );
+        assert!(
+            seed.contains("${CHARLIE_PUBKEY}${BOB_PUBKEY}${TYLER_PUBKEY}"),
+            "group-DM fixture hash must cover all participants in bytewise order",
+        );
     }
 
     #[test]

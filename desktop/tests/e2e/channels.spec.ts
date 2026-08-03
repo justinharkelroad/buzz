@@ -5,6 +5,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_TYPING_INDICATOR,
 } from "../../src/shared/constants/kinds";
+import { waitForAnimations } from "../helpers/animations";
 import {
   TEST_IDENTITIES,
   installMockBridge,
@@ -1662,8 +1663,11 @@ test("ephemeral countdown refreshes when switching channels after a clock jump",
     await page
       .getByTestId("create-channel-description")
       .fill("Auto-cleaned test stream");
-    await page.getByTestId("create-channel-channel-type").click();
+    const channelType = page.getByTestId("create-channel-channel-type");
+    await waitForAnimations(page);
+    await channelType.click();
     await page.getByLabel("Temporary channel").click();
+    await expect(channelType).toHaveAccessibleName("Channel type: Temporary");
     await page.getByTestId("create-channel-submit").click();
     await expect(page.getByTestId("chat-title")).toContainText(channelName);
   }
@@ -2085,6 +2089,16 @@ test("channel date divider keeps the date sticky while the separator rule scroll
 test("shows and clears activity indicators for active channel agents", async ({
   page,
 }) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "alice",
+        respondTo: "anyone",
+        channelNames: ["agents"],
+      },
+    ],
+  });
   await page.goto("/");
 
   await page.getByTestId("channel-agents").click();
@@ -4155,6 +4169,17 @@ test("bulk remove stays hidden when row-level remove is not allowed", async ({
   const alicePubkey =
     "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
 
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: alicePubkey,
+        name: "alice",
+        respondTo: "owner-only",
+        channelNames: ["design"],
+      },
+    ],
+  });
+
   await page.goto("/");
 
   // Join the "design" channel (unjoined by default) via the channel browser.
@@ -4169,9 +4194,9 @@ test("bulk remove stays hidden when row-level remove is not allowed", async ({
 
   await openMembersSidebar(page, "design");
 
-  // Alice is a relay-observed bot in design (present in mockRelayAgents) that
-  // the user does not manage locally. Since there is no local managed agent
-  // for alice, hasActions is false and no 3-dot menu renders.
+  // Alice is explicitly seeded as a relay-observed bot in design that the user
+  // does not manage locally. Since there is no local managed agent for alice,
+  // hasActions is false and no 3-dot menu renders.
   await expect(page.getByTestId(`sidebar-member-${alicePubkey}`)).toBeVisible();
   await expect(
     page.getByTestId(`sidebar-member-menu-${alicePubkey}`),

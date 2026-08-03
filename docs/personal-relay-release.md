@@ -26,6 +26,12 @@ inspection.
 
 - Relay pull requests build `runtime-personal` without package-write or OIDC
   permission.
+- Same-repository write access is a trust boundary for GitHub Actions. Keep it
+  limited to Justin. A distinct environment reviewer may have read or triage
+  access, but must not receive repository write access. The credential-free PR
+  image jobs and their structural contracts prevent accidental privilege drift;
+  they cannot defend against a writer who edits both a workflow and its
+  candidate-side validator before the PR runs.
 - Manual relay publication begins with a clean, protected release-approval job.
   That job alone can read the exact approved candidate SHA and administrator-
   bypass receipt hash; candidate tests and registry/OIDC jobs do not hold the
