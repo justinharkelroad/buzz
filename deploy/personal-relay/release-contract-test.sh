@@ -2400,18 +2400,18 @@ if grep -Fq 'cargo test --locked -p buzz-acp author_gate_tests::' "$gate1_workfl
   exit 1
 fi
 for workflow in "$relay_workflow" "$gate1_workflow" "$desktop_workflow"; do
-  if rg -n '^[[:space:]]*uses:[[:space:]]+(\./|docker://)' "$workflow"; then
+  if grep -En '^[[:space:]]*uses:[[:space:]]+(\./|docker://)' "$workflow"; then
     printf '%s\n' "workflow contains a local or Docker action: $workflow" >&2
     exit 1
   fi
-  if rg -n '^[[:space:]]*uses:[[:space:]]+[^#[:space:]]+@' "$workflow" \
-    | rg -v '@[0-9a-f]{40}([[:space:]]|$)'; then
+  if grep -En '^[[:space:]]*uses:[[:space:]]+[^#[:space:]]+@' "$workflow" \
+    | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)'; then
     printf '%s\n' "workflow contains an action that is not pinned by full commit SHA: $workflow" >&2
     exit 1
   fi
 done
 attest_job=$(awk '/^  attest:$/ { keep=1 } keep { print }' "$gate1_workflow")
-if rg -q 'cargo (run|test|build)|docker (pull|run)|runtime-contract-test\.sh' <<<"$attest_job"; then
+if grep -Eq 'cargo (run|test|build)|docker (pull|run)|runtime-contract-test\.sh' <<<"$attest_job"; then
   printf '%s\n' "OIDC-enabled Gate 1 attestation job must never execute candidate source or image code" >&2
   exit 1
 fi
@@ -2453,7 +2453,7 @@ desktop_audit_job=$(awk '/^  audit:$/ { keep=1 } keep { print }' "$desktop_workf
 [[ -n "$desktop_build_job" && -n "$desktop_attest_job" && -n "$desktop_audit_job" ]]
 [[ $(grep -Fc 'id-token: write' "$desktop_workflow") -eq 1 ]]
 if grep -Eq 'ref:[[:space:]]+\$\{\{[[:space:]]*inputs\.source_sha' <<<"$desktop_attest_job" \
-  || rg -q '(^|[;&|[:space:]])(cargo|pnpm|just|tauri)[[:space:]]|docker[[:space:]]+(run|pull)|(^|[[:space:]])(bash[[:space:]]+)?(\./)?[^[:space:]]*build[^[:space:]]*\.sh' \
+  || grep -Eq '(^|[;&|[:space:]])(cargo|pnpm|just|tauri)[[:space:]]|docker[[:space:]]+(run|pull)|(^|[[:space:]])(bash[[:space:]]+)?(\./)?[^[:space:]]*build[^[:space:]]*\.sh' \
     <<<"$desktop_attest_job"; then
   printf '%s\n' "OIDC-enabled desktop attestation must not checkout or execute candidate source" >&2
   exit 1
@@ -2561,7 +2561,7 @@ for desktop_release_contract in \
 done
 grep -Fq '`terminal-verifier` after all scanners' "$deploy_runbook"
 grep -Fq 'An attestation alone' "$deploy_runbook"
-if rg -q 'nine-command contract|four-file candidate package|All six scans|build job secret-scans' "$release_runbook" "$deploy_runbook"; then
+if grep -Eq 'nine-command contract|four-file candidate package|All six scans|build job secret-scans' "$release_runbook" "$deploy_runbook"; then
   printf '%s\n' "release documentation still describes the superseded Desktop or Gate 1 evidence graph" >&2
   exit 1
 fi
@@ -2585,17 +2585,18 @@ grep -Fq '/usr/local/bin/personal-relay-migrate' "$relay_runtime_contract"
 grep -Fq '.State.ExitCode' "$relay_runtime_contract"
 [[ $(grep -Fc 'runtime-contract-test.sh "$IMAGE_REF"' "$relay_workflow") -eq 2 ]]
 publish_job=$(awk '/^  publish:$/ { keep=1 } keep { print }' "$relay_workflow")
-if rg -q '(^|[;&|[:space:]])(cargo|pnpm|just|tauri)[[:space:]]|docker[[:space:]]+(run|pull)|runtime-contract-test\.sh' \
+if grep -Eq '(^|[;&|[:space:]])(cargo|pnpm|just|tauri)[[:space:]]|docker[[:space:]]+(run|pull)|runtime-contract-test\.sh' \
   <<<"$publish_job"; then
   printf '%s\n' "OIDC-enabled personal relay publish job must not execute candidate source or images" >&2
   exit 1
 fi
-publish_script_calls=$(rg -o 'bash[[:space:]]+\./[^[:space:]\\]+' <<<"$publish_job" | sort -u)
+publish_script_calls=$(grep -Eo 'bash[[:space:]]+\./[^[:space:]\\]+' <<<"$publish_job" | sort -u)
 [[ "$publish_script_calls" == $'bash ./deploy/personal-relay/download-exact-artifact.sh\nbash ./deploy/personal-relay/validate-main-protection.sh' ]] || {
   printf '%s\n' "OIDC-enabled publish may execute only the protected exact-artifact and main-protection verifiers" >&2
   exit 1
 }
-if rg -q '\bgosu\b' "$relay_dockerfile" "$relay_entrypoint" "$relay_migrate"; then
+if grep -Eq '(^|[^[:alnum:]_])gosu([^[:alnum:]_]|$)' \
+  "$relay_dockerfile" "$relay_entrypoint" "$relay_migrate"; then
   printf '%s\n' "personal relay runtime must not bundle or invoke gosu" >&2
   exit 1
 fi
@@ -2684,8 +2685,8 @@ image_schema=$(
   exit 1
 }
 if grep -Fq '"default"' <<<"$image_schema" \
-  || rg -q 'DEFAULT_[A-Z0-9_]*IMAGE|IMAGE_[A-Z0-9_]*DEFAULT' "$provider_src" \
-  || rg -q 'ghcr\.io/block/buzz-sprig(:[^@[:space:]"]+)?@sha256:[0-9a-f]{64}' "$provider_src"; then
+  || grep -ERq 'DEFAULT_[A-Z0-9_]*IMAGE|IMAGE_[A-Z0-9_]*DEFAULT' "$provider_src" \
+  || grep -ERq 'ghcr\.io/block/buzz-sprig(:[^@[:space:]"]+)?@sha256:[0-9a-f]{64}' "$provider_src"; then
   printf '%s\n' \
     "Kubernetes provider must not bake a ghcr.io/block/buzz-sprig default; require an explicit scanned and attested digest" >&2
   exit 1
