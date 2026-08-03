@@ -5,11 +5,10 @@
 //! distinguishes them from digests for exactly this reason — so a tag-only
 //! reference is rejected, not just `:latest`.
 //!
-//! There is no parse-time fallback: `image` is required, and its absence
-//! fails closed with a named field. The published `ghcr.io/block/buzz-sprig`
-//! digest is offered only as a schema `default` (a UI prefill the desktop
-//! submits explicitly — see `config::DEFAULT_IMAGE`), so the create-intent
-//! fingerprint never depends on compiled-in provider state.
+//! There is no parse-time or schema fallback: `image` is required, and its
+//! absence fails closed with a named field. A tag+digest reference normalizes
+//! to its tagless canonical form, so equivalent explicit selections produce
+//! the same create-intent fingerprint.
 
 /// A validated, digest-qualified image reference.
 ///
@@ -171,9 +170,8 @@ mod tests {
         }
     }
 
-    /// Parsing has no fallback (the schema default is a UI prefill, not a
-    /// parse-time substitute), so an absent image is an error that names the
-    /// field rather than a silent fallback.
+    /// Parsing has no fallback, so an absent image is an error that names the
+    /// field rather than a silent default.
     #[test]
     fn empty_reference_names_the_field() {
         for empty in ["", "   "] {
