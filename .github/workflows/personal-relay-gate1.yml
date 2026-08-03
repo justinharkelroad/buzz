@@ -2,6 +2,7 @@ name: Personal Relay Gate 1 Receipt
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       source_sha:
@@ -27,15 +28,15 @@ on:
         type: string
 
 concurrency:
-  group: personal-relay-gate1-${{ inputs.source_sha || github.sha }}-${{ inputs.image_digest || github.event_name }}
-  cancel-in-progress: false
+  group: personal-relay-gate1-${{ github.event_name == 'pull_request' && github.ref || inputs.source_sha || github.sha }}-${{ inputs.image_digest || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
 
 jobs:
   contract:
     name: Gate 1 receipt contract
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

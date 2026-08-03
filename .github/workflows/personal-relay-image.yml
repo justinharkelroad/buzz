@@ -2,6 +2,7 @@ name: Personal Relay Image
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - ".cargo/**"
       - ".dockerignore"
@@ -32,8 +33,8 @@ on:
         type: string
 
 concurrency:
-  group: personal-relay-image-${{ github.sha }}
-  cancel-in-progress: false
+  group: personal-relay-image-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: {}
 
@@ -558,6 +559,7 @@ jobs:
 
   prepare:
     name: Bind workflow to source
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -626,7 +628,7 @@ jobs:
 
   build-check:
     name: Build-only check (${{ matrix.platform }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
