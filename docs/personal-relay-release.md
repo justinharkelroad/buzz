@@ -22,8 +22,11 @@ inspection.
   permission.
 - Manual relay publication requires a protected environment approval and an
   environment variable containing the exact candidate SHA.
-- Relay publication creates a non-overwriting candidate tag, but only the
-  digest-qualified image is immutable or eligible for promotion.
+- Relay publication makes a best-effort create-only candidate marker, but never
+  reads that mutable tag to determine the release digest. The digest comes from
+  Buildx create metadata and a raw, hash-verified merged index. Its ledger
+  remains candidate-only and `deployment_eligible: false` until a separate
+  protected Gate 1 review accepts every remaining HIGH and CRITICAL finding.
 - The desktop workflow is unsigned and staging-only. It consumes evidence from
   a successful matching relay workflow run before building.
 - There is no production desktop lane, Apple signing secret, updater key, feed,
@@ -101,21 +104,36 @@ The workflow:
 3. Runs `buzz-workflow` with `reqwest` plus the three exact Postgres regressions.
 4. Builds native AMD64 and ARM64 `runtime-personal` manifests with BuildKit SBOM
    and provenance.
-5. Gives Trivy only package-read permission and uploads JSON before enforcing
-   the fixed HIGH and CRITICAL finding gate.
-6. Rechecks tag absence immediately before creating the multi-platform
-   candidate marker.
-7. Verifies the image entrypoint, root-to-1000 privilege drop, volume marker,
-   `/data/git` write ownership, relay binary, and admin binary.
-8. Attests the merged digest and verifies the attestation with repository,
+5. Retains and verifies each platform's raw OCI index, OCI-artifact subject,
+   in-toto statement, and SPDX predicate before scanning both the exact image
+   digest and that SPDX with the same pinned Trivy version and database bytes.
+6. Uploads the exact JSON reports and policy summaries, then blocks any fixed
+   HIGH or CRITICAL finding across their union. Unfixed findings remain visible
+   and require a separate protected disposition before deployment eligibility.
+7. Rechecks tag absence immediately before creating the multi-platform
+   candidate marker, captures the created digest from Buildx metadata, and
+   verifies the raw merged index is the exact union of both scanned descriptor
+   chains without rereading the mutable tag.
+8. Verifies each exact pushed platform digest on its native runner, then checks
+   the merged image entrypoint, irreversible root-to-1000 privilege drop,
+   cleared groups and capability bounding set, `NoNewPrivs`, PID 1 signal
+   delivery, both migration wrapper paths, volume marker, `/data/git` ownership,
+   and relay/admin binaries.
+9. Attests the merged digest and verifies the attestation with repository,
    source digest, source ref, and hosted-runner constraints.
-9. Uploads a relay ledger, attestation verification and predicate inspection,
-   and both Trivy reports.
+10. Uploads a candidate-only relay ledger, attestation verification and
+    predicate inspection, both raw SBOM descriptor chains and platform SPDX
+    files, four Trivy reports, scanner database hashes/metadata, and both policy
+    summaries.
 
-Source-SHA concurrency serializes attempts across refs. The workflow never
-moves an existing candidate tag. A failure after untagged platform manifests are
-pushed does not make them eligible. A failure after the candidate tag is created
-requires a new reviewed recovery decision; rerunning cannot overwrite the tag.
+Source-SHA concurrency serializes attempts across refs. The workflow checks tag
+absence twice and never intentionally moves a preexisting marker. Registries do
+not provide an atomic create-only tag operation, so the marker remains untrusted
+and is never used for digest resolution or deployment. A failure after untagged
+platform manifests are pushed does not make them eligible. A failure after the
+candidate tag is created requires a new reviewed recovery decision.
+Even a successful run publishes only a candidate artifact. It does not grant
+deployment eligibility or authorize staging.
 
 The ledger's only deployment identity is:
 
@@ -145,6 +163,12 @@ Follow `deploy/personal-relay/README.md`. The Railway service must be an image
 source pinned to the ledger's digest. Do not connect the service to the GitHub
 repository and do not use a branch, version, or SHA tag as the deployment
 source.
+
+Do not promote solely because the artifact workflow passed. First complete the
+separate protected Gate 1 review, record a disposition for every remaining HIGH
+and CRITICAL finding in both architecture summaries, and issue a reviewed
+receipt that changes `deployment_eligible` from false to true for this exact
+digest. The workflow itself never issues that approval.
 
 Compare the dashboard to
 `deploy/personal-relay/railway-settings.reference.json` and receipt:
@@ -327,7 +351,9 @@ Record:
 - Operator, reviewer, protected environment approval, repository, ref,
   `github.sha`, and workflow run URLs.
 - Relay image, candidate marker, immutable digest, attestation verification and
-  predicate, platform SBOMs, Trivy reports, and database regression results.
+  predicate, platform SBOMs, image and SBOM Trivy reports, scanner database
+  metadata, policy summaries, finding dispositions, and database regression
+  results.
 - Actual Railway image digest and settings, resource IDs, hostname, and NIP-11
   pubkey.
 - Smoke approval record SHA-256 and exact test outputs.

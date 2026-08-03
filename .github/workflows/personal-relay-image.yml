@@ -157,25 +157,7 @@ jobs:
       - name: Verify personal runtime contract
         env:
           IMAGE_REF: personal-relay-check:${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE_REF")" = "root:root"
-          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE_REF")" = '["/usr/local/bin/personal-relay-entrypoint"]'
-          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE_REF")" = '["/usr/local/bin/buzz-relay"]'
-          if docker run --rm "$IMAGE_REF" >/tmp/no-volume.out 2>&1; then
-            echo "::error::relay startup succeeded without the Railway volume marker"
-            exit 1
-          fi
-          grep -q 'RAILWAY_VOLUME_MOUNT_PATH must be /data/git' /tmp/no-volume.out
-          docker run --rm --tmpfs /data/git:rw \
-            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" /bin/sh -ec \
-            'test "$(id -u):$(id -g)" = 1000:1000
-             test -x /usr/local/bin/buzz-relay
-             test -x /usr/local/bin/buzz-admin
-             test "$(stat -c %u:%g /data/git)" = 1000:1000
-             touch /data/git/runtime-probe
-             test "$(stat -c %u:%g /data/git/runtime-probe)" = 1000:1000
-             rm /data/git/runtime-probe'
+        run: bash ./deploy/personal-relay/runtime-contract-test.sh "$IMAGE_REF"
 
   release-gate:
     name: Approve source and run release tests
@@ -333,7 +315,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=Personal Buzz Relay
-          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true,oci-artifact=true
           provenance: mode=max
           sbom: true
 
@@ -345,6 +327,14 @@ jobs:
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           mkdir -p /tmp/personal-relay-digests
           touch "/tmp/personal-relay-digests/${DIGEST#sha256:}"
+
+      - name: Verify exact pushed platform runtime
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+          bash ./deploy/personal-relay/runtime-contract-test.sh "$IMAGE_REF"
 
       - name: Upload platform digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -359,14 +349,31 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     needs: [prepare, build-publish]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
+      contents: read
       packages: read
+    env:
+      TRIVY_DISABLE_TELEMETRY: "true"
+      TRIVY_OFFLINE_SCAN: "true"
+      TRIVY_SKIP_VERSION_CHECK: "true"
+      TRIVY_SKIP_VEX_REPO_UPDATE: "true"
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
     steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact scan source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
       - name: Download platform digest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -393,31 +400,211 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Export vulnerability report
+      - name: Fetch and bind the exact platform's raw SBOM attestation
+        env:
+          ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repository_path=${IMAGE_NAME#ghcr.io/}
+          [[ "$repository_path" != "$IMAGE_NAME" ]]
+          registry_token=$(
+            curl --fail --silent --show-error --location --retry 3 \
+              --user "$IMAGE_OWNER:$GH_TOKEN" \
+              --get \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:${repository_path}:pull" \
+              https://ghcr.io/token \
+              | jq -er '.token // .access_token'
+          )
+          echo "::add-mask::$registry_token"
+
+          registry_get() {
+            local path=$1
+            local output=$2
+            local accept=${3:-}
+            local args=(
+              --fail --silent --show-error --location --retry 3
+              --header "Authorization: Bearer ${registry_token}"
+            )
+            if [[ -n "$accept" ]]; then
+              args+=(--header "Accept: ${accept}")
+            fi
+            curl "${args[@]}" "https://ghcr.io/v2/${repository_path}/${path}" --output "$output"
+          }
+
+          digest_matches() {
+            local digest=$1
+            local path=$2
+            printf '%s  %s\n' "${digest#sha256:}" "$path" | sha256sum --check --status -
+          }
+
+          image_index="personal-relay-image-index-${ARCH}.json"
+          attestation_manifest="personal-relay-attestation-manifest-${ARCH}.json"
+          sbom_attestation="personal-relay-sbom-attestation-${ARCH}.intoto.json"
+          spdx="personal-relay-sbom-${ARCH}.spdx.json"
+
+          registry_get \
+            "manifests/${IMAGE_DIGEST}" \
+            "$image_index" \
+            'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          digest_matches "$IMAGE_DIGEST" "$image_index"
+
+          platform_digest=$(jq -er --arg arch "$ARCH" '
+            [
+              .manifests[]
+              | select(.mediaType == "application/vnd.oci.image.manifest.v1+json")
+              | select(.platform.os == "linux" and .platform.architecture == $arch)
+            ]
+            | if length == 1 then .[0].digest else error("expected one platform manifest") end
+          ' "$image_index")
+          attestation_digest=$(jq -er --arg platform_digest "$platform_digest" '
+            [
+              .manifests[]
+              | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")
+              | select(.annotations["vnd.docker.reference.digest"] == $platform_digest)
+              | select(.platform.os == "unknown" and .platform.architecture == "unknown")
+            ]
+            | if length == 1 then .[0].digest else error("expected one attestation manifest") end
+          ' "$image_index")
+
+          registry_get \
+            "manifests/${attestation_digest}" \
+            "$attestation_manifest" \
+            'application/vnd.oci.image.manifest.v1+json'
+          digest_matches "$attestation_digest" "$attestation_manifest"
+          jq -e --arg platform_digest "$platform_digest" '
+            .artifactType == "application/vnd.docker.attestation.manifest.v1+json"
+            and .subject.mediaType == "application/vnd.oci.image.manifest.v1+json"
+            and .subject.digest == $platform_digest
+            and (.subject.size | type == "number" and . > 0)
+          ' "$attestation_manifest" >/dev/null
+          sbom_layer_digest=$(jq -er '
+            [
+              .layers[]
+              | select(.mediaType == "application/vnd.in-toto+json")
+              | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")
+            ]
+            | if length == 1 then .[0].digest else error("expected one SPDX attestation layer") end
+          ' "$attestation_manifest")
+
+          registry_get "blobs/${sbom_layer_digest}" "$sbom_attestation"
+          digest_matches "$sbom_layer_digest" "$sbom_attestation"
+          jq -e --arg subject "${platform_digest#sha256:}" '
+            (."_type" == "https://in-toto.io/Statement/v0.1" or
+              ."_type" == "https://in-toto.io/Statement/v1")
+            and .predicateType == "https://spdx.dev/Document"
+            and (.subject | type == "array" and length == 1)
+            and .subject[0].digest.sha256 == $subject
+            and .predicate.SPDXID == "SPDXRef-DOCUMENT"
+            and (.predicate.packages | type == "array" and length > 0)
+          ' "$sbom_attestation" >/dev/null
+          jq '.predicate' "$sbom_attestation" > "$spdx"
+
+      - name: Export exact image vulnerability report
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
         with:
           image-ref: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          scanners: vuln
+          vuln-type: os,library
           format: json
-          output: personal-relay-trivy-${{ matrix.arch }}.json
+          output: personal-relay-trivy-image-${{ matrix.arch }}.json
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          list-all-pkgs: true
           exit-code: "0"
+          version: v0.70.0
 
-      - name: Upload vulnerability report before the blocking gate
+      - name: Export attached SPDX vulnerability report with the same database
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          scan-type: sbom
+          scan-ref: personal-relay-sbom-${{ matrix.arch }}.spdx.json
+          scanners: vuln
+          vuln-type: os,library
+          format: json
+          output: personal-relay-trivy-sbom-${{ matrix.arch }}.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          list-all-pkgs: true
+          exit-code: "0"
+          version: v0.70.0
+          skip-setup-trivy: true
+          cache: false
+
+      - name: Record scanner and database identity
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          vulnerability_db="$GITHUB_WORKSPACE/.cache/trivy/db/trivy.db"
+          java_db="$GITHUB_WORKSPACE/.cache/trivy/java-db/trivy-java.db"
+          test -s "$vulnerability_db"
+          vulnerability_db_sha256=$(sha256sum "$vulnerability_db" | awk '{print $1}')
+          java_db_sha256=null
+          if [[ -s "$java_db" ]]; then
+            java_db_sha256=$(sha256sum "$java_db" | awk '{print $1}')
+          fi
+          trivy version --cache-dir "$GITHUB_WORKSPACE/.cache/trivy" --format json \
+            | jq \
+              --arg vulnerability_db_sha256 "$vulnerability_db_sha256" \
+              --arg java_db_sha256 "$java_db_sha256" \
+              '. + {
+                VulnerabilityDBSHA256: $vulnerability_db_sha256,
+                JavaDBSHA256: (if $java_db_sha256 == "null" then null else $java_db_sha256 end)
+              }' \
+            > "personal-relay-trivy-version-${ARCH}.json"
+          jq -e '
+            .Version == "0.70.0"
+            and (.VulnerabilityDB.UpdatedAt | type == "string" and length > 0)
+            and (.VulnerabilityDBSHA256 | test("^[0-9a-f]{64}$"))
+            and (.JavaDBSHA256 == null or (.JavaDBSHA256 | test("^[0-9a-f]{64}$")))
+          ' \
+            "personal-relay-trivy-version-${ARCH}.json" >/dev/null
+
+      - name: Enforce the exact image and attached SPDX report union
+        env:
+          ARCH: ${{ matrix.arch }}
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          bash ./deploy/personal-relay/trivy-report-policy.sh \
+            --image-report "personal-relay-trivy-image-${ARCH}.json" \
+            --sbom-report "personal-relay-trivy-sbom-${ARCH}.json" \
+            --image-index "personal-relay-image-index-${ARCH}.json" \
+            --attestation-manifest "personal-relay-attestation-manifest-${ARCH}.json" \
+            --sbom-attestation "personal-relay-sbom-attestation-${ARCH}.intoto.json" \
+            --spdx "personal-relay-sbom-${ARCH}.spdx.json" \
+            --expected-image-ref "$IMAGE_REF" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --expected-arch "$ARCH" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-trivy-version 0.70.0 \
+            > "personal-relay-trivy-policy-${ARCH}.json"
+
+      - name: Upload exact scan evidence even when policy blocks
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: personal-relay-trivy-${{ matrix.arch }}
-          path: personal-relay-trivy-${{ matrix.arch }}.json
+          name: personal-relay-scan-${{ matrix.arch }}
+          path: |
+            personal-relay-attestation-manifest-${{ matrix.arch }}.json
+            personal-relay-image-index-${{ matrix.arch }}.json
+            personal-relay-sbom-attestation-${{ matrix.arch }}.intoto.json
+            personal-relay-sbom-${{ matrix.arch }}.spdx.json
+            personal-relay-trivy-image-${{ matrix.arch }}.json
+            personal-relay-trivy-policy-${{ matrix.arch }}.json
+            personal-relay-trivy-sbom-${{ matrix.arch }}.json
+            personal-relay-trivy-version-${{ matrix.arch }}.json
           if-no-files-found: error
           retention-days: 90
-
-      - name: Enforce high and critical vulnerability gate
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
-          format: table
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
 
   publish:
     name: Create candidate manifest and attest digest
@@ -431,6 +618,17 @@ jobs:
       id-token: write
       packages: write
     steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact publication source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
       - name: Download platform digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -438,12 +636,58 @@ jobs:
           pattern: personal-relay-digest-*
           merge-multiple: true
 
-      - name: Download vulnerability reports
+      - name: Download exact platform scan evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: /tmp/personal-relay-trivy
-          pattern: personal-relay-trivy-*
+          path: /tmp/personal-relay-scan
+          pattern: personal-relay-scan-*
           merge-multiple: true
+
+      - name: Reverify exact platform scan bindings
+        env:
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            summary="/tmp/personal-relay-scan/personal-relay-trivy-policy-${arch}.json"
+            version="/tmp/personal-relay-scan/personal-relay-trivy-version-${arch}.json"
+            test -s "$summary"
+            test -s "$version"
+            jq -e \
+              --arg arch "$arch" \
+              --arg image "$IMAGE_NAME" \
+              --arg source_sha "$SOURCE_SHA" '
+                .artifact.architecture == $arch
+                and .artifact.source_sha == $source_sha
+                and .artifact.image_ref == ($image + "@" + .artifact.image_digest)
+                and (.artifact.image_digest | test("^sha256:[0-9a-f]{64}$"))
+                and .scanner == {name: "Trivy", version: "0.70.0"}
+                and .high_critical.fixed_findings == 0
+              ' "$summary" >/dev/null
+            digest=$(jq -r '.artifact.image_digest | sub("^sha256:"; "")' "$summary")
+            test -f "/tmp/personal-relay-digests/${digest}"
+          done
+          jq -s 'sort_by(.artifact.architecture)' \
+            /tmp/personal-relay-scan/personal-relay-trivy-policy-*.json \
+            > personal-relay-scan-policy-summaries.json
+          jq -e '
+            length == 2
+            and (map(.artifact.architecture) == ["amd64", "arm64"])
+            and (map(.artifact.image_digest) | unique | length == 2)
+          ' personal-relay-scan-policy-summaries.json >/dev/null
+          jq -n \
+            --slurpfile amd64 /tmp/personal-relay-scan/personal-relay-trivy-version-amd64.json \
+            --slurpfile arm64 /tmp/personal-relay-scan/personal-relay-trivy-version-arm64.json \
+            '[{architecture: "amd64"} + $amd64[0], {architecture: "arm64"} + $arm64[0]]' \
+            > personal-relay-trivy-databases.json
+          jq -e '
+            length == 2
+            and (map(.Version) | unique == ["0.70.0"])
+            and (map(.VulnerabilityDB.UpdatedAt) | unique | length == 1)
+            and (map(.VulnerabilityDBSHA256) | unique | length == 1)
+            and (map(.JavaDBSHA256) | unique | length == 1)
+          ' personal-relay-trivy-databases.json >/dev/null
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
@@ -490,14 +734,74 @@ jobs:
             exit 1
           }
           candidate_ref="${IMAGE_NAME}:${CANDIDATE_TAG}"
-          docker buildx imagetools create -t "$candidate_ref" "${digest_refs[@]}"
-          manifest_digest=$(docker buildx imagetools inspect "$candidate_ref" \
-            --format '{{json .Manifest}}' | jq -r '.digest')
+          docker buildx imagetools create \
+            -t "$candidate_ref" \
+            --metadata-file /tmp/personal-relay-manifest-create.json \
+            "${digest_refs[@]}"
+          manifest_digest=$(jq -er '
+            .["containerimage.descriptor"]
+            | select(.mediaType == "application/vnd.oci.image.index.v1+json")
+            | .digest
+          ' /tmp/personal-relay-manifest-create.json)
           [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
           {
             echo "candidate_ref=$candidate_ref"
             echo "digest=$manifest_digest"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the exact merged descriptor union by digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repository_path=${IMAGE_NAME#ghcr.io/}
+          [[ "$repository_path" != "$IMAGE_NAME" ]]
+          registry_token=$(
+            curl --fail --silent --show-error --location --retry 3 \
+              --user "$IMAGE_OWNER:$GH_TOKEN" \
+              --get \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:${repository_path}:pull" \
+              https://ghcr.io/token \
+              | jq -er '.token // .access_token'
+          )
+          echo "::add-mask::$registry_token"
+
+          curl --fail --silent --show-error --location --retry 3 \
+            --header "Authorization: Bearer ${registry_token}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/${repository_path}/manifests/${IMAGE_DIGEST}" \
+            --output personal-relay-merged-index.json
+          printf '%s  %s\n' \
+            "${IMAGE_DIGEST#sha256:}" \
+            personal-relay-merged-index.json \
+            | sha256sum --check --status -
+
+          metadata_size=$(jq -er --arg digest "$IMAGE_DIGEST" '
+            .["containerimage.descriptor"]
+            | select(.digest == $digest)
+            | .size
+          ' /tmp/personal-relay-manifest-create.json)
+          actual_size=$(wc -c < personal-relay-merged-index.json)
+          actual_size=${actual_size//[[:space:]]/}
+          [[ "$metadata_size" == "$actual_size" ]]
+
+          jq -s '
+            map(.manifests) | add | sort_by(.digest)
+          ' \
+            /tmp/personal-relay-scan/personal-relay-image-index-amd64.json \
+            /tmp/personal-relay-scan/personal-relay-image-index-arm64.json \
+            > personal-relay-expected-merged-descriptors.json
+          jq -e \
+            --slurpfile expected personal-relay-expected-merged-descriptors.json '
+              .schemaVersion == 2
+              and .mediaType == "application/vnd.oci.image.index.v1+json"
+              and (.manifests | type == "array")
+              and (.manifests | sort_by(.digest)) == $expected[0]
+            ' personal-relay-merged-index.json >/dev/null
 
       - name: Verify binaries and scoped privilege drop
         env:
@@ -505,25 +809,7 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "$IMAGE_REF"
-          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE_REF")" = "root:root"
-          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE_REF")" = '["/usr/local/bin/personal-relay-entrypoint"]'
-          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$IMAGE_REF")" = '["/usr/local/bin/buzz-relay"]'
-          if docker run --rm "$IMAGE_REF" >/tmp/no-volume.out 2>&1; then
-            echo "::error::relay startup succeeded without the Railway volume marker"
-            exit 1
-          fi
-          grep -q 'RAILWAY_VOLUME_MOUNT_PATH must be /data/git' /tmp/no-volume.out
-          docker run --rm --tmpfs /data/git:rw \
-            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" /bin/sh -ec \
-            'test "$(id -u):$(id -g)" = 1000:1000
-             test -x /usr/local/bin/buzz-relay
-             test -x /usr/local/bin/buzz-admin
-             test "$(stat -c %u:%g /data/git)" = 1000:1000
-             touch /data/git/runtime-probe
-             test "$(stat -c %u:%g /data/git/runtime-probe)" = 1000:1000
-             rm /data/git/runtime-probe'
-          docker run --rm --tmpfs /data/git:rw \
-            -e RAILWAY_VOLUME_MOUNT_PATH=/data/git "$IMAGE_REF" buzz-admin --help >/dev/null
+          bash ./deploy/personal-relay/runtime-contract-test.sh "$IMAGE_REF"
 
       - name: Attest merged image provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -557,6 +843,9 @@ jobs:
           IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
+          set -euo pipefail
+          merged_index_sha256=$(sha256sum personal-relay-merged-index.json | awk '{print $1}')
+          manifest_create_sha256=$(sha256sum /tmp/personal-relay-manifest-create.json | awk '{print $1}')
           jq -n \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$SOURCE_SHA" \
@@ -566,8 +855,12 @@ jobs:
             --arg candidate_ref "$CANDIDATE_REF" \
             --arg digest "$IMAGE_DIGEST" \
             --arg deployment_ref "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --arg merged_index_sha256 "$merged_index_sha256" \
+            --arg manifest_create_sha256 "$manifest_create_sha256" \
             --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{repository: $repository, source_sha: $source_sha, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha, image: $image, candidate_ref: $candidate_ref, candidate_tag_policy: "created once by this workflow and never used for deployment", digest: $digest, deployment_ref: $deployment_ref, sbom: "BuildKit SBOM attestation attached to each platform manifest", vulnerability_gate: "Trivy fixed HIGH and CRITICAL findings blocked on AMD64 and ARM64", database_regressions: "three webhook dispatch authority tests passed against Postgres", workflow_run: $workflow_run}' \
+            --slurpfile scan_policy personal-relay-scan-policy-summaries.json \
+            --slurpfile scanner_databases personal-relay-trivy-databases.json \
+            '{repository: $repository, source_sha: $source_sha, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha, image: $image, candidate_ref: $candidate_ref, candidate_tag_policy: "best-effort non-overwriting marker; never used for deployment or digest resolution", digest: $digest, deployment_ref: $deployment_ref, artifact_status: "candidate_only", deployment_eligible: false, deployment_blockers: ["separate protected Gate 1 review", "recorded disposition for every remaining HIGH and CRITICAL finding"], merged_manifest: {raw_index_sha256: $merged_index_sha256, create_metadata_sha256: $manifest_create_sha256, descriptor_policy: "exact union of the two scanned platform indexes"}, sbom: "raw OCI descriptor chain and OCI-artifact subject cryptographically bind each retained SPDX predicate to its exact platform manifest", vulnerability_gate: "exact Trivy JSON image and subject-bound SPDX report union blocks fixed HIGH and CRITICAL findings on AMD64 and ARM64", unfixed_high_critical_finding_rows: ($scan_policy[0] | map(.high_critical.unfixed_findings) | add // 0), scan_policy: $scan_policy[0], scanner_databases: $scanner_databases[0], database_regressions: "three webhook dispatch authority tests passed against Postgres", workflow_run: $workflow_run}' \
             > personal-relay-release.json
 
       - name: Upload release evidence
@@ -577,8 +870,13 @@ jobs:
           path: |
             personal-relay-attestation-predicate.json
             personal-relay-attestation-verification.json
+            personal-relay-expected-merged-descriptors.json
+            personal-relay-merged-index.json
             personal-relay-release.json
-            /tmp/personal-relay-trivy/*.json
+            personal-relay-scan-policy-summaries.json
+            personal-relay-trivy-databases.json
+            /tmp/personal-relay-manifest-create.json
+            /tmp/personal-relay-scan/*
           if-no-files-found: error
           retention-days: 90
 
@@ -594,7 +892,9 @@ jobs:
             echo
             echo "Deployment image: \`$IMAGE_REF\`"
             echo
-            echo "Only the digest-qualified image is immutable and eligible for promotion."
+            echo "The digest-qualified image is immutable but remains candidate-only."
+            echo
+            echo "Deployment eligibility requires a separate protected Gate 1 review and recorded dispositions."
             echo
             echo "This workflow publishes an artifact only. It does not deploy Railway or change hosted Buzz."
           } >> "$GITHUB_STEP_SUMMARY"

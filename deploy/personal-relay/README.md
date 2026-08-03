@@ -41,16 +41,20 @@ interruption. This design does not promise zero downtime.
 ## Digest-only Railway source
 
 Use an image-source Railway service. Do not connect this service to a source
-repository and do not let Railway rebuild the Dockerfile. The only eligible
-artifact is the `deployment_ref` from a successful relay evidence ledger:
+repository and do not let Railway rebuild the Dockerfile. A successful artifact
+workflow ledger remains candidate-only with `deployment_eligible: false`. Only
+a separate protected Gate 1 review may approve its exact `deployment_ref`:
 
 ```text
 ghcr.io/justinharkelroad/buzz-relay-personal@sha256:<64-hex-digest>
 ```
 
-The `sha-<full-source-sha>` tag is a non-overwriting candidate marker. It is not
-the deployment identity. Every promotion, rollback, receipt, and comparison
-uses the digest-qualified reference.
+The `sha-<full-source-sha>` tag is a best-effort create-only candidate marker.
+Registry tags are mutable and provide no atomic create-only guarantee, so the
+workflow never uses this tag to resolve the artifact digest. Every promotion,
+rollback, receipt, and comparison uses the hash-verified digest-qualified
+reference, and no promotion may begin until the Gate 1 receipt records
+dispositions for all remaining HIGH and CRITICAL findings.
 
 Before staging, Justin approves the Railway project, plan, spend limit, region,
 hostnames, and operator. The operator then configures these settings and records
@@ -85,8 +89,9 @@ The public `runtime` and `runtime-debug` images remain non-root. Only
 3. Rejects a missing, non-directory, or symlinked mount path.
 4. Changes ownership and user access only on the `/data/git` directory itself.
 5. Performs a write probe as UID/GID 1000.
-6. Uses `gosu` with `exec` so Buzz runs as UID/GID 1000 and receives PID 1
-   signals directly.
+6. Uses `setpriv` with cleared supplementary groups, an empty capability
+   bounding set, and `NoNewPrivs`, then `exec`s Buzz as UID/GID 1000 so it
+   receives PID 1 signals directly.
 
 It never recursively changes restored repository ownership. A restore that has
 incorrect child ownership must be normalized once, offline, under the reviewed

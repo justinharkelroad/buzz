@@ -44,7 +44,16 @@ if [ "$initialize_git_volume" = true ]; then
   [ "$(stat -c '%u:%g' "$git_path")" = "$runtime_uid:$runtime_gid" ] || \
     fail "/data/git ownership did not converge to 1000:1000"
 
-  gosu "$runtime_uid:$runtime_gid" /bin/sh -eu -c '
+  /usr/bin/setpriv \
+    --reuid "$runtime_uid" \
+    --regid "$runtime_gid" \
+    --clear-groups \
+    --inh-caps=-all \
+    --ambient-caps=-all \
+    --bounding-set=-all \
+    --no-new-privs \
+    -- \
+    /bin/sh -eu -c '
     path=$1
     test -r "$path" && test -w "$path" && test -x "$path"
     probe="$path/.buzz-volume-probe.$$"
@@ -58,4 +67,12 @@ if [ "$initialize_git_volume" = true ]; then
     fail "UID/GID 1000 cannot safely use /data/git"
 fi
 
-exec gosu "$runtime_uid:$runtime_gid" "$@"
+exec /usr/bin/setpriv \
+  --reuid "$runtime_uid" \
+  --regid "$runtime_gid" \
+  --clear-groups \
+  --inh-caps=-all \
+  --ambient-caps=-all \
+  --bounding-set=-all \
+  --no-new-privs \
+  -- "$@"

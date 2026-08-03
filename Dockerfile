@@ -175,9 +175,10 @@ COPY --from=builder /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pa
 # drops to UID/GID 1000. The normal runtime targets remain non-root.
 FROM runtime-base AS runtime-personal
 USER root:root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
-    && rm -rf /var/lib/apt/lists/*
+# The shared Debian runtime already provides setpriv through util-linux. Keep a
+# build-time assertion here so a future base-image change cannot silently remove
+# the fixed privilege-drop primitive used by the personal entrypoint.
+RUN test -x /usr/bin/setpriv
 COPY --from=stripped-binaries /build/target/release/buzz-relay /usr/local/bin/buzz-relay
 COPY --from=stripped-binaries /build/target/release/buzz-admin /usr/local/bin/buzz-admin
 COPY --from=stripped-binaries /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
