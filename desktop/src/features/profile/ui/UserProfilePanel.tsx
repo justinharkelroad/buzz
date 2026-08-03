@@ -26,6 +26,10 @@ import {
   useUpdatePersonaMutation,
 } from "@/features/agents/hooks";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
+import {
+  canDirectMessageAgent,
+  isAgentClassificationUnavailable,
+} from "@/features/agents/lib/agentAutocompleteEligibility";
 import { AddAgentToChannelDialog } from "@/features/agents/ui/AddAgentToChannelDialog";
 import {
   availableRuntimesForStart,
@@ -70,6 +74,7 @@ import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfile
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
+import { resolveProfileOwnerPresentation } from "@/features/profile/ui/profileOwnerPresentation";
 import { submitProfilePersonaDialog } from "@/features/profile/ui/UserProfilePanelPersonaSubmit";
 import {
   type CardMintTarget,
@@ -82,7 +87,6 @@ import {
   resolveAgentInstruction,
   resolvePanelProfile,
   resolveProfileDisplayName,
-  truncatePubkey,
   type UserProfilePanelProps,
   useRetainedPersona,
 } from "@/features/profile/ui/UserProfilePanelUtils";
@@ -298,6 +302,16 @@ export function UserProfilePanel({
   );
   const isBot =
     Boolean(relayAgent || managedAgent || resolvedPersona) || isAgentByOaOwner;
+  const isAgentClassificationPending =
+    Boolean(effectivePubkey) &&
+    managedAgent === undefined &&
+    resolvedPersona === undefined &&
+    isAgentClassificationUnavailable(
+      profileQuery.data,
+      relayAgentsQuery.data,
+      managedAgentsQuery.data,
+      usersBatchQuery.data,
+    );
   const managedAgentOwner = useIsManagedAgent(isBot ? effectivePubkey : null);
   // Does THIS desktop hold the agent's seckey (or is this an editable persona)?
   // Gates edit (which needs the key) and grants owner access when managed locally.
@@ -312,6 +326,11 @@ export function UserProfilePanel({
   // manage it locally (older agents may not advertise an owner pubkey). Every
   // real boundary is server-side, so this only controls what UI we paint.
   const viewerIsOwner = isCurrentUserOwner || isOwner === true;
+  const canMessageAgent = canDirectMessageAgent({
+    currentPubkey,
+    isOwned: viewerIsOwner,
+    relayAgent,
+  });
 
   const activityAgent = React.useMemo(
     () =>
@@ -673,43 +692,19 @@ export function UserProfilePanel({
     profile,
     pubkey: effectivePubkey,
   });
-  const ownerHandle = React.useMemo(() => {
-    if (ownerPubkey) {
-      const ownerProfile = ownerProfileQuery.data;
-      return (
-        ownerProfile?.nip05Handle?.trim() ||
-        ownerProfile?.displayName?.trim() ||
-        truncatePubkey(ownerPubkey)
-      );
-    }
-
-    if (currentPubkey === undefined || isOwner !== true) {
-      return null;
-    }
-
-    const currentProfile = currentProfileQuery.data;
-    return (
-      currentProfile?.nip05Handle?.trim() ||
-      currentProfile?.displayName?.trim() ||
-      truncatePubkey(currentPubkey)
-    );
-  }, [
-    currentProfileQuery.data,
+  const {
+    ownerAvatarProfile,
+    ownerDisplayName,
+    ownerHandle,
+    ownerProfilePubkey,
+  } = resolveProfileOwnerPresentation({
+    currentProfile: currentProfileQuery.data,
     currentPubkey,
-    isOwner,
-    ownerProfileQuery.data,
+    isCurrentUserOwner,
+    isOwner: isOwner === true,
+    ownerProfile: ownerProfileQuery.data,
     ownerPubkey,
-  ]);
-  const ownerDisplayName = ownerHandle
-    ? isCurrentUserOwner || (!ownerPubkey && isOwner === true)
-      ? `${ownerHandle} (you)`
-      : ownerHandle
-    : null;
-  const ownerProfilePubkey =
-    ownerPubkey ?? (isOwner === true ? (currentPubkey ?? null) : null);
-  const ownerAvatarProfile = ownerPubkey
-    ? ownerProfileQuery.data
-    : currentProfileQuery.data;
+  });
   const memoryCount =
     memoryQuery.data &&
     (memoryQuery.data.core ? 1 : 0) + memoryQuery.data.memories.length;
@@ -789,6 +784,7 @@ export function UserProfilePanel({
           canAddToChannel={managedAgent !== undefined && isOwner === true}
           canEditAgent={canEditAgent}
           canInstantiateAgent={canInstantiateAgent}
+          canMessageAgent={canMessageAgent}
           canOpenAgentLogs={canOpenAgentLogs}
           canViewActivity={canViewActivity}
           callerChannelId={callerChannelId}
@@ -808,6 +804,7 @@ export function UserProfilePanel({
           isArchived={archiveActions.isArchived === true}
           isMessagePending={isOpeningDm}
           isBot={isBot}
+          isAgentClassificationPending={isAgentClassificationPending}
           isAgentActionPending={isAgentActionPending}
           isFollowing={isFollowing}
           isOwner={viewerIsOwner}

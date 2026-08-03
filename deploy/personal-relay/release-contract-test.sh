@@ -23,6 +23,7 @@ bundle_script="$repo_root/scripts/bundle-sidecars.sh"
 tauri_config="$repo_root/desktop/src-tauri/tauri.conf.json"
 release_runbook="$repo_root/docs/personal-relay-release.md"
 deploy_runbook="$repo_root/deploy/personal-relay/README.md"
+relay_env_example="$repo_root/deploy/personal-relay/env.example"
 relay_workflow="$repo_root/.github/workflows/personal-relay-image.yml"
 relay_dockerfile="$repo_root/Dockerfile"
 relay_entrypoint="$repo_root/deploy/personal-relay/git-volume-entrypoint.sh"
@@ -1694,7 +1695,70 @@ source_run = gate1_step(source, expected_source_steps.last).fetch("run")
   '[[ "$match_count" == 1 ]]',
   "expected exactly one listed Rust test",
   'require_exact_test buzz-relay "$relay_test" ignored',
-  'require_exact_test buzz-acp "$full_name" normal'
+  'require_exact_test buzz-acp "$full_name" normal',
+  'require_exact_test buzz-acp "$acp_nip11_test" normal',
+  'require_exact_test buzz-core "$core_test" normal',
+  'require_exact_test buzz-relay "$full_name" normal',
+  'require_exact_test buzz-admin "$admin_reconcile_test" ignored',
+  'require_exact_test buzz-db "$db_test" ignored',
+  'require_exact_test buzz-core "$core_group_role_test" normal',
+  'require_exact_test buzz-core "$core_relay_only_test" normal',
+  'require_exact_test buzz-relay "$relay_client_discovery_test" normal',
+  'require_exact_test buzz-acp "$acp_membership_discovery_test" normal',
+  'require_exact_test buzz-acp "$acp_metadata_discovery_test" normal',
+  'require_exact_test buzz-core "$core_membership_notification_test" normal',
+  'require_exact_test buzz-core "$core_metadata_content_test" normal',
+  'require_exact_test buzz-acp "$acp_current_membership_test" normal',
+  'require_exact_test buzz-acp "$acp_metadata_shadow_test" normal',
+  'require_exact_test buzz-acp "$acp_verified_dm_metadata_test" normal',
+  'require_exact_test buzz-acp "$acp_membership_recheck_test" normal',
+  'require_exact_test buzz-acp "$acp_setup_membership_test" normal',
+  'require_exact_test buzz-acp "$acp_pool_wrong_signer_test" normal',
+  'require_exact_test buzz-acp "$acp_pool_malformed_head_test" normal',
+  'require_exact_test buzz-relay "$relay_reconciliation_matcher_test" normal',
+  'require_exact_test buzz-relay "$relay_missing_members_repair_test" ignored',
+  'require_exact_test buzz-admin "$admin_missing_members_repair_test" ignored',
+  'require_exact_test buzz-db "$db_duplicate_participants_test" normal',
+  'require_exact_test buzz-db "$db_migration_contract_test" normal',
+  'require_exact_test buzz-acp "$acp_setup_stale_add_test" normal',
+  'require_exact_test buzz-acp "$acp_setup_stale_remove_test" normal',
+  'require_exact_test buzz-acp "$acp_readd_subscription_test" normal',
+  'require_exact_test buzz-acp "$acp_membership_retry_cap_test" normal',
+  'require_exact_test buzz-acp "$acp_readd_background_repair_test" normal',
+  'require_exact_test buzz-acp "$acp_exhausted_remove_policy_test" normal',
+  'require_exact_test buzz-acp "$acp_membership_removal_cleanup_test" normal',
+  'require_exact_test buzz-acp "$acp_setup_exhausted_remove_test" normal',
+  'cargo test --locked -p buzz-acp "$acp_nip11_test" -- --exact',
+  'cargo test --locked -p buzz-core "$core_test" -- --exact',
+  'cargo test --locked -p buzz-admin "$admin_reconcile_test" -- --ignored --exact --test-threads=1',
+  'cargo test --locked -p buzz-db "$db_test" -- --ignored --exact --test-threads=1',
+  'cargo test --locked -p buzz-core "$core_group_role_test" -- --exact',
+  'cargo test --locked -p buzz-core "$core_relay_only_test" -- --exact',
+  'cargo test --locked -p buzz-relay "$relay_client_discovery_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_membership_discovery_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_metadata_discovery_test" -- --exact',
+  'cargo test --locked -p buzz-core "$core_membership_notification_test" -- --exact',
+  'cargo test --locked -p buzz-core "$core_metadata_content_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_current_membership_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_metadata_shadow_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_verified_dm_metadata_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_membership_recheck_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_setup_membership_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_pool_wrong_signer_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_pool_malformed_head_test" -- --exact',
+  'cargo test --locked -p buzz-relay "$relay_reconciliation_matcher_test" -- --exact',
+  'cargo test --locked -p buzz-relay "$relay_missing_members_repair_test" -- --ignored --exact --test-threads=1',
+  'cargo test --locked -p buzz-admin "$admin_missing_members_repair_test" -- --ignored --exact --test-threads=1',
+  'cargo test --locked -p buzz-db "$db_duplicate_participants_test" -- --exact',
+  'cargo test --locked -p buzz-db "$db_migration_contract_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_setup_stale_add_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_setup_stale_remove_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_readd_subscription_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_membership_retry_cap_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_readd_background_repair_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_exhausted_remove_policy_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_membership_removal_cleanup_test" -- --exact',
+  'cargo test --locked -p buzz-acp "$acp_setup_exhausted_remove_test" -- --exact'
 ].each { |token| require_gate1(source_run.include?(token), "candidate source-test command contract is missing #{token}") }
 
 require_gate1(proof["needs"] == "source-tests", "clean source proof must depend directly on source-tests")
@@ -1725,29 +1789,71 @@ end
   require_gate1(fetch_result.include?(token.tr("\\", "")), "clean source isolation assertion is missing #{token.tr("\\", "")}")
 end
 seal = gate1_step(proof, "Seal exact control-plane source-test result binding").fetch("run")
-%w[personal-relay-gate1-source-result/v2 github-controlled-protected-job-conclusion candidate_output_trusted protected_workflow_sha256 source_test_job_metadata_sha256 test_contract trusted_validation].each do |token|
-  require_gate1(seal.include?(token), "v2 source-result seal is missing #{token}")
+%w[personal-relay-gate1-source-result/v6 github-controlled-protected-job-conclusion candidate_output_trusted protected_workflow_sha256 source_test_job_metadata_sha256 test_contract trusted_validation].each do |token|
+  require_gate1(seal.include?(token), "v6 source-result seal is missing #{token}")
 end
 %w[
   buzz-admin-migrate buzz-relay-workflow-owner-attribution
-  trusted_relay_workflow_uses_attributed_owner_for_author_gate
-  forged_workflow_marker_cannot_replace_actual_signer
-  relay_signed_non_workflow_event_cannot_replace_actual_signer
-  missing_trusted_relay_identity_fails_closed_to_actual_signer
-  invalid_signature_fails_closed_to_actual_signer
-  wrong_kind_fails_closed_to_actual_signer
-  duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer
-  test_allowlist_accepts_explicit_external_pubkey
-  test_allowlist_rejects_non_sibling_not_in_allowlist
-  test_owner_only_rejects_stranger_so_no_steer
-  test_dm_rejects_allowlisted_external_pubkey
-].each { |id| require_gate1(seal.include?(id), "v2 source-result command contract is missing #{id}") }
+  author_gate_tests::trusted_relay_workflow_uses_attributed_owner_for_author_gate
+  author_gate_tests::forged_workflow_marker_cannot_replace_actual_signer
+  author_gate_tests::relay_signed_non_workflow_event_cannot_replace_actual_signer
+  author_gate_tests::missing_trusted_relay_identity_fails_closed_to_actual_signer
+  author_gate_tests::invalid_signature_fails_closed_to_actual_signer
+  author_gate_tests::wrong_kind_fails_closed_to_actual_signer
+  author_gate_tests::duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer
+  author_gate_tests::test_allowlist_accepts_explicit_external_pubkey
+  author_gate_tests::test_allowlist_rejects_non_sibling_not_in_allowlist
+  author_gate_tests::test_owner_only_rejects_stranger_so_no_steer
+  author_gate_tests::test_dm_accepts_explicit_allowlisted_external_pubkey
+  author_gate_tests::test_dm_rejects_allowlisted_external_pubkey_in_group
+  author_gate_tests::test_dm_rejects_external_pubkey_absent_from_allowlist
+  author_gate_tests::test_dm_rejects_stranger_under_anyone
+  author_gate_tests::test_author_gate_resolver_caches_verified_immutable_dm_metadata
+  author_gate_tests::test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off
+  author_gate_tests::test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message
+  relay::tests::nip11_identity_lookup_retries_boundedly_and_recovers
+  dm::tests::relay_channel_metadata_verifier_is_strict_and_fail_closed
+  handlers::side_effects::tests::immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations
+  handlers::side_effects::tests::immutable_dm_discovery_tags_are_sorted_and_committed
+  handlers::side_effects::tests::immutable_dm_reconciliation_matcher_rejects_unmarked_metadata
+  nip11::tests::nip11_dev_fallback_identity_is_advertised_for_harness_verification
+  tests::channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window
+  tests::reconcile_replacement_bumps_past_trusted_wrong_d_and_ignores_wrong_signer
+  dm::tests::immutable_dm_database_guards_reject_mutations_and_allow_create_dm
+  dm::tests::relay_group_role_discovery_verifier_is_strict_and_fail_closed
+  kind::tests::nip29_relay_authored_discovery_snapshots_are_relay_only
+  handlers::ingest::tests::relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest
+  relay::tests::membership_discovery_rejects_forged_invalid_or_stale_snapshots
+  relay::tests::merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata
+  dm::tests::relay_membership_notification_verifier_is_strict_and_target_bound
+  dm::tests::relay_channel_metadata_rejects_signed_nonempty_content
+  relay::tests::current_membership_state_is_tri_state_and_stale_notification_safe
+  relay::tests::merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata
+  relay::tests::merge_discovered_channels_accepts_only_fully_verified_dm_metadata
+  relay::tests::membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor
+  setup_mode::tests::setup_membership_notifications_requery_current_signed_39002
+  pool::tests::lazy_metadata_lookup_ignores_newer_wrong_signer_sibling
+  pool::tests::lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid
+  handlers::side_effects::tests::channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata
+  handlers::side_effects::tests::channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata
+  tests::reconcile_channels_repairs_missing_members_snapshot_with_valid_metadata
+  dm::tests::create_dm_rejects_duplicate_participants_before_opening_transaction
+  migration::tests::immutable_dm_migration_contract_is_embedded
+  setup_mode::tests::setup_membership_stale_add_cannot_override_current_removal_snapshot
+  setup_mode::tests::setup_membership_stale_remove_cannot_override_current_member_snapshot
+  relay::tests::verified_member_requires_ensure_subscribe_despite_stale_outer_tracking
+  relay::tests::membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable
+  relay::tests::readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking
+  relay::tests::exhausted_remove_fails_closed_but_add_waits_for_distinct_repair
+  membership_removal_cleanup_tests::authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path
+  setup_mode::tests::setup_exhausted_remove_fails_closed_through_unsubscribe_path
+].each { |id| require_gate1(seal.include?(id), "v6 source-result command contract is missing #{id}") }
 proof_upload = gate1_step(proof, "Upload one clean sealed source-test result directory")
 require_gate1(proof_upload.dig("with", "path") == "/tmp/personal-relay-gate1-source-proof", "clean source-proof upload path drifted")
 
 require_gate1(validate.fetch("needs").include?("source-proof") && !validate.fetch("needs").include?("source-tests"), "protected validation must consume only the clean source proof")
 receipt_run = gate1_step(validate, "Validate all exact evidence and issue a non-deploying receipt").fetch("run")
-require_gate1(receipt_run.include?("--source-test-result /tmp/personal-relay-gate1-source-proof/source-test-result.json"), "Gate 1 receipt does not consume the v2 source result")
+require_gate1(receipt_run.include?("--source-test-result /tmp/personal-relay-gate1-source-proof/source-test-result.json"), "Gate 1 receipt does not consume the v6 source result")
 %w[--authorization-tests --authorization-relay-log --authorization-acp-log].each do |legacy|
   require_gate1(!receipt_run.include?(legacy), "Gate 1 receipt still consumes legacy candidate proof #{legacy}")
 end
@@ -2278,7 +2384,7 @@ done
 [[ -f "$desktop_multi_user_acceptance_validator" && -r "$desktop_multi_user_acceptance_validator" && -x "$desktop_multi_user_acceptance_validator" && ! -L "$desktop_multi_user_acceptance_validator" ]]
 [[ -f "$desktop_multi_user_acceptance_test" && -r "$desktop_multi_user_acceptance_test" && -x "$desktop_multi_user_acceptance_test" && ! -L "$desktop_multi_user_acceptance_test" ]]
 [[ -f "$desktop_multi_user_acceptance_example" && -r "$desktop_multi_user_acceptance_example" && ! -L "$desktop_multi_user_acceptance_example" ]]
-[[ $(grep -Ec '^mutate_and_reject ' "$desktop_multi_user_acceptance_test") -eq 35 ]]
+[[ $(grep -Ec '^mutate_and_reject ' "$desktop_multi_user_acceptance_test") -eq 122 ]]
 [[ $(grep -Ec '^expect_rejected ' "$desktop_multi_user_acceptance_test") -eq 18 ]]
 for desktop_acceptance_mutation in \
   identity-impersonation identity-self-claim-false justin-credentials-used \
@@ -2286,35 +2392,215 @@ for desktop_acceptance_mutation in \
   duplicate-agent-id missing-allowlist wrong-apply-action wrong-common-channel \
   missing-common-channel bad-root-binding bad-parent-binding \
   extra-challenge-p-tag missing-response-p-tag wrong-stream-kind \
-  duplicate-nonce duplicate-event-id missing-dm-probe wrong-dm-probe-kind \
-  wrong-dm-context wrong-dm-channel-type wrong-dm-channel duplicate-dm-channel \
-  tampered-dm-probe-author tampered-dm-probe-tag tampered-dm-decision \
-  dm-response dm-short-window dm-observation-gap runtime-applied-after-dm-probe \
-  copied-receipt-hash substituted-source substituted-dmg substituted-hosted \
+  duplicate-nonce duplicate-event-id duplicate-cross-surface-event-id \
+  duplicate-dm-response-event-id duplicate-cross-surface-nonce \
+  missing-dm-recipient-discovery missing-dm-recipient-selection \
+  wrong-dm-open-kind open-dm-channel stale-dm-metadata unmarked-dm-channel \
+  wrong-dm-metadata-signer bad-dm-metadata-signature wrong-dm-metadata-d-tag \
+  public-dm-metadata not-closed-dm-metadata bad-dm-participant-commitment \
+  db-immutable-dm-invariant-false missing-dm-private-marker \
+  not-hidden-dm-metadata open-marker-on-dm-metadata \
+  db-current-membership-false wrong-dm-metadata-participants \
+  dm-metadata-before-open duplicate-dm-metadata-event-id \
+  wrong-membership-snapshot-kind wrong-membership-snapshot-signer \
+  bad-membership-snapshot-signature stale-membership-snapshot \
+  wrong-membership-snapshot-d-tag wrong-membership-snapshot-participants \
+  wrong-membership-snapshot-roles duplicate-membership-snapshot-event-id \
+  membership-snapshot-before-metadata-verification \
+  copied-dm-security-receipt copied-membership-snapshot-receipt \
+  tampered-stored-db-participant-hash tampered-recomputed-db-participant-hash \
+  conflated-db-and-metadata-participant-hashes \
+  tampered-recomputed-metadata-participant-commitment wrong-dm-channel-hash \
+  wrong-dm-participant-policy-version wrong-dm-channel-type wrong-dm-channel \
+  duplicate-dm-channel \
+  tampered-dm-participants tampered-dm-opened-by tampered-dm-open-author \
+  tampered-dm-open-tag tampered-dm-decision missing-second-dm-turn \
+  wrong-dm-turn-order dm-turn-not-started wrong-dm-challenge-kind \
+  wrong-dm-response-kind tampered-dm-challenge-author \
+  tampered-dm-challenge-tag tampered-dm-response-author tampered-dm-response-tag \
+  bad-dm-first-response-root unexpected-dm-first-root bad-dm-followup-root \
+  bad-dm-followup-parent bad-dm-followup-response-root \
+  bad-dm-followup-response-parent \
+  continuity-not-verified duplicate-dm-nonce duplicate-dm-event-id \
+  copied-dm-receipt-hash runtime-applied-after-dm-open copied-receipt-hash \
+  unauthorized-third-party-identity-substitution \
+  negative-probe-aggregate-claim-false missing-negative-probe \
+  wrong-negative-probe-order wrong-negative-probe-type wrong-negative-probe-agent \
+  wrong-negative-probe-channel-type wrong-negative-probe-channel-id \
+  wrong-negative-probe-channel-hash duplicate-negative-probe-channel \
+  group-probe-missing-third-party third-party-probe-includes-mary \
+  duplicate-negative-probe-nonce duplicate-negative-probe-event-id \
+  wrong-negative-probe-kind wrong-group-probe-author \
+  wrong-third-party-probe-author wrong-negative-probe-p-tag \
+  copied-negative-probe-receipt copied-negative-participant-receipt \
+  wrong-group-probe-decision wrong-third-party-probe-decision \
+  copied-negative-decision-receipt negative-probe-turn-started \
+  negative-probe-has-response negative-probe-observation-start-mismatch \
+  negative-probe-wrong-observation-seconds \
+  negative-probe-observation-window-mismatch copied-negative-no-turn-receipt \
+  negative-probe-after-completion negative-probe-extra-key \
+  substituted-source substituted-dmg substituted-hosted \
   substituted-agent-set inventory-charter-swap substituted-evidence-bundle \
   symlink-evidence-bundle hardlink-samefile-evidence-bundle \
   unsafe-evidence-bundle-mode unsafe-manifest-mode \
   substituted-evidence-bundle-record stale expired \
-  near-expiry old-fresh-near-now-expiry extra-key fresh-example-only-poison \
+  near-expiry old-fresh-near-now-expiry extra-key legacy-v1-dm-denial \
+  fresh-example-only-poison \
   duplicate-top-member duplicate-disjoint-object multiple-json; do
   grep -Fq "$desktop_acceptance_mutation" "$desktop_multi_user_acceptance_test"
 done
 grep -Fq '"$validator" --input "$valid" --evidence-bundle "$evidence_bundle"' "$desktop_multi_user_acceptance_test"
 grep -Fq 'jq -e '\''.example_only == true'\'' "$example"' "$desktop_multi_user_acceptance_test"
 grep -Fq 'fail "checked-in example was accepted"' "$desktop_multi_user_acceptance_test"
+jq -e '
+  . as $record
+  | .schema == "personal-desktop-multi-user-acceptance/v2"
+  and .example_only == true
+  and .all_dm_negative_probes_passed == true
+  and (.agents | type == "array" and length == 8)
+  and all(.agents[];
+    has("dm_conversation")
+    and (has("dm_denial") | not)
+    and .dm_conversation.channel_type == "dm"
+    and .dm_conversation.open_event_kind == 41010
+    and .dm_conversation.channel_metadata.kind == 39000
+    and .dm_conversation.channel_metadata.author_pubkey == $record.relay.pubkey
+    and .dm_conversation.channel_metadata.signature_verified == true
+    and .dm_conversation.channel_metadata.current_for_d_tag == true
+    and .dm_conversation.channel_metadata.t_tag == "dm"
+    and .dm_conversation.channel_metadata.visibility == "private"
+    and .dm_conversation.channel_metadata.hidden == true
+    and .dm_conversation.channel_metadata.closed == true
+    and .dm_conversation.channel_metadata.public_marker_count == 0
+    and .dm_conversation.channel_metadata.open_marker_count == 0
+    and .dm_conversation.channel_metadata.participant_set_policy == "buzz:dm-participants"
+    and .dm_conversation.channel_metadata.participant_set_version == "v1"
+    and .dm_conversation.membership_snapshot.kind == 39002
+    and .dm_conversation.membership_snapshot.author_pubkey == $record.relay.pubkey
+    and .dm_conversation.membership_snapshot.signature_verified == true
+    and .dm_conversation.membership_snapshot.current_for_d_tag == true
+    and .dm_conversation.membership_snapshot.d_tag == .dm_conversation.channel_metadata.d_tag
+    and .dm_conversation.membership_snapshot.participant_p_tags ==
+      .dm_conversation.participant_pubkeys
+    and .dm_conversation.membership_snapshot.p_role_tags ==
+      (.dm_conversation.participant_pubkeys | map([., "member"]))
+    and .dm_conversation.db_invariant.immutable_participant_set == true
+    and .dm_conversation.db_invariant.current_membership_verified == true
+    and .dm_conversation.db_invariant.participant_hash_algorithm ==
+      "sha256-concat-sorted-xonly-pubkeys"
+    and .dm_conversation.db_invariant.participant_hash_hex ==
+      .dm_conversation.db_invariant.recomputed_participant_hash_hex
+    and .dm_conversation.db_invariant.participant_hash_hex !=
+      .dm_conversation.channel_metadata.participant_set_commitment_sha256
+    and .dm_conversation.db_invariant.recomputed_metadata_participant_set_commitment_sha256 ==
+      .dm_conversation.channel_metadata.participant_set_commitment_sha256
+    and .dm_conversation.author_gate_decision == "allowed_explicit_allowlist"
+    and (.dm_conversation.turns | length) == 2
+    and .dm_conversation.continuity_verified == true
+  )
+  and (.dm_negative_probes | type == "array" and length == 16)
+  and ([.dm_negative_probes[].probe_type]
+    | map(select(. == "group_dm"))
+    | length) == 8
+  and ([.dm_negative_probes[].probe_type]
+    | map(select(. == "unauthorized_third_party_dm"))
+    | length) == 8
+  and all(.dm_negative_probes[];
+    .channel_type == "dm"
+    and .challenge_kind == 9
+    and .challenge_p_tags == [.agent_pubkey]
+    and .turn_started == false
+    and .response_event_ids == []
+    and .observation_seconds == 120
+    and (if .probe_type == "group_dm"
+      then .challenge_author_pubkey == $record.identities.mary_pubkey
+        and .participant_pubkeys == ([$record.identities.mary_pubkey,
+          $record.identities.unauthorized_third_party_pubkey,
+          .agent_pubkey] | sort)
+        and .author_gate_decision == "denied_group_dm"
+      else .challenge_author_pubkey == $record.identities.unauthorized_third_party_pubkey
+        and .participant_pubkeys == ([$record.identities.unauthorized_third_party_pubkey,
+          .agent_pubkey] | sort)
+        and .author_gate_decision == "denied_not_allowlisted"
+      end)
+  )
+' "$desktop_multi_user_acceptance_example" >/dev/null
 grep -Fq 'same-second parallel positive fixture was rejected' "$desktop_multi_user_acceptance_test"
 grep -Fq 'same-agent challenge/response pair in one second was rejected' "$desktop_multi_user_acceptance_test"
+grep -Fq 'all 64 interaction event IDs, 24 channel-security event IDs, 40 nonces, 24 DM channels, and 168 receipt hashes' "$desktop_multi_user_acceptance_test"
+grep -Fq '.schema = "personal-desktop-multi-user-acceptance/v1"' "$desktop_multi_user_acceptance_test"
+grep -Fq '.dm_denial = {' "$desktop_multi_user_acceptance_test"
+grep -Fq '.schema == "personal-desktop-multi-user-acceptance/v2"' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.challenge_p_tags == [$agent.agent_pubkey]' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.response_p_tags == [$record.identities.mary_pubkey]' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.challenge_kind == 9' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.response_kind == 9' "$desktop_multi_user_acceptance_validator"
-grep -Fq '.dm_denial.probe_kind == 9' "$desktop_multi_user_acceptance_validator"
-grep -Fq '.dm_denial.conversation_context == "dm"' "$desktop_multi_user_acceptance_validator"
-grep -Fq '.dm_denial.channel_type == "dm"' "$desktop_multi_user_acceptance_validator"
-grep -Fq '.dm_denial.dm_channel_sha256 != $record.common_stream_channel_sha256' "$desktop_multi_user_acceptance_validator"
-grep -Fq '$applied <= $dm_probe_at' "$desktop_multi_user_acceptance_validator"
-grep -Fq '$dm_from <= $dm_probe_at' "$desktop_multi_user_acceptance_validator"
-grep -Fq '$dm_until >= ($dm_probe_at + 120)' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($interaction_event_ids | length) == 64' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($channel_security_event_ids | length) == 24' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($all_event_ids | length) == 88' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($positive_nonces | length) == 24' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($negative_nonces | length) == 16' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($all_nonces | length) == 40' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($receipt_hashes | length) == 168' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.recipient_discovered == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.recipient_selected == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_type == "dm"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.participant_pubkeys ==' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.open_event_kind == 41010' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.open_author_pubkey == $record.identities.mary_pubkey' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.open_p_tags == [$agent.agent_pubkey]' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'PARTICIPANT_POLICY = "buzz:dm-participants"' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'PARTICIPANT_VERSION = "v1"' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'PARTICIPANT_DOMAIN = b"buzz:dm-participants:v1\0"' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'commitment_input.append(len(participants))' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'commitment_input.extend(bytes.fromhex(participant))' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'd_tag_sha256 = hashlib.sha256(d_tag.encode("ascii")).hexdigest()' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.kind == 39000' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.author_pubkey == $record.relay.pubkey' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.signature_verified == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.current_for_d_tag == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.t_tag == "dm"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.visibility == "private"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.hidden == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.closed == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.public_marker_count == 0' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.open_marker_count == 0' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.participant_set_policy == "buzz:dm-participants"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.channel_metadata.participant_set_version == "v1"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.kind == 39002' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.author_pubkey == $record.relay.pubkey' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.signature_verified == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.current_for_d_tag == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.participant_p_tags ==' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.membership_snapshot.p_role_tags ==' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.db_invariant.immutable_participant_set == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.db_invariant.current_membership_verified == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '"sha256-concat-sorted-xonly-pubkeys"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.db_invariant.participant_hash_hex ==' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.db_invariant.participant_hash_hex !=' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.db_invariant.recomputed_metadata_participant_set_commitment_sha256 ==' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_open_at <= $dm_metadata_at' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_metadata_verified_at <= $dm_membership_at' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_membership_verified_at <= $dm_db_checked_at' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_db_checked_at <= $dm_first_challenge_at' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.author_gate_decision == "allowed_explicit_allowlist"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.turns | type == "array" and length == 2' "$desktop_multi_user_acceptance_validator"
+grep -Fq '[.dm_conversation.turns[].ordinal] == [1, 2]' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_followup.challenge_parent_event_id == $dm_first.response_event_id' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_followup.response_parent_event_id == $dm_followup.challenge_event_id' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_conversation.continuity_verified == true' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$applied <= $dm_open_at' "$desktop_multi_user_acceptance_validator"
+grep -Fq '$dm_followup_response_at <= $completed' "$desktop_multi_user_acceptance_validator"
+grep -Fq -- '--expected-unauthorized-third-party-pubkey' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.dm_negative_probes | type == "array" and length == 16' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.author_gate_decision == "denied_group_dm"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.author_gate_decision == "denied_not_allowlisted"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.challenge_p_tags == [$agent.agent_pubkey]' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.turn_started == false' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.response_event_ids == []' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.observation_seconds == 120' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($observed_until - $observed_from) == .observation_seconds' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'fail "acceptance manifest does not satisfy the v2 contract"' "$desktop_multi_user_acceptance_validator"
 grep -Fq '$expires >= ($now + 3600)' "$desktop_multi_user_acceptance_validator"
 grep -Fq 'if not hasattr(os, "O_NOFOLLOW")' "$desktop_multi_user_acceptance_validator"
 grep -Fq 'manifest_fd = os.open(manifest_path, open_flags)' "$desktop_multi_user_acceptance_validator"
@@ -2330,6 +2616,17 @@ grep -Fq 'Its summary alone never authorizes production cutover.' "$desktop_mult
 desktop_acceptance_summary_builder=$(awk '/^jq -cnS \\/ { keep = 1 } keep { print }' "$desktop_multi_user_acceptance_validator")
 for desktop_acceptance_summary_assertion in \
   'manifest_claimed_all_agents_passed: true' \
+  'manifest_claimed_all_dm_conversations_passed: true' \
+  'manifest_claimed_all_dm_channels_current_and_safe: true' \
+  'manifest_claimed_all_dm_negative_probes_passed: true' \
+  'dm_conversation_count: 8' \
+  'dm_channel_metadata_count: 8' \
+  'dm_membership_snapshot_count: 8' \
+  'dm_db_invariant_check_count: 8' \
+  'dm_turn_count: 16' \
+  'dm_negative_probe_count: 16' \
+  'group_dm_denial_probe_count: 8' \
+  'unauthorized_third_party_dm_denial_probe_count: 8' \
   'manifest_contract_passed: true' \
   'evidence_bundle_authenticated: false' \
   'cutover_authorized: false'; do
@@ -2355,8 +2652,9 @@ gate1_pull_request_trigger=$(awk '
   /^  workflow_dispatch:$/ { exit }
   keep { print }
 ' "$gate1_workflow")
-[[ -z "${gate1_pull_request_trigger//[[:space:]]/}" ]] || {
-  printf '%s\n' "Gate 1 contract check must run on every pull request without path filters" >&2
+expected_gate1_pull_request_trigger='    types: [opened, synchronize, reopened, ready_for_review]'
+[[ "$gate1_pull_request_trigger" == "$expected_gate1_pull_request_trigger" ]] || {
+  printf '%s\n' "Gate 1 contract check must use the exact approved pull-request lifecycle events without path filters" >&2
   exit 1
 }
 contract_job=$(awk '/^  contract:$/ { keep=1 } /^  source-tests:$/ { exit } keep { print }' "$gate1_workflow")
@@ -2379,20 +2677,69 @@ for legacy_source_proof in authorization-tests authorization-relay-log authoriza
   fi
 done
 grep -Fq 'personal-relay-gate1-approval-secret.json' "$gate1_workflow"
-for acp_test in \
-  trusted_relay_workflow_uses_attributed_owner_for_author_gate \
-  forged_workflow_marker_cannot_replace_actual_signer \
-  relay_signed_non_workflow_event_cannot_replace_actual_signer \
-  missing_trusted_relay_identity_fails_closed_to_actual_signer \
-  invalid_signature_fails_closed_to_actual_signer \
-  wrong_kind_fails_closed_to_actual_signer \
-  duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer \
-  test_allowlist_accepts_explicit_external_pubkey \
-  test_allowlist_rejects_non_sibling_not_in_allowlist \
-  test_owner_only_rejects_stranger_so_no_steer \
-  test_dm_rejects_allowlisted_external_pubkey; do
-  grep -Fq "$acp_test" "$gate1_workflow"
-  grep -Fq "author_gate_tests::${acp_test}" "$gate1_receipt"
+grep -Fq 'personal-relay-gate1-source-result/v6' "$gate1_workflow"
+grep -Fq 'personal-relay-gate1-source-result/v6' "$gate1_receipt"
+grep -Fq '(.test_contract.commands | length) == 55' "$gate1_workflow"
+for exact_source_command_id in \
+  buzz-admin-migrate \
+  buzz-relay-workflow-owner-attribution \
+  author_gate_tests::trusted_relay_workflow_uses_attributed_owner_for_author_gate \
+  author_gate_tests::forged_workflow_marker_cannot_replace_actual_signer \
+  author_gate_tests::relay_signed_non_workflow_event_cannot_replace_actual_signer \
+  author_gate_tests::missing_trusted_relay_identity_fails_closed_to_actual_signer \
+  author_gate_tests::invalid_signature_fails_closed_to_actual_signer \
+  author_gate_tests::wrong_kind_fails_closed_to_actual_signer \
+  author_gate_tests::duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer \
+  author_gate_tests::test_allowlist_accepts_explicit_external_pubkey \
+  author_gate_tests::test_allowlist_rejects_non_sibling_not_in_allowlist \
+  author_gate_tests::test_owner_only_rejects_stranger_so_no_steer \
+  author_gate_tests::test_dm_accepts_explicit_allowlisted_external_pubkey \
+  author_gate_tests::test_dm_rejects_allowlisted_external_pubkey_in_group \
+  author_gate_tests::test_dm_rejects_external_pubkey_absent_from_allowlist \
+  author_gate_tests::test_dm_rejects_stranger_under_anyone \
+  author_gate_tests::test_author_gate_resolver_caches_verified_immutable_dm_metadata \
+  author_gate_tests::test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off \
+  author_gate_tests::test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message \
+  relay::tests::nip11_identity_lookup_retries_boundedly_and_recovers \
+  dm::tests::relay_channel_metadata_verifier_is_strict_and_fail_closed \
+  handlers::side_effects::tests::immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations \
+  handlers::side_effects::tests::immutable_dm_discovery_tags_are_sorted_and_committed \
+  handlers::side_effects::tests::immutable_dm_reconciliation_matcher_rejects_unmarked_metadata \
+  nip11::tests::nip11_dev_fallback_identity_is_advertised_for_harness_verification \
+  tests::channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window \
+  tests::reconcile_replacement_bumps_past_trusted_wrong_d_and_ignores_wrong_signer \
+  dm::tests::immutable_dm_database_guards_reject_mutations_and_allow_create_dm \
+  dm::tests::relay_group_role_discovery_verifier_is_strict_and_fail_closed \
+  kind::tests::nip29_relay_authored_discovery_snapshots_are_relay_only \
+  handlers::ingest::tests::relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest \
+  relay::tests::membership_discovery_rejects_forged_invalid_or_stale_snapshots \
+  relay::tests::merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata \
+  dm::tests::relay_membership_notification_verifier_is_strict_and_target_bound \
+  dm::tests::relay_channel_metadata_rejects_signed_nonempty_content \
+  relay::tests::current_membership_state_is_tri_state_and_stale_notification_safe \
+  relay::tests::merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata \
+  relay::tests::merge_discovered_channels_accepts_only_fully_verified_dm_metadata \
+  relay::tests::membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor \
+  setup_mode::tests::setup_membership_notifications_requery_current_signed_39002 \
+  pool::tests::lazy_metadata_lookup_ignores_newer_wrong_signer_sibling \
+  pool::tests::lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid \
+  handlers::side_effects::tests::channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata \
+  handlers::side_effects::tests::channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata \
+  tests::reconcile_channels_repairs_missing_members_snapshot_with_valid_metadata \
+  dm::tests::create_dm_rejects_duplicate_participants_before_opening_transaction \
+  migration::tests::immutable_dm_migration_contract_is_embedded \
+  setup_mode::tests::setup_membership_stale_add_cannot_override_current_removal_snapshot \
+  setup_mode::tests::setup_membership_stale_remove_cannot_override_current_member_snapshot \
+  relay::tests::verified_member_requires_ensure_subscribe_despite_stale_outer_tracking \
+  relay::tests::membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable \
+  relay::tests::readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking \
+  relay::tests::exhausted_remove_fails_closed_but_add_waits_for_distinct_repair \
+  membership_removal_cleanup_tests::authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path \
+  setup_mode::tests::setup_exhausted_remove_fails_closed_through_unsubscribe_path; do
+  grep -Fq "$exact_source_command_id" "$gate1_workflow"
+  grep -Fq "$exact_source_command_id" "$gate1_receipt"
+  grep -Fq "$exact_source_command_id" "$release_runbook"
+  grep -Fq "$exact_source_command_id" "$deploy_runbook"
 done
 grep -Fq 'cargo test --locked -p buzz-acp "$full_name" -- --exact' "$gate1_workflow"
 if grep -Fq 'cargo test --locked -p buzz-acp author_gate_tests::' "$gate1_workflow"; then
@@ -2501,7 +2848,10 @@ for exact_acp_test in \
   test_allowlist_accepts_explicit_external_pubkey \
   test_allowlist_rejects_non_sibling_not_in_allowlist \
   test_owner_only_rejects_stranger_so_no_steer \
-  test_dm_rejects_allowlisted_external_pubkey; do
+  test_dm_accepts_explicit_allowlisted_external_pubkey \
+  test_dm_rejects_allowlisted_external_pubkey_in_group \
+  test_dm_rejects_external_pubkey_absent_from_allowlist \
+  test_dm_rejects_stranger_under_anyone; do
   grep -Fq "$exact_acp_test" "$release_runbook"
   grep -Fq "$exact_acp_test" "$deploy_runbook"
 done
@@ -2512,14 +2862,21 @@ for mary_blocker in \
   'same-thread' \
   'exact sole `p` tag' \
   'both root and parent' \
-  'DMs remain owner/sibling-only' \
+  'exact 1:1 DM' \
+  'kind `41010` open event' \
+  'lexicographically sorted two-key array' \
+  'verified NIP-OA kind' \
+  'owner binding to Justin' \
+  'accepted owner-authored kind `30177`' \
+  'allowed_explicit_allowlist' \
+  'two kind `9` turns' \
+  'Group or unknown' \
+  '`anyone`' \
   'never sign in as Justin' \
   'provider-hosted' \
   'restarted' \
   'redeployed' \
   'unique kind `9` challenge' \
-  'kind `9` DM denial probe' \
-  'at least 120 seconds' \
   "Justin's credentials" \
   'not advisory'; do
   grep -Fq "$mary_blocker" "$release_runbook"
@@ -2529,7 +2886,8 @@ for desktop_acceptance_contract in \
   'pre-build staging' \
   'cannot prove' \
   'private evidence bundle' \
-  '`personal-desktop-multi-user-acceptance/v1`' \
+  '`personal-desktop-multi-user-acceptance/v2`' \
+  '`personal-desktop-multi-user-acceptance-summary/v2`' \
   'exact DMG' \
   'attestation predicate' \
   'final v3 audit' \
@@ -2539,6 +2897,32 @@ for desktop_acceptance_contract in \
   'sealed private snapshot' \
   'does not authenticate' \
   'manifest_claimed_all_agents_passed: true' \
+  'manifest_claimed_all_dm_conversations_passed: true' \
+  'manifest_claimed_all_dm_channels_current_and_safe: true' \
+  'manifest_claimed_all_dm_negative_probes_passed: true' \
+  'eight DM conversations' \
+  'metadata events' \
+  'membership snapshots' \
+  'DB invariant' \
+  'sixteen DM turns' \
+  'group-DM' \
+  'unauthorized-third-party' \
+  'kind `39000`' \
+  'kind `39002`' \
+  'lowercase hyphenated' \
+  'dm_channel_sha256' \
+  't=dm' \
+  '["buzz:dm-participants","v1","<commitment>"]' \
+  'one unsigned participant-count byte' \
+  '32-byte x-only' \
+  'immutable participant set' \
+  'current membership' \
+  '`channels.participant_hash`' \
+  'concatenated sorted raw' \
+  '`denied_group_dm`' \
+  '`denied_not_allowlisted`' \
+  '120-second' \
+  'DB-invariant-failing' \
   'manifest_contract_passed: true' \
   'evidence_bundle_authenticated: false' \
   'cutover_authorized: false' \
@@ -2548,6 +2932,19 @@ for desktop_acceptance_contract in \
   'Any future production or promotion lane must exact-download'; do
   grep -Fq "$desktop_acceptance_contract" "$release_runbook"
   grep -Fq "$desktop_acceptance_contract" "$deploy_runbook"
+done
+[[ -f "$relay_env_example" && -r "$relay_env_example" && ! -L "$relay_env_example" ]]
+[[ $(grep -Ec '^BUZZ_RECONCILE_CHANNELS=' "$relay_env_example") -eq 1 ]]
+[[ $(grep -Fxc 'BUZZ_RECONCILE_CHANNELS=true' "$relay_env_example") -eq 1 ]]
+for channel_reconciliation_contract in \
+  '`BUZZ_RECONCILE_CHANNELS=true`' \
+  'personal staging and personal production' \
+  "before Mary's acceptance" \
+  'provider configuration receipt' \
+  'startup reconciliation evidence' \
+  'Gate 1 evidence'; do
+  grep -Fq "$channel_reconciliation_contract" "$release_runbook"
+  grep -Fq "$channel_reconciliation_contract" "$deploy_runbook"
 done
 for desktop_release_contract in \
   'exact ten-file candidate' \

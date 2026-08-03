@@ -881,7 +881,7 @@ jq -e \
     "source_test_job_metadata_sha256", "source_test_job", "test_contract",
     "trusted_validation"
   ] | sort)
-  and .schema == "personal-relay-gate1-source-result/v2"
+  and .schema == "personal-relay-gate1-source-result/v6"
   and .evidence_model == "github-controlled-protected-job-conclusion"
   and .repository == $repository
   and .source_sha == $source_sha
@@ -994,8 +994,176 @@ jq -e \
         argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_owner_only_rejects_stranger_so_no_steer", "--", "--exact"]
       },
       {
-        id: "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey",
-        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey", "--", "--exact"]
+        id: "author_gate_tests::test_dm_accepts_explicit_allowlisted_external_pubkey",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_accepts_explicit_allowlisted_external_pubkey", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey_in_group",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_rejects_allowlisted_external_pubkey_in_group", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_dm_rejects_external_pubkey_absent_from_allowlist",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_rejects_external_pubkey_absent_from_allowlist", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_dm_rejects_stranger_under_anyone",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dm_rejects_stranger_under_anyone", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_author_gate_resolver_caches_verified_immutable_dm_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_author_gate_resolver_caches_verified_immutable_dm_metadata", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off", "--", "--exact"]
+      },
+      {
+        id: "author_gate_tests::test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "author_gate_tests::test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::nip11_identity_lookup_retries_boundedly_and_recovers",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::nip11_identity_lookup_retries_boundedly_and_recovers", "--", "--exact"]
+      },
+      {
+        id: "dm::tests::relay_channel_metadata_verifier_is_strict_and_fail_closed",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-core", "dm::tests::relay_channel_metadata_verifier_is_strict_and_fail_closed", "--", "--exact"]
+      },
+      {
+        id: "handlers::side_effects::tests::immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::side_effects::tests::immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations", "--", "--exact"]
+      },
+      {
+        id: "handlers::side_effects::tests::immutable_dm_discovery_tags_are_sorted_and_committed",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::side_effects::tests::immutable_dm_discovery_tags_are_sorted_and_committed", "--", "--exact"]
+      },
+      {
+        id: "handlers::side_effects::tests::immutable_dm_reconciliation_matcher_rejects_unmarked_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::side_effects::tests::immutable_dm_reconciliation_matcher_rejects_unmarked_metadata", "--", "--exact"]
+      },
+      {
+        id: "nip11::tests::nip11_dev_fallback_identity_is_advertised_for_harness_verification",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "nip11::tests::nip11_dev_fallback_identity_is_advertised_for_harness_verification", "--", "--exact"]
+      },
+      {
+        id: "tests::channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "tests::channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window", "--", "--exact"]
+      },
+      {
+        id: "tests::reconcile_replacement_bumps_past_trusted_wrong_d_and_ignores_wrong_signer",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-admin", "tests::reconcile_replacement_bumps_past_trusted_wrong_d_and_ignores_wrong_signer", "--", "--ignored", "--exact", "--test-threads=1"]
+      },
+      {
+        id: "dm::tests::immutable_dm_database_guards_reject_mutations_and_allow_create_dm",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-db", "dm::tests::immutable_dm_database_guards_reject_mutations_and_allow_create_dm", "--", "--ignored", "--exact", "--test-threads=1"]
+      },
+      {
+        id: "dm::tests::relay_group_role_discovery_verifier_is_strict_and_fail_closed",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-core", "dm::tests::relay_group_role_discovery_verifier_is_strict_and_fail_closed", "--", "--exact"]
+      },
+      {
+        id: "kind::tests::nip29_relay_authored_discovery_snapshots_are_relay_only",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-core", "kind::tests::nip29_relay_authored_discovery_snapshots_are_relay_only", "--", "--exact"]
+      },
+      {
+        id: "handlers::ingest::tests::relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::ingest::tests::relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::membership_discovery_rejects_forged_invalid_or_stale_snapshots",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::membership_discovery_rejects_forged_invalid_or_stale_snapshots", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata", "--", "--exact"]
+      },
+      {
+        id: "dm::tests::relay_membership_notification_verifier_is_strict_and_target_bound",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-core", "dm::tests::relay_membership_notification_verifier_is_strict_and_target_bound", "--", "--exact"]
+      },
+      {
+        id: "dm::tests::relay_channel_metadata_rejects_signed_nonempty_content",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-core", "dm::tests::relay_channel_metadata_rejects_signed_nonempty_content", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::current_membership_state_is_tri_state_and_stale_notification_safe",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::current_membership_state_is_tri_state_and_stale_notification_safe", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::merge_discovered_channels_accepts_only_fully_verified_dm_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::merge_discovered_channels_accepts_only_fully_verified_dm_metadata", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor", "--", "--exact"]
+      },
+      {
+        id: "setup_mode::tests::setup_membership_notifications_requery_current_signed_39002",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "setup_mode::tests::setup_membership_notifications_requery_current_signed_39002", "--", "--exact"]
+      },
+      {
+        id: "pool::tests::lazy_metadata_lookup_ignores_newer_wrong_signer_sibling",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "pool::tests::lazy_metadata_lookup_ignores_newer_wrong_signer_sibling", "--", "--exact"]
+      },
+      {
+        id: "pool::tests::lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "pool::tests::lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid", "--", "--exact"]
+      },
+      {
+        id: "handlers::side_effects::tests::channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::side_effects::tests::channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata", "--", "--exact"]
+      },
+      {
+        id: "handlers::side_effects::tests::channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-relay", "handlers::side_effects::tests::channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata", "--", "--ignored", "--exact", "--test-threads=1"]
+      },
+      {
+        id: "tests::reconcile_channels_repairs_missing_members_snapshot_with_valid_metadata",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-admin", "tests::reconcile_channels_repairs_missing_members_snapshot_with_valid_metadata", "--", "--ignored", "--exact", "--test-threads=1"]
+      },
+      {
+        id: "dm::tests::create_dm_rejects_duplicate_participants_before_opening_transaction",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-db", "dm::tests::create_dm_rejects_duplicate_participants_before_opening_transaction", "--", "--exact"]
+      },
+      {
+        id: "migration::tests::immutable_dm_migration_contract_is_embedded",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-db", "migration::tests::immutable_dm_migration_contract_is_embedded", "--", "--exact"]
+      },
+      {
+        id: "setup_mode::tests::setup_membership_stale_add_cannot_override_current_removal_snapshot",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "setup_mode::tests::setup_membership_stale_add_cannot_override_current_removal_snapshot", "--", "--exact"]
+      },
+      {
+        id: "setup_mode::tests::setup_membership_stale_remove_cannot_override_current_member_snapshot",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "setup_mode::tests::setup_membership_stale_remove_cannot_override_current_member_snapshot", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::verified_member_requires_ensure_subscribe_despite_stale_outer_tracking",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::verified_member_requires_ensure_subscribe_despite_stale_outer_tracking", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking", "--", "--exact"]
+      },
+      {
+        id: "relay::tests::exhausted_remove_fails_closed_but_add_waits_for_distinct_repair",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "relay::tests::exhausted_remove_fails_closed_but_add_waits_for_distinct_repair", "--", "--exact"]
+      },
+      {
+        id: "membership_removal_cleanup_tests::authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "membership_removal_cleanup_tests::authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path", "--", "--exact"]
+      },
+      {
+        id: "setup_mode::tests::setup_exhausted_remove_fails_closed_through_unsubscribe_path",
+        argv: ["cargo", "test", "--locked", "-p", "buzz-acp", "setup_mode::tests::setup_exhausted_remove_fails_closed_through_unsubscribe_path", "--", "--exact"]
       }
     ]
   }
@@ -1008,7 +1176,7 @@ jq -e \
   and .trusted_validation.release_contract_fixtures == "passed"
   and .trusted_validation.release_contract_fixtures_log_sha256 == $release_fixtures_sha256
 ' "$source_test_result" >/dev/null \
-  || fail "source-test result is not the exact trusted v2 control-plane proof"
+  || fail "source-test result is not the exact trusted v6 control-plane proof"
 [[ "$(grep -Fxc 'personal relay Gate 1 receipt fixture tests passed' "$trusted_gate1_fixtures_log")" == 1 ]] \
   || fail "trusted Gate 1 fixture log does not record its exact successful status"
 [[ "$(grep -Fxc 'personal relay release contracts passed' "$trusted_release_fixtures_log")" == 1 ]] \

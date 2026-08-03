@@ -842,6 +842,7 @@ dependencies = [
  "buzz-pubsub",
  "buzz-search",
  "buzz-workflow",
+ "chrono",
  "clap",
  "deadpool-redis",
  "hex",
@@ -852,6 +853,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

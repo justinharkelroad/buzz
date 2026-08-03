@@ -69,6 +69,7 @@ export type ProfileSummaryViewProps = {
   displayName: string;
   followMutation: ReturnType<typeof useFollowMutation>;
   canInstantiateAgent: boolean;
+  canMessageAgent: boolean;
   agentInstruction: string | null;
   handleAgentPrimaryAction: () => void;
   handleAgentRestart: () => void;
@@ -79,6 +80,7 @@ export type ProfileSummaryViewProps = {
   isArchived: boolean;
   isMessagePending: boolean;
   isBot: boolean;
+  isAgentClassificationPending: boolean;
   isAgentActionPending: boolean;
   isFollowing: boolean;
   isOwner: boolean | undefined;
@@ -184,6 +186,7 @@ export function ProfileSummaryView({
   displayName,
   followMutation,
   canInstantiateAgent,
+  canMessageAgent,
   agentInstruction,
   handleAgentPrimaryAction,
   handleAgentRestart,
@@ -194,6 +197,7 @@ export function ProfileSummaryView({
   isArchived,
   isMessagePending,
   isBot,
+  isAgentClassificationPending,
   isAgentActionPending,
   isFollowing,
   isOwner,
@@ -380,7 +384,13 @@ export function ProfileSummaryView({
           }
           isFollowing={isFollowing}
           messagePending={isMessagePending}
-          onMessage={onOpenDm ? handleMessage : undefined}
+          onMessage={
+            onOpenDm &&
+            !isAgentClassificationPending &&
+            (!isBot || canMessageAgent)
+              ? handleMessage
+              : undefined
+          }
           pubkey={pubkey}
           unfollowMutation={unfollowMutation}
         />

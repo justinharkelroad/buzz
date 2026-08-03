@@ -12,6 +12,8 @@ import {
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
 import {
+  type AgentInvocationContext,
+  getExplicitlyDeniedAgentPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
@@ -160,28 +162,38 @@ export function useMentions(
       ),
     [relayAgentsQuery.data],
   );
-  const directoryAgentPubkeys = React.useMemo(
-    () =>
-      new Set(
-        (relayAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ),
-    [relayAgentsQuery.data],
-  );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
   );
+  const agentInvocationContext: AgentInvocationContext =
+    options?.channelType === "dm" ? "dm" : "regular-channel";
+  const explicitlyDeniedAgentPubkeys = React.useMemo(
+    () =>
+      getExplicitlyDeniedAgentPubkeys({
+        context: agentInvocationContext,
+        currentPubkey,
+        relayAgents: relayAgentsQuery.data,
+        sharedChannelIds,
+      }),
+    [
+      agentInvocationContext,
+      currentPubkey,
+      relayAgentsQuery.data,
+      sharedChannelIds,
+    ],
+  );
   const mentionableAgentPubkeys = React.useMemo(
     () =>
       getMentionableAgentPubkeys({
+        context: agentInvocationContext,
         currentPubkey,
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
       }),
     [
+      agentInvocationContext,
       currentPubkey,
       managedAgentPubkeys,
       relayAgentsQuery.data,
@@ -256,7 +268,7 @@ export function useMentions(
         channelId,
         channelType: options?.channelType,
         currentPubkey,
-        directoryAgentPubkeys,
+        explicitlyDeniedAgentPubkeys,
         isArchivedDiscovery,
         managedAgentNamesByPubkey,
         managedAgentPersonaIds,
@@ -279,7 +291,7 @@ export function useMentions(
       userSearchResults,
       canSearchGlobalUsers,
       currentPubkey,
-      directoryAgentPubkeys,
+      explicitlyDeniedAgentPubkeys,
       isArchivedDiscovery,
       managedAgentNamesByPubkey,
       managedAgentPersonaIds,

@@ -36,10 +36,12 @@ export type PulseNoteActions = {
 };
 
 export function usePulseNoteActions({
+  canStartDm,
   currentPubkey,
   reactionQueryKey,
   reactions,
 }: {
+  canStartDm: (pubkey: string) => boolean;
   currentPubkey?: string;
   reactionQueryKey: ReturnType<typeof pulseQueryKeys.reactions>;
   reactions: Map<string, PulseReactionState>;
@@ -154,6 +156,10 @@ export function usePulseNoteActions({
 
   const startDm = React.useCallback(
     async (pubkey: string) => {
+      if (!canStartDm(pubkey)) {
+        toast.error("This author is not available for direct messages.");
+        return;
+      }
       try {
         const directMessage = await openDmMutation.mutateAsync({
           pubkeys: [pubkey],
@@ -168,7 +174,7 @@ export function usePulseNoteActions({
         );
       }
     },
-    [navigate, openDmMutation],
+    [canStartDm, navigate, openDmMutation],
   );
 
   return {

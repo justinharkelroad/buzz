@@ -105,6 +105,9 @@ type MockRelayAgentSeed = {
   capabilities?: string[];
   respondTo?: RawRelayAgent["respond_to"];
   respondToAllowlist?: string[];
+  invocationPolicyKnown?: boolean;
+  ownerPubkey?: string | null;
+  ownerPubkeyVerified?: boolean;
   channelNames?: string[];
   channelIds?: string[];
   status?: PresenceStatus;
@@ -775,6 +778,9 @@ type RawRelayAgent = {
   status: PresenceStatus;
   respond_to?: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist?: string[];
+  invocation_policy_known?: boolean;
+  owner_pubkey?: string | null;
+  owner_pubkey_verified?: boolean;
 };
 
 type RawManagedAgent = {
@@ -1051,7 +1057,8 @@ declare global {
     }>;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-      channelName: string;
+      channelId?: string;
+      channelName?: string;
       kind?: number;
     }) => boolean;
     __BUZZ_E2E_HAS_MOCK_OWNER_KIND_SUBSCRIPTION__?: (input: {
@@ -1059,7 +1066,8 @@ declare global {
       kind: number;
     }) => boolean;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-      channelName: string;
+      channelId?: string;
+      channelName?: string;
       content: string;
       parentEventId?: string | null;
       pubkey?: string;
@@ -1545,6 +1553,7 @@ function cloneRelayAgent(agent: RawRelayAgent): RawRelayAgent {
     channels: [...agent.channels],
     channel_ids: [...agent.channel_ids],
     capabilities: [...agent.capabilities],
+    respond_to_allowlist: [...(agent.respond_to_allowlist ?? [])],
   };
 }
 
@@ -2152,8 +2161,16 @@ function resetMockRelayAgents(config?: E2eConfig) {
       channel_ids: channels.map((channel) => channel.id),
       capabilities: seed.capabilities ?? ["messages", "channels", "mcp"],
       status: seed.status ?? "online",
-      respond_to: seed.respondTo ?? "owner-only",
+      respond_to:
+        (seed.invocationPolicyKnown ?? seed.respondTo !== undefined)
+          ? (seed.respondTo ?? "owner-only")
+          : undefined,
       respond_to_allowlist: seed.respondToAllowlist ?? [],
+      invocation_policy_known:
+        seed.invocationPolicyKnown ?? seed.respondTo !== undefined,
+      owner_pubkey: seed.ownerPubkey ?? null,
+      owner_pubkey_verified:
+        seed.ownerPubkeyVerified ?? seed.ownerPubkey != null,
     });
   }
 }
@@ -3064,6 +3081,8 @@ const defaultMockRelayAgents: RawRelayAgent[] = [
     status: "online",
     respond_to: "anyone",
     respond_to_allowlist: [],
+    invocation_policy_known: true,
+    owner_pubkey: null,
   },
   {
     pubkey: CHARLIE_PUBKEY,
@@ -3075,6 +3094,8 @@ const defaultMockRelayAgents: RawRelayAgent[] = [
     status: "away",
     respond_to: "anyone",
     respond_to_allowlist: [],
+    invocation_policy_known: true,
+    owner_pubkey: null,
   },
 ];
 let mockRelayAgents: RawRelayAgent[] = defaultMockRelayAgents.map((agent) => ({
@@ -3399,6 +3420,9 @@ function syncMockRelayAgentsFromManagedAgents() {
             : "offline",
         respond_to: agent.respond_to,
         respond_to_allowlist: [...agent.respond_to_allowlist],
+        invocation_policy_known: true,
+        owner_pubkey: MOCK_IDENTITY_PUBKEY,
+        owner_pubkey_verified: true,
       };
     },
   );
@@ -9650,6 +9674,7 @@ export function maybeInstallE2eTauriMocks() {
     await emitMockHuddleState();
   };
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
+    channelId,
     channelName,
     content,
     parentEventId,
@@ -9661,11 +9686,11 @@ export function maybeInstallE2eTauriMocks() {
     pending,
     id,
   }) => {
-    const channel = mockChannels.find(
-      (candidate) => candidate.name === channelName,
+    const channel = mockChannels.find((candidate) =>
+      channelId ? candidate.id === channelId : candidate.name === channelName,
     );
     if (!channel) {
-      throw new Error(`Mock channel ${channelName} not found.`);
+      throw new Error(`Mock channel ${channelId ?? channelName} not found.`);
     }
 
     return emitMockChannelMessage(
@@ -9702,12 +9727,16 @@ export function maybeInstallE2eTauriMocks() {
       createdAt,
     );
   };
-  window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({ channelName, kind }) => {
-    const channel = mockChannels.find(
-      (candidate) => candidate.name === channelName,
+  window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({
+    channelId,
+    channelName,
+    kind,
+  }) => {
+    const channel = mockChannels.find((candidate) =>
+      channelId ? candidate.id === channelId : candidate.name === channelName,
     );
     if (!channel) {
-      throw new Error(`Mock channel ${channelName} not found.`);
+      throw new Error(`Mock channel ${channelId ?? channelName} not found.`);
     }
 
     return hasMockLiveSubscription(channel.id, kind);

@@ -27,7 +27,8 @@ const DM_RELAY_AGENT_PUBKEY =
 
 type MockFeedWindow = Window & {
   __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-    channelName: string;
+    channelId?: string;
+    channelName?: string;
     content: string;
     createdAt?: number;
     id?: string;
@@ -204,28 +205,31 @@ async function expectMembersTriggerCount(
 
 async function waitForMockLiveSubscription(
   page: import("@playwright/test").Page,
-  channelName: string,
+  channelName: string | undefined,
   kind?: number,
+  channelId?: string,
 ) {
   await expect
     .poll(async () => {
       return page.evaluate(
-        ({ currentChannelName, kind }) => {
+        ({ currentChannelId, currentChannelName, kind }) => {
           return (
             (
               window as Window & {
                 __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                  channelName: string;
+                  channelId?: string;
+                  channelName?: string;
                   kind?: number;
                 }) => boolean;
               }
             ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+              channelId: currentChannelId,
               channelName: currentChannelName,
               kind,
             }) ?? false
           );
         },
-        { currentChannelName: channelName, kind },
+        { currentChannelId: channelId, currentChannelName: channelName, kind },
       );
     })
     .toBe(true);
@@ -593,6 +597,146 @@ test("start a new direct message from the sidebar", async ({ page }) => {
   await expect(page.getByTestId("dm-list")).toContainText("charlie");
   await expect(page.getByTestId("chat-title")).toHaveText("charlie");
   await expect(page.getByTestId("section-actions-dms")).not.toBeFocused();
+});
+
+test("delegated-agent DM UI sends two Mary turns around an injected mock response", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        name: "quinn",
+        respondTo: "allowlist",
+        respondToAllowlist: [MOCK_IDENTITY_PUBKEY],
+      },
+    ],
+    searchProfiles: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        displayName: "quinn",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+  });
+  await page.goto("/");
+  await openNewMessagePage(page);
+
+  const search = page.getByTestId("new-dm-search");
+  await search.fill("quinn");
+  const result = page.getByTestId(`new-dm-result-${DM_RELAY_AGENT_PUBKEY}`);
+  await expect(result).toBeVisible();
+  await expect(result).toContainText("agent");
+  await result.click();
+
+  const firstMessage = "Mary delegated DM turn one";
+  await page.getByTestId("message-input").fill(firstMessage);
+  await page.getByTestId("send-message").click();
+
+  await expect(page.getByTestId("chat-title")).toHaveText("quinn");
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    firstMessage,
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ content, agentPubkey }) => {
+          const event = (
+            window as Window & {
+              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
+                content: string;
+                kind: number;
+                tags: string[][];
+              }>;
+            }
+          ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
+            (candidate) => candidate.content === content,
+          );
+          return {
+            kind: event?.kind ?? null,
+            pTags: event?.tags.filter((tag) => tag[0] === "p") ?? [],
+            targetsAgent:
+              event?.tags
+                .filter((tag) => tag[0] === "p")
+                .some((tag) => tag[1] === agentPubkey) ?? false,
+          };
+        },
+        { content: firstMessage, agentPubkey: DM_RELAY_AGENT_PUBKEY },
+      ),
+    )
+    .toEqual({
+      kind: 9,
+      pTags: [["p", DM_RELAY_AGENT_PUBKEY]],
+      targetsAgent: true,
+    });
+
+  // This is a transport/UI fixture, not an ACP-generated response. The real
+  // two-turn ACP proof remains the staging acceptance gate.
+  const dmChannelId = await page.evaluate((content) => {
+    const event = window.__BUZZ_E2E_SIGNED_EVENTS__?.find(
+      (candidate) => candidate.content === content,
+    );
+    return event?.tags.find((tag) => tag[0] === "h")?.[1] ?? null;
+  }, firstMessage);
+  expect(dmChannelId).not.toBeNull();
+  if (!dmChannelId) throw new Error("Delegated DM send is missing its h tag");
+  await waitForMockLiveSubscription(page, undefined, undefined, dmChannelId);
+  await page.evaluate(
+    ({ agentPubkey, channelId, viewerPubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelId,
+        content: "Injected delegated response one",
+        mentionPubkeys: [viewerPubkey],
+        pubkey: agentPubkey,
+      });
+    },
+    {
+      agentPubkey: DM_RELAY_AGENT_PUBKEY,
+      channelId: dmChannelId,
+      viewerPubkey: MOCK_IDENTITY_PUBKEY,
+    },
+  );
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "Injected delegated response one",
+  );
+
+  const followup = "Mary delegated DM turn two";
+  await page.getByTestId("message-input").fill(followup);
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-timeline")).toContainText(followup);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ content, agentPubkey }) => {
+          const event = (
+            window as Window & {
+              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
+                content: string;
+                kind: number;
+                tags: string[][];
+              }>;
+            }
+          ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
+            (candidate) => candidate.content === content,
+          );
+          return {
+            kind: event?.kind ?? null,
+            pTags: event?.tags.filter((tag) => tag[0] === "p") ?? [],
+            targetsAgent:
+              event?.tags
+                .filter((tag) => tag[0] === "p")
+                .some((tag) => tag[1] === agentPubkey) ?? false,
+          };
+        },
+        { content: followup, agentPubkey: DM_RELAY_AGENT_PUBKEY },
+      ),
+    )
+    .toEqual({
+      kind: 9,
+      pTags: [["p", DM_RELAY_AGENT_PUBKEY]],
+      targetsAgent: true,
+    });
 });
 
 test("keeps typing focus while arrow keys traverse and select DM recipients", async ({

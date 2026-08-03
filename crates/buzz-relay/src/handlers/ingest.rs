@@ -1831,9 +1831,7 @@ async fn ingest_event_inner(
         )));
     }
 
-    if buzz_core::kind::is_relay_only_kind(kind_u32) {
-        return Err(IngestError::Rejected("restricted: relay-only kind".into()));
-    }
+    reject_relay_only_client_kind(kind_u32)?;
 
     // Share the event with the verify task via Arc instead of deep-cloning it
     // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
@@ -2903,6 +2901,13 @@ async fn ingest_event_inner(
     })
 }
 
+fn reject_relay_only_client_kind(kind: u32) -> Result<(), IngestError> {
+    if buzz_core::kind::is_relay_only_kind(kind) {
+        return Err(IngestError::Rejected("restricted: relay-only kind".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -2915,6 +2920,27 @@ mod tests {
         KIND_STREAM_MESSAGE_DIFF, KIND_TEAM, KIND_USER_STATUS,
     };
     use nostr::{EventBuilder, Kind};
+
+    #[test]
+    fn relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest() {
+        for kind in [
+            buzz_core::kind::KIND_MEMBER_ADDED_NOTIFICATION,
+            buzz_core::kind::KIND_MEMBER_REMOVED_NOTIFICATION,
+            buzz_core::kind::KIND_NIP29_GROUP_METADATA,
+            buzz_core::kind::KIND_NIP29_GROUP_ADMINS,
+            buzz_core::kind::KIND_NIP29_GROUP_MEMBERS,
+        ] {
+            assert!(matches!(
+                reject_relay_only_client_kind(kind),
+                Err(IngestError::Rejected(message))
+                    if message == "restricted: relay-only kind"
+            ));
+        }
+        assert!(
+            reject_relay_only_client_kind(buzz_core::kind::KIND_NIP29_GROUP_ROLES).is_ok(),
+            "kind:39003 is not relay-owned until Buzz defines an emission contract"
+        );
+    }
 
     /// A banned relay admin must be refused with the same wire prefix and
     /// transport status as every other durable-restriction refusal:

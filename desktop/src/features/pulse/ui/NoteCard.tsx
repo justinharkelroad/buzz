@@ -43,6 +43,7 @@ type NoteCardProps = {
   isUpvotePending?: boolean;
   isUpvoted?: boolean;
   members?: ChannelMember[];
+  canStartDm?: boolean;
   isAgent?: boolean;
   isOwnNote: boolean;
   actions?: NoteCardActions;
@@ -141,6 +142,7 @@ export function NoteCard({
   isUpvotePending = false,
   isUpvoted = false,
   members = [],
+  canStartDm = false,
   actions,
 }: NoteCardProps) {
   const displayName = profile?.displayName ?? truncatePubkey(note.pubkey);
@@ -270,7 +272,7 @@ export function NoteCard({
               </TooltipTrigger>
               <TooltipContent>Share</TooltipContent>
             </Tooltip>
-            {!isOwnNote ? (
+            {!isOwnNote && canStartDm ? (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button

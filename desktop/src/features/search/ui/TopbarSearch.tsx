@@ -407,8 +407,10 @@ export function TopbarSearch({
   const { cancelDeferredModalOpen, openAfterExit, openNextFrame } =
     useDeferredModalOpen();
   const {
+    canOpenUser,
     channelLookup,
     debouncedQuery,
+    isAgentPolicyPending,
     isWaitingOnFromResolution,
     query,
     resultProfiles,
@@ -416,7 +418,13 @@ export function TopbarSearch({
     searchQuery,
     setQuery,
     userSearchQuery,
-  } = useSearchResults({ channelLabels, channels, enabled: isOpen, limit: 8 });
+  } = useSearchResults({
+    channelLabels,
+    channels,
+    currentPubkey,
+    enabled: isOpen,
+    limit: 8,
+  });
   const trimmedQuery = query.trim();
   const isIconVariant = variant === "icon";
   const currentPubkeyNormalized = currentPubkey
@@ -489,6 +497,7 @@ export function TopbarSearch({
     ? suggestionResults
     : groupedSearchResults;
   const isSearchLoading =
+    isAgentPolicyPending ||
     isWaitingOnFromResolution ||
     searchQuery.isLoading ||
     userSearchQuery.isLoading;
@@ -523,6 +532,7 @@ export function TopbarSearch({
       }
 
       if (result.kind === "user") {
+        if (!canOpenUser(result.user)) return;
         void onOpenUser?.(result.user);
         return;
       }
@@ -549,6 +559,7 @@ export function TopbarSearch({
     },
     [
       onBrowseChannels,
+      canOpenUser,
       onCreateAgent,
       onCreateChannel,
       onOpenChannel,

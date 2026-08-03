@@ -19,6 +19,40 @@ hex40() {
   printf '%040d' "$1"
 }
 
+participant_commitment() {
+  python3 - "$@" <<'PY'
+import hashlib
+import re
+import sys
+
+participants = sorted(sys.argv[1:])
+if len(participants) < 2 or len(participants) > 9 or len(set(participants)) != len(participants):
+    raise SystemExit("participant commitment requires 2-9 unique pubkeys")
+if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in participants):
+    raise SystemExit("participant commitment pubkeys must be 64 lowercase hex")
+material = bytearray(b"buzz:dm-participants:v1\0")
+material.append(len(participants))
+for participant in participants:
+    material.extend(bytes.fromhex(participant))
+print(hashlib.sha256(material).hexdigest())
+PY
+}
+
+db_participant_hash() {
+  python3 - "$@" <<'PY'
+import hashlib
+import re
+import sys
+
+participants = sorted(sys.argv[1:])
+if len(participants) < 2 or len(participants) > 9 or len(set(participants)) != len(participants):
+    raise SystemExit("DB participant hash requires 2-9 unique pubkeys")
+if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in participants):
+    raise SystemExit("DB participant hash pubkeys must be 64 lowercase hex")
+print(hashlib.sha256(b"".join(bytes.fromhex(value) for value in participants)).hexdigest())
+PY
+}
+
 sha256_line() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum | awk '{print $1}'
@@ -49,7 +83,7 @@ sealed_validator=$(awk '
   sealed { print }
 ' "$validator")
 [[ -n "$sealed_validator" ]] || fail "validator omits sealed-manifest read boundary"
-if printf '%s\n' "$sealed_validator" | grep -Fq '"$input"'; then
+if grep -Fq '"$input"' <<<"$sealed_validator"; then
   fail "validator reopens caller-controlled input after sealing the manifest"
 fi
 for sealed_read in \
@@ -59,7 +93,7 @@ for sealed_read in \
   'jq -ceS . "$manifest_snapshot"' \
   'jq -r .completed_at "$manifest_snapshot"' \
   'jq -r .expires_at "$manifest_snapshot"'; do
-  printf '%s\n' "$sealed_validator" | grep -Fq "$sealed_read" \
+  grep -Fq "$sealed_read" <<<"$sealed_validator" \
     || fail "post-safety manifest read does not use the sealed snapshot: $sealed_read"
 done
 
@@ -83,6 +117,7 @@ common_stream_channel_sha256=$(hex64 304)
 hosted_buzz_unchanged_evidence_sha256=$(hex64 305)
 justin_pubkey=$(hex64 1)
 mary_pubkey=$(hex64 2)
+unauthorized_third_party_pubkey=$(hex64 6)
 
 evidence_bundle="$fixture_root/evidence-bundle.bin"
 printf '%s\n' "opaque synthetic fixture evidence; validator must not interpret this content" > "$evidence_bundle"
@@ -112,6 +147,51 @@ agent_inventory_canonical=$(jq -cnS --arg justin "$justin_pubkey" '
 ')
 agent_inventory_sha256=$(printf '%s\n' "$agent_inventory_canonical" | sha256_line)
 
+dm_security_canonical=$(python3 - "$mary_pubkey" <<'PY'
+import hashlib
+import json
+import sys
+
+mary = sys.argv[1]
+records = []
+for index in range(8):
+    agent = f"{10 + index:064d}"
+    participants = sorted([mary, agent])
+    material = bytearray(b"buzz:dm-participants:v1\0")
+    material.append(len(participants))
+    for participant in participants:
+        material.extend(bytes.fromhex(participant))
+    participant_hash = hashlib.sha256(
+        b"".join(bytes.fromhex(participant) for participant in participants)
+    ).hexdigest()
+    d_tag = f"00000000-0000-4000-8000-{3300 + index:012d}"
+    records.append({
+        "d_tag": d_tag,
+        "d_tag_sha256": hashlib.sha256(d_tag.encode("ascii")).hexdigest(),
+        "participant_set_commitment_sha256": hashlib.sha256(material).hexdigest(),
+        "participant_hash_hex": participant_hash,
+    })
+print(json.dumps(records, separators=(",", ":")))
+PY
+)
+
+dm_negative_security_canonical=$(python3 <<'PY'
+import hashlib
+import json
+
+records = []
+for index in range(8):
+    for offset, probe_type in ((3400, "group_dm"), (3500, "unauthorized_third_party_dm")):
+        channel_id = f"00000000-0000-4000-8000-{offset + index:012d}"
+        records.append({
+            "probe_type": probe_type,
+            "channel_id": channel_id,
+            "dm_channel_sha256": hashlib.sha256(channel_id.encode("ascii")).hexdigest(),
+        })
+print(json.dumps(records, separators=(",", ":")))
+PY
+)
+
 valid="$fixture_root/valid.json"
 jq -n \
   --arg evidence_bundle_sha256 "$evidence_bundle_sha256" \
@@ -125,9 +205,12 @@ jq -n \
   --arg hosted_buzz_unchanged_evidence_sha256 "$hosted_buzz_unchanged_evidence_sha256" \
   --arg justin_pubkey "$justin_pubkey" \
   --arg mary_pubkey "$mary_pubkey" \
+  --arg unauthorized_third_party_pubkey "$unauthorized_third_party_pubkey" \
   --arg agent_set_sha256 "$agent_set_sha256" \
   --arg agent_inventory_sha256 "$agent_inventory_sha256" \
   --argjson agent_inventory "$agent_inventory_canonical" \
+  --argjson dm_security "$dm_security_canonical" \
+  --argjson dm_negative_security "$dm_negative_security_canonical" \
   --argjson installed "$installed_epoch" \
   --argjson started "$started_epoch" \
   --argjson completed "$completed_epoch" \
@@ -135,7 +218,7 @@ jq -n \
   def h($n):
     ("0000000000000000000000000000000000000000000000000000000000000000" + ($n | tostring))[-64:];
   {
-    schema: "personal-desktop-multi-user-acceptance/v1",
+    schema: "personal-desktop-multi-user-acceptance/v2",
     evidence_bundle_sha256: $evidence_bundle_sha256,
     relay: {
       environment: "personal-staging",
@@ -152,6 +235,7 @@ jq -n \
       justin_pubkey: $justin_pubkey,
       mary_pubkey: $mary_pubkey,
       mary_authenticated_pubkey: $mary_pubkey,
+      unauthorized_third_party_pubkey: $unauthorized_third_party_pubkey,
       mary_authenticated_as_self: true,
       justin_credentials_used: false,
       credentials_shared: false
@@ -170,6 +254,7 @@ jq -n \
     agent_inventory: $agent_inventory,
     agents: [
       range(8) as $i
+      | $dm_security[$i] as $dm_security_record
       | {
           agent_pubkey: h(10 + $i),
           discovery: {
@@ -212,27 +297,174 @@ jq -n \
             response_parent_event_id: h(2000 + $i),
             response_p_tags: [$mary_pubkey]
           },
-          dm_denial: {
-            probe_event_id: h(2300 + $i),
-            probe_kind: 9,
-            probe_created_at: (($started + 30) | todateiso8601),
-            probe_author_pubkey: $mary_pubkey,
-            probe_p_tags: [h(10 + $i)],
-            conversation_context: "dm",
+          dm_conversation: {
+            recipient_discovered: true,
+            recipient_selected: true,
+            discovery_receipt_sha256: h(1500 + $i),
             channel_type: "dm",
-            dm_channel_sha256: h(3300 + $i),
-            author_gate_decision: "denied_dm_external",
-            decision_receipt_sha256: h(1500 + $i),
-            turn_started: false,
-            response_event_ids: [],
-            observed_from: (($started + 30) | todateiso8601),
-            observed_until: (($started + 150) | todateiso8601),
-            observation_seconds: 120
+            dm_channel_sha256: $dm_security_record.d_tag_sha256,
+            participant_pubkeys: ([$mary_pubkey, h(10 + $i)] | sort),
+            opened_by_pubkey: $mary_pubkey,
+            open_event_id: h(2300 + $i),
+            open_event_kind: 41010,
+            open_created_at: (($started + 20) | todateiso8601),
+            open_author_pubkey: $mary_pubkey,
+            open_p_tags: [h(10 + $i)],
+            channel_metadata: {
+              event_id: h(2600 + $i),
+              kind: 39000,
+              created_at: (($started + 21) | todateiso8601),
+              verified_at: (($started + 22) | todateiso8601),
+              author_pubkey: $relay_pubkey,
+              signature_verified: true,
+              current_for_d_tag: true,
+              d_tag: $dm_security_record.d_tag,
+              d_tag_sha256: $dm_security_record.d_tag_sha256,
+              d_tag_count: 1,
+              t_tag: "dm",
+              t_tag_count: 1,
+              visibility: "private",
+              private_marker_count: 1,
+              hidden: true,
+              hidden_marker_count: 1,
+              closed: true,
+              closed_marker_count: 1,
+              public_marker_count: 0,
+              open_marker_count: 0,
+              participant_p_tags: ([$mary_pubkey, h(10 + $i)] | sort),
+              participant_set_policy: "buzz:dm-participants",
+              participant_set_version: "v1",
+              participant_set_commitment_sha256:
+                $dm_security_record.participant_set_commitment_sha256,
+              participant_set_tag_count: 1,
+              metadata_receipt_sha256: h(1950 + $i)
+            },
+            membership_snapshot: {
+              event_id: h(2650 + $i),
+              kind: 39002,
+              created_at: (($started + 23) | todateiso8601),
+              verified_at: (($started + 24) | todateiso8601),
+              author_pubkey: $relay_pubkey,
+              signature_verified: true,
+              current_for_d_tag: true,
+              d_tag: $dm_security_record.d_tag,
+              d_tag_sha256: $dm_security_record.d_tag_sha256,
+              d_tag_count: 1,
+              participant_p_tags: ([$mary_pubkey, h(10 + $i)] | sort),
+              p_role_tags: ([
+                [$mary_pubkey, "member"],
+                [h(10 + $i), "member"]
+              ] | sort_by(.[0])),
+              membership_receipt_sha256: h(1600 + $i)
+            },
+            db_invariant: {
+              checked_at: (($started + 25) | todateiso8601),
+              channel_id: $dm_security_record.d_tag,
+              channel_type: "dm",
+              visibility: "private",
+              deleted: false,
+              immutable_participant_set: true,
+              current_membership_verified: true,
+              participant_pubkeys: ([$mary_pubkey, h(10 + $i)] | sort),
+              participant_hash_algorithm: "sha256-concat-sorted-xonly-pubkeys",
+              participant_hash_hex: $dm_security_record.participant_hash_hex,
+              recomputed_participant_hash_hex: $dm_security_record.participant_hash_hex,
+              metadata_participant_set_policy: "buzz:dm-participants",
+              metadata_participant_set_version: "v1",
+              recomputed_metadata_participant_set_commitment_sha256:
+                $dm_security_record.participant_set_commitment_sha256,
+              invariant_receipt_sha256: h(1970 + $i)
+            },
+            author_gate_decision: "allowed_explicit_allowlist",
+            decision_receipt_sha256: h(1700 + $i),
+            turns: [
+              {
+                ordinal: 1,
+                challenge_nonce_sha256: h(2400 + (2 * $i)),
+                challenge_event_id: h(2500 + (4 * $i)),
+                challenge_kind: 9,
+                challenge_created_at: (($started + 30) | todateiso8601),
+                challenge_author_pubkey: $mary_pubkey,
+                challenge_root_event_id: null,
+                challenge_parent_event_id: null,
+                challenge_p_tags: [h(10 + $i)],
+                response_event_id: h(2501 + (4 * $i)),
+                response_kind: 9,
+                response_created_at: (($started + 40) | todateiso8601),
+                response_author_pubkey: h(10 + $i),
+                response_root_event_id: h(2500 + (4 * $i)),
+                response_parent_event_id: h(2500 + (4 * $i)),
+                response_p_tags: [$mary_pubkey],
+                turn_started: true,
+                exchange_receipt_sha256: h(1800 + (2 * $i))
+              },
+              {
+                ordinal: 2,
+                challenge_nonce_sha256: h(2401 + (2 * $i)),
+                challenge_event_id: h(2502 + (4 * $i)),
+                challenge_kind: 9,
+                challenge_created_at: (($started + 50) | todateiso8601),
+                challenge_author_pubkey: $mary_pubkey,
+                challenge_root_event_id: h(2500 + (4 * $i)),
+                challenge_parent_event_id: h(2501 + (4 * $i)),
+                challenge_p_tags: [h(10 + $i)],
+                response_event_id: h(2503 + (4 * $i)),
+                response_kind: 9,
+                response_created_at: (($started + 60) | todateiso8601),
+                response_author_pubkey: h(10 + $i),
+                response_root_event_id: h(2500 + (4 * $i)),
+                response_parent_event_id: h(2502 + (4 * $i)),
+                response_p_tags: [$mary_pubkey],
+                turn_started: true,
+                exchange_receipt_sha256: h(1801 + (2 * $i))
+              }
+            ],
+            continuity_verified: true,
+            continuity_receipt_sha256: h(1900 + $i)
           },
           passed: true
         }
     ],
-    all_agents_passed: true
+    dm_negative_probes: [
+      range(8) as $i
+      | range(2) as $probe_index
+      | $dm_negative_security[(2 * $i) + $probe_index] as $security
+      | {
+          agent_pubkey: h(10 + $i),
+          probe_type: $security.probe_type,
+          channel_type: "dm",
+          channel_id: $security.channel_id,
+          dm_channel_sha256: $security.dm_channel_sha256,
+          participant_pubkeys: (if $probe_index == 0
+            then ([$mary_pubkey, h(10 + $i), $unauthorized_third_party_pubkey] | sort)
+            else ([h(10 + $i), $unauthorized_third_party_pubkey] | sort)
+            end),
+          challenge_nonce_sha256: h(2800 + (2 * $i) + $probe_index),
+          challenge_event_id: h(2700 + (2 * $i) + $probe_index),
+          challenge_kind: 9,
+          challenge_created_at: (($started + (if $probe_index == 0 then 90 else 220 end)) | todateiso8601),
+          challenge_author_pubkey: (if $probe_index == 0
+            then $mary_pubkey
+            else $unauthorized_third_party_pubkey
+            end),
+          challenge_p_tags: [h(10 + $i)],
+          probe_receipt_sha256: h(3600 + (2 * $i) + $probe_index),
+          participant_set_receipt_sha256: h(3700 + (2 * $i) + $probe_index),
+          author_gate_decision: (if $probe_index == 0
+            then "denied_group_dm"
+            else "denied_not_allowlisted"
+            end),
+          decision_receipt_sha256: h(3800 + (2 * $i) + $probe_index),
+          turn_started: false,
+          response_event_ids: [],
+          observed_from: (($started + (if $probe_index == 0 then 90 else 220 end)) | todateiso8601),
+          observed_until: (($started + (if $probe_index == 0 then 210 else 340 end)) | todateiso8601),
+          observation_seconds: 120,
+          no_turn_receipt_sha256: h(3900 + (2 * $i) + $probe_index)
+        }
+    ],
+    all_agents_passed: true,
+    all_dm_negative_probes_passed: true
   }
 ' > "$valid"
 
@@ -246,6 +478,7 @@ common_args=(
   --expected-final-audit-receipt-sha256 "$final_audit_receipt_sha256"
   --expected-justin-pubkey "$justin_pubkey"
   --expected-mary-pubkey "$mary_pubkey"
+  --expected-unauthorized-third-party-pubkey "$unauthorized_third_party_pubkey"
   --expected-common-stream-channel-sha256 "$common_stream_channel_sha256"
   --expected-hosted-buzz-unchanged-evidence-sha256 "$hosted_buzz_unchanged_evidence_sha256"
   --expected-agent-set-sha256 "$agent_set_sha256"
@@ -266,16 +499,35 @@ jq -e \
   and keys == [
     "acceptance_manifest_sha256", "agent_inventory_sha256", "agent_set_sha256",
     "common_stream_channel_sha256", "completed_at", "cutover_authorized",
-    "evidence_bundle_authenticated", "evidence_bundle_sha256", "expires_at",
-    "manifest_claimed_all_agents_passed", "manifest_contract_passed", "schema"
+    "dm_channel_metadata_count", "dm_conversation_count",
+    "dm_db_invariant_check_count", "dm_membership_snapshot_count",
+    "dm_negative_probe_count", "dm_turn_count",
+    "evidence_bundle_authenticated",
+    "evidence_bundle_sha256", "expires_at", "group_dm_denial_probe_count",
+    "manifest_claimed_all_agents_passed",
+    "manifest_claimed_all_dm_channels_current_and_safe",
+    "manifest_claimed_all_dm_conversations_passed",
+    "manifest_claimed_all_dm_negative_probes_passed", "manifest_contract_passed",
+    "schema", "unauthorized_third_party_dm_denial_probe_count"
   ]
-  and .schema == "personal-desktop-multi-user-acceptance-summary/v1"
+  and .schema == "personal-desktop-multi-user-acceptance-summary/v2"
   and .acceptance_manifest_sha256 == $acceptance_manifest_sha256
   and .evidence_bundle_sha256 == $evidence_bundle_sha256
   and .agent_set_sha256 == $agent_set_sha256
   and .agent_inventory_sha256 == $agent_inventory_sha256
   and .common_stream_channel_sha256 == $common_stream_channel_sha256
   and .manifest_claimed_all_agents_passed == true
+  and .manifest_claimed_all_dm_channels_current_and_safe == true
+  and .manifest_claimed_all_dm_conversations_passed == true
+  and .manifest_claimed_all_dm_negative_probes_passed == true
+  and .dm_channel_metadata_count == 8
+  and .dm_conversation_count == 8
+  and .dm_db_invariant_check_count == 8
+  and .dm_membership_snapshot_count == 8
+  and .dm_turn_count == 16
+  and .dm_negative_probe_count == 16
+  and .group_dm_denial_probe_count == 8
+  and .unauthorized_third_party_dm_denial_probe_count == 8
   and .manifest_contract_passed == true
   and .evidence_bundle_authenticated == false
   and .cutover_authorized == false
@@ -284,7 +536,88 @@ jq -e \
 jq -e '
   ([.agents[].live_exchange.challenge_created_at] | unique | length) == 1
   and ([.agents[].live_exchange.response_created_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.open_created_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.channel_metadata.created_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.membership_snapshot.created_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.db_invariant.checked_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.turns[0].challenge_created_at] | unique | length) == 1
+  and ([.agents[].dm_conversation.turns[1].response_created_at] | unique | length) == 1
 ' "$valid" >/dev/null || fail "positive fixture does not exercise same-second parallel events"
+jq -e '
+  ([
+    .agents[].live_exchange.challenge_event_id,
+    .agents[].live_exchange.response_event_id,
+    .agents[].dm_conversation.turns[].challenge_event_id,
+    .agents[].dm_conversation.turns[].response_event_id,
+    .dm_negative_probes[].challenge_event_id
+  ] as $interaction_event_ids
+    | ($interaction_event_ids | length) == 64
+    and ($interaction_event_ids | unique | length) == 64)
+  and ([
+    .agents[].dm_conversation.open_event_id,
+    .agents[].dm_conversation.channel_metadata.event_id,
+    .agents[].dm_conversation.membership_snapshot.event_id
+  ] as $channel_security_event_ids
+    | ($channel_security_event_ids | length) == 24
+    and ($channel_security_event_ids | unique | length) == 24)
+  and ([
+    .agents[].live_exchange.challenge_event_id,
+    .agents[].live_exchange.response_event_id,
+    .agents[].dm_conversation.open_event_id,
+    .agents[].dm_conversation.channel_metadata.event_id,
+    .agents[].dm_conversation.membership_snapshot.event_id,
+    .agents[].dm_conversation.turns[].challenge_event_id,
+    .agents[].dm_conversation.turns[].response_event_id,
+    .dm_negative_probes[].challenge_event_id
+  ] as $all_event_ids
+    | ($all_event_ids | length) == 88
+    and ($all_event_ids | unique | length) == 88)
+  and ([
+    .agents[].live_exchange.challenge_nonce_sha256,
+    .agents[].dm_conversation.turns[].challenge_nonce_sha256
+  ] as $positive_nonces
+    | ($positive_nonces | length) == 24
+    and ($positive_nonces | unique | length) == 24)
+  and ([.dm_negative_probes[].challenge_nonce_sha256] as $negative_nonces
+    | ($negative_nonces | length) == 16
+    and ($negative_nonces | unique | length) == 16)
+  and ([
+    .agents[].live_exchange.challenge_nonce_sha256,
+    .agents[].dm_conversation.turns[].challenge_nonce_sha256,
+    .dm_negative_probes[].challenge_nonce_sha256
+  ] as $all_nonces
+    | ($all_nonces | length) == 40
+    and ($all_nonces | unique | length) == 40)
+  and ([
+    .agents[].dm_conversation.dm_channel_sha256,
+    .dm_negative_probes[].dm_channel_sha256
+  ] as $dm_channels
+    | ($dm_channels | length) == 24
+    and ($dm_channels | unique | length) == 24)
+  and ([
+    (.agents[]
+      | .discovery.directory_receipt_sha256,
+        .discovery.selection_receipt_sha256,
+        .authorization.policy_receipt_sha256,
+        .channel.membership_receipt_sha256,
+        .runtime_application.application_receipt_sha256,
+        .dm_conversation.discovery_receipt_sha256,
+        .dm_conversation.membership_snapshot.membership_receipt_sha256,
+        .dm_conversation.decision_receipt_sha256,
+        .dm_conversation.continuity_receipt_sha256,
+        .dm_conversation.channel_metadata.metadata_receipt_sha256,
+        .dm_conversation.db_invariant.invariant_receipt_sha256,
+        .dm_conversation.turns[].exchange_receipt_sha256),
+    (.dm_negative_probes[]
+      | .probe_receipt_sha256,
+        .participant_set_receipt_sha256,
+        .decision_receipt_sha256,
+        .no_turn_receipt_sha256)
+  ] as $receipt_hashes
+    | ($receipt_hashes | length) == 168
+    and ($receipt_hashes | unique | length) == 168)
+' "$valid" >/dev/null \
+  || fail "fixture does not cover all 64 interaction event IDs, 24 channel-security event IDs, 40 nonces, 24 DM channels, and 168 receipt hashes"
 "$validator" --input "$valid" --evidence-bundle "$evidence_bundle" \
   "${common_args[@]}" >/dev/null \
   || fail "same-second parallel positive fixture was rejected"
@@ -358,44 +691,285 @@ mutate_and_reject duplicate-nonce \
   '.agents[1].live_exchange.challenge_nonce_sha256 = .agents[0].live_exchange.challenge_nonce_sha256'
 mutate_and_reject duplicate-event-id \
   '.agents[1].live_exchange.challenge_event_id = .agents[0].live_exchange.challenge_event_id'
-mutate_and_reject missing-dm-probe 'del(.agents[0].dm_denial.probe_event_id)'
-mutate_and_reject wrong-dm-probe-kind '.agents[0].dm_denial.probe_kind = 1059'
-mutate_and_reject wrong-dm-context '.agents[0].dm_denial.conversation_context = "stream"'
-mutate_and_reject wrong-dm-channel-type '.agents[0].dm_denial.channel_type = "stream"'
+mutate_and_reject duplicate-cross-surface-event-id \
+  '.agents[0].dm_conversation.open_event_id = .agents[0].live_exchange.response_event_id'
+mutate_and_reject duplicate-dm-response-event-id '
+  .agents[0].dm_conversation.turns[1].response_event_id =
+    .agents[1].dm_conversation.turns[0].response_event_id
+'
+mutate_and_reject duplicate-cross-surface-nonce '
+  .agents[0].dm_conversation.turns[0].challenge_nonce_sha256 =
+    .agents[0].live_exchange.challenge_nonce_sha256
+'
+mutate_and_reject missing-dm-recipient-discovery \
+  '.agents[0].dm_conversation.recipient_discovered = false'
+mutate_and_reject missing-dm-recipient-selection \
+  '.agents[0].dm_conversation.recipient_selected = false'
+mutate_and_reject wrong-dm-open-kind '.agents[0].dm_conversation.open_event_kind = 41011'
+mutate_and_reject open-dm-channel \
+  '.agents[0].dm_conversation.channel_metadata.visibility = "open"'
+mutate_and_reject stale-dm-metadata \
+  '.agents[0].dm_conversation.channel_metadata.current_for_d_tag = false'
+mutate_and_reject unmarked-dm-channel '
+  .agents[0].dm_conversation.channel_metadata.t_tag = ""
+  | .agents[0].dm_conversation.channel_metadata.t_tag_count = 0
+'
+mutate_and_reject wrong-dm-metadata-signer \
+  '.agents[0].dm_conversation.channel_metadata.author_pubkey = .identities.justin_pubkey'
+mutate_and_reject bad-dm-metadata-signature \
+  '.agents[0].dm_conversation.channel_metadata.signature_verified = false'
+mutate_and_reject wrong-dm-metadata-d-tag '
+  .agents[0].dm_conversation.channel_metadata.d_tag =
+    .agents[1].dm_conversation.channel_metadata.d_tag
+'
+mutate_and_reject public-dm-metadata \
+  '.agents[0].dm_conversation.channel_metadata.public_marker_count = 1'
+mutate_and_reject not-closed-dm-metadata \
+  '.agents[0].dm_conversation.channel_metadata.closed = false'
+mutate_and_reject bad-dm-participant-commitment \
+  '.agents[0].dm_conversation.channel_metadata.participant_set_commitment_sha256 = ("f" * 64)'
+mutate_and_reject db-immutable-dm-invariant-false \
+  '.agents[0].dm_conversation.db_invariant.immutable_participant_set = false'
+mutate_and_reject missing-dm-private-marker \
+  '.agents[0].dm_conversation.channel_metadata.private_marker_count = 0'
+mutate_and_reject not-hidden-dm-metadata \
+  '.agents[0].dm_conversation.channel_metadata.hidden = false'
+mutate_and_reject open-marker-on-dm-metadata \
+  '.agents[0].dm_conversation.channel_metadata.open_marker_count = 1'
+mutate_and_reject db-current-membership-false \
+  '.agents[0].dm_conversation.db_invariant.current_membership_verified = false'
+mutate_and_reject wrong-dm-metadata-participants '
+  .agents[0].dm_conversation.channel_metadata.participant_p_tags +=
+    [.identities.justin_pubkey]
+'
+mutate_and_reject dm-metadata-before-open '
+  (.agents[0].dm_conversation.open_created_at | fromdateiso8601) as $open
+  | .agents[0].dm_conversation.channel_metadata.created_at =
+      (($open - 1) | todateiso8601)
+'
+mutate_and_reject duplicate-dm-metadata-event-id '
+  .agents[1].dm_conversation.channel_metadata.event_id =
+    .agents[0].dm_conversation.channel_metadata.event_id
+'
+mutate_and_reject wrong-membership-snapshot-kind \
+  '.agents[0].dm_conversation.membership_snapshot.kind = 39001'
+mutate_and_reject wrong-membership-snapshot-signer \
+  '.agents[0].dm_conversation.membership_snapshot.author_pubkey = .identities.justin_pubkey'
+mutate_and_reject bad-membership-snapshot-signature \
+  '.agents[0].dm_conversation.membership_snapshot.signature_verified = false'
+mutate_and_reject stale-membership-snapshot \
+  '.agents[0].dm_conversation.membership_snapshot.current_for_d_tag = false'
+mutate_and_reject wrong-membership-snapshot-d-tag '
+  .agents[0].dm_conversation.membership_snapshot.d_tag =
+    .agents[1].dm_conversation.membership_snapshot.d_tag
+'
+mutate_and_reject wrong-membership-snapshot-participants '
+  .agents[0].dm_conversation.membership_snapshot.participant_p_tags +=
+    [.identities.unauthorized_third_party_pubkey]
+'
+mutate_and_reject wrong-membership-snapshot-roles '
+  .agents[0].dm_conversation.membership_snapshot.p_role_tags[1][1] = "bot"
+'
+mutate_and_reject duplicate-membership-snapshot-event-id '
+  .agents[1].dm_conversation.membership_snapshot.event_id =
+    .agents[0].dm_conversation.membership_snapshot.event_id
+'
+mutate_and_reject membership-snapshot-before-metadata-verification '
+  .agents[0].dm_conversation.channel_metadata.verified_at as $verified
+  | .agents[0].dm_conversation.membership_snapshot.created_at =
+      (($verified | fromdateiso8601) - 1 | todateiso8601)
+'
+mutate_and_reject copied-dm-security-receipt '
+  .agents[0].dm_conversation.db_invariant.invariant_receipt_sha256 =
+    .agents[0].dm_conversation.channel_metadata.metadata_receipt_sha256
+'
+mutate_and_reject copied-membership-snapshot-receipt '
+  .agents[0].dm_conversation.membership_snapshot.membership_receipt_sha256 =
+    .agents[0].dm_conversation.channel_metadata.metadata_receipt_sha256
+'
+mutate_and_reject tampered-stored-db-participant-hash \
+  '.agents[0].dm_conversation.db_invariant.participant_hash_hex = ("a" * 64)'
+mutate_and_reject tampered-recomputed-db-participant-hash \
+  '.agents[0].dm_conversation.db_invariant.recomputed_participant_hash_hex = ("b" * 64)'
+mutate_and_reject conflated-db-and-metadata-participant-hashes '
+  .agents[0].dm_conversation.db_invariant.participant_hash_hex =
+    .agents[0].dm_conversation.channel_metadata.participant_set_commitment_sha256
+  | .agents[0].dm_conversation.db_invariant.recomputed_participant_hash_hex =
+    .agents[0].dm_conversation.channel_metadata.participant_set_commitment_sha256
+'
+mutate_and_reject tampered-recomputed-metadata-participant-commitment \
+  '.agents[0].dm_conversation.db_invariant.recomputed_metadata_participant_set_commitment_sha256 = ("c" * 64)'
+mutate_and_reject wrong-dm-channel-hash \
+  '.agents[0].dm_conversation.dm_channel_sha256 = ("e" * 64)'
+mutate_and_reject wrong-dm-participant-policy-version '
+  .agents[0].dm_conversation.channel_metadata.participant_set_version = "v2"
+  | .agents[0].dm_conversation.db_invariant.metadata_participant_set_version = "v2"
+'
+mutate_and_reject wrong-dm-channel-type '.agents[0].dm_conversation.channel_type = "stream"'
 mutate_and_reject wrong-dm-channel '
-  .agents[0].dm_denial.dm_channel_sha256 = .common_stream_channel_sha256
+  .agents[0].dm_conversation.dm_channel_sha256 = .common_stream_channel_sha256
 '
 mutate_and_reject duplicate-dm-channel '
-  .agents[1].dm_denial.dm_channel_sha256 = .agents[0].dm_denial.dm_channel_sha256
+  .agents[1].dm_conversation.dm_channel_sha256 = .agents[0].dm_conversation.dm_channel_sha256
 '
-mutate_and_reject tampered-dm-probe-author \
-  '.agents[0].dm_denial.probe_author_pubkey = .identities.justin_pubkey'
-mutate_and_reject tampered-dm-probe-tag \
-  '.agents[0].dm_denial.probe_p_tags = [.identities.mary_pubkey]'
+mutate_and_reject tampered-dm-participants \
+  '.agents[0].dm_conversation.participant_pubkeys += [.identities.justin_pubkey]'
+mutate_and_reject tampered-dm-opened-by \
+  '.agents[0].dm_conversation.opened_by_pubkey = .identities.justin_pubkey'
+mutate_and_reject tampered-dm-open-author \
+  '.agents[0].dm_conversation.open_author_pubkey = .identities.justin_pubkey'
+mutate_and_reject tampered-dm-open-tag \
+  '.agents[0].dm_conversation.open_p_tags = [.identities.mary_pubkey]'
 mutate_and_reject tampered-dm-decision \
-  '.agents[0].dm_denial.author_gate_decision = "allowed"'
-mutate_and_reject dm-response '
-  (.agents[0].live_exchange.response_event_id) as $response
-  | .agents[0].dm_denial.response_event_ids = [$response]
+  '.agents[0].dm_conversation.author_gate_decision = "denied_dm_external"'
+mutate_and_reject missing-second-dm-turn '.agents[0].dm_conversation.turns |= .[0:1]'
+mutate_and_reject wrong-dm-turn-order '.agents[0].dm_conversation.turns |= reverse'
+mutate_and_reject dm-turn-not-started \
+  '.agents[0].dm_conversation.turns[0].turn_started = false'
+mutate_and_reject wrong-dm-challenge-kind \
+  '.agents[0].dm_conversation.turns[0].challenge_kind = 1059'
+mutate_and_reject wrong-dm-response-kind \
+  '.agents[0].dm_conversation.turns[0].response_kind = 1059'
+mutate_and_reject tampered-dm-challenge-author \
+  '.agents[0].dm_conversation.turns[0].challenge_author_pubkey = .identities.justin_pubkey'
+mutate_and_reject tampered-dm-challenge-tag \
+  '.agents[0].dm_conversation.turns[0].challenge_p_tags = [.identities.mary_pubkey]'
+mutate_and_reject tampered-dm-response-author \
+  '.agents[0].dm_conversation.turns[0].response_author_pubkey = .identities.mary_pubkey'
+mutate_and_reject tampered-dm-response-tag \
+  '.agents[0].dm_conversation.turns[0].response_p_tags = [.agents[0].agent_pubkey]'
+mutate_and_reject bad-dm-first-response-root \
+  '.agents[0].dm_conversation.turns[0].response_root_event_id = .agents[1].dm_conversation.turns[0].challenge_event_id'
+mutate_and_reject unexpected-dm-first-root \
+  '.agents[0].dm_conversation.turns[0].challenge_root_event_id = .agents[0].dm_conversation.open_event_id'
+mutate_and_reject bad-dm-followup-root \
+  '.agents[0].dm_conversation.turns[1].challenge_root_event_id = .agents[1].dm_conversation.turns[0].challenge_event_id'
+mutate_and_reject bad-dm-followup-parent \
+  '.agents[0].dm_conversation.turns[1].challenge_parent_event_id = .agents[1].dm_conversation.turns[0].response_event_id'
+mutate_and_reject bad-dm-followup-response-root \
+  '.agents[0].dm_conversation.turns[1].response_root_event_id = .agents[0].dm_conversation.turns[1].challenge_event_id'
+mutate_and_reject bad-dm-followup-response-parent \
+  '.agents[0].dm_conversation.turns[1].response_parent_event_id = .agents[0].dm_conversation.turns[0].response_event_id'
+mutate_and_reject continuity-not-verified \
+  '.agents[0].dm_conversation.continuity_verified = false'
+mutate_and_reject duplicate-dm-nonce '
+  .agents[0].dm_conversation.turns[1].challenge_nonce_sha256 =
+    .agents[0].dm_conversation.turns[0].challenge_nonce_sha256
 '
-mutate_and_reject dm-short-window '
-  (.agents[0].dm_denial.observed_from | fromdateiso8601) as $from
-  | .agents[0].dm_denial.observed_until = (($from + 60) | todateiso8601)
-  | .agents[0].dm_denial.observation_seconds = 60
+mutate_and_reject duplicate-dm-event-id '
+  .agents[0].dm_conversation.turns[1].challenge_event_id =
+    .agents[0].dm_conversation.turns[0].challenge_event_id
 '
-mutate_and_reject dm-observation-gap '
-  (.agents[0].dm_denial.probe_created_at | fromdateiso8601) as $probe
-  | .agents[0].dm_denial.observed_from = (($probe + 10) | todateiso8601)
-  | .agents[0].dm_denial.observed_until = (($probe + 130) | todateiso8601)
+mutate_and_reject copied-dm-receipt-hash '
+  .agents[0].dm_conversation.turns[1].exchange_receipt_sha256 =
+    .agents[0].dm_conversation.discovery_receipt_sha256
 '
-mutate_and_reject runtime-applied-after-dm-probe '
-  (.agents[0].dm_denial.probe_created_at | fromdateiso8601) as $probe
-  | .agents[0].runtime_application.applied_at = (($probe + 1) | todateiso8601)
+mutate_and_reject runtime-applied-after-dm-open '
+  (.agents[0].dm_conversation.open_created_at | fromdateiso8601) as $open
+  | .agents[0].runtime_application.applied_at = (($open + 1) | todateiso8601)
 '
 mutate_and_reject copied-receipt-hash '
   .agents[1].authorization.policy_receipt_sha256 =
     .agents[0].authorization.policy_receipt_sha256
 '
+mutate_and_reject unauthorized-third-party-identity-substitution \
+  '.identities.unauthorized_third_party_pubkey = .identities.justin_pubkey'
+mutate_and_reject negative-probe-aggregate-claim-false \
+  '.all_dm_negative_probes_passed = false'
+mutate_and_reject missing-negative-probe '.dm_negative_probes |= .[0:15]'
+mutate_and_reject wrong-negative-probe-order '.dm_negative_probes |= reverse'
+mutate_and_reject wrong-negative-probe-type \
+  '.dm_negative_probes[0].probe_type = "unauthorized_third_party_dm"'
+mutate_and_reject wrong-negative-probe-agent \
+  '.dm_negative_probes[0].agent_pubkey = .agents[1].agent_pubkey'
+mutate_and_reject wrong-negative-probe-channel-type \
+  '.dm_negative_probes[0].channel_type = "stream"'
+mutate_and_reject wrong-negative-probe-channel-id \
+  '.dm_negative_probes[0].channel_id = .dm_negative_probes[1].channel_id'
+mutate_and_reject wrong-negative-probe-channel-hash \
+  '.dm_negative_probes[0].dm_channel_sha256 = ("d" * 64)'
+mutate_and_reject duplicate-negative-probe-channel '
+  .dm_negative_probes[1].channel_id = .dm_negative_probes[0].channel_id
+  | .dm_negative_probes[1].dm_channel_sha256 = .dm_negative_probes[0].dm_channel_sha256
+'
+mutate_and_reject group-probe-missing-third-party '
+  .identities.unauthorized_third_party_pubkey as $third
+  | .dm_negative_probes[0].participant_pubkeys |= map(select(. != $third))
+'
+mutate_and_reject third-party-probe-includes-mary '
+  .dm_negative_probes[1].participant_pubkeys += [.identities.mary_pubkey]
+  | .dm_negative_probes[1].participant_pubkeys |= sort
+'
+mutate_and_reject duplicate-negative-probe-nonce '
+  .dm_negative_probes[0].challenge_nonce_sha256 =
+    .agents[0].live_exchange.challenge_nonce_sha256
+'
+mutate_and_reject duplicate-negative-probe-event-id '
+  .dm_negative_probes[0].challenge_event_id =
+    .agents[0].dm_conversation.turns[0].challenge_event_id
+'
+mutate_and_reject wrong-negative-probe-kind \
+  '.dm_negative_probes[0].challenge_kind = 1059'
+mutate_and_reject wrong-group-probe-author '
+  .dm_negative_probes[0].challenge_author_pubkey =
+    .identities.unauthorized_third_party_pubkey
+'
+mutate_and_reject wrong-third-party-probe-author '
+  .dm_negative_probes[1].challenge_author_pubkey = .identities.mary_pubkey
+'
+mutate_and_reject wrong-negative-probe-p-tag '
+  .dm_negative_probes[0].challenge_p_tags = [.identities.mary_pubkey]
+'
+mutate_and_reject copied-negative-probe-receipt '
+  .dm_negative_probes[1].probe_receipt_sha256 =
+    .dm_negative_probes[0].probe_receipt_sha256
+'
+mutate_and_reject copied-negative-participant-receipt '
+  .dm_negative_probes[0].participant_set_receipt_sha256 =
+    .agents[0].dm_conversation.discovery_receipt_sha256
+'
+mutate_and_reject wrong-group-probe-decision '
+  .dm_negative_probes[0].author_gate_decision = "allowed_explicit_allowlist"
+'
+mutate_and_reject wrong-third-party-probe-decision '
+  .dm_negative_probes[1].author_gate_decision = "denied_group_dm"
+'
+mutate_and_reject copied-negative-decision-receipt '
+  .dm_negative_probes[0].decision_receipt_sha256 =
+    .dm_negative_probes[1].decision_receipt_sha256
+'
+mutate_and_reject negative-probe-turn-started \
+  '.dm_negative_probes[0].turn_started = true'
+mutate_and_reject negative-probe-has-response '
+  .dm_negative_probes[0].response_event_ids =
+    [.agents[0].dm_conversation.turns[0].response_event_id]
+'
+mutate_and_reject negative-probe-observation-start-mismatch '
+  (.dm_negative_probes[0].observed_from | fromdateiso8601) as $from
+  | .dm_negative_probes[0].observed_from = (($from + 1) | todateiso8601)
+'
+mutate_and_reject negative-probe-wrong-observation-seconds \
+  '.dm_negative_probes[0].observation_seconds = 119'
+mutate_and_reject negative-probe-observation-window-mismatch '
+  (.dm_negative_probes[0].observed_until | fromdateiso8601) as $until
+  | .dm_negative_probes[0].observed_until = (($until + 1) | todateiso8601)
+'
+mutate_and_reject copied-negative-no-turn-receipt '
+  .dm_negative_probes[0].no_turn_receipt_sha256 =
+    .dm_negative_probes[0].decision_receipt_sha256
+'
+mutate_and_reject negative-probe-after-completion '
+  .completed_at as $completed
+  | .dm_negative_probes[0].observed_until =
+      (($completed | fromdateiso8601) + 1 | todateiso8601)
+  | .dm_negative_probes[0].observation_seconds = 120
+  | .dm_negative_probes[0].observed_from =
+      (($completed | fromdateiso8601) - 119 | todateiso8601)
+  | .dm_negative_probes[0].challenge_created_at =
+      (($completed | fromdateiso8601) - 119 | todateiso8601)
+'
+mutate_and_reject negative-probe-extra-key \
+  '.dm_negative_probes[0].unexpected = true'
 
 substituted_source="$fixture_root/substituted-source.json"
 jq --arg source "$(hex40 9)" '.relay.source_sha = $source' "$valid" > "$substituted_source"
@@ -412,11 +986,45 @@ expect_rejected substituted-hosted "$substituted_hosted"
 
 substituted_set_pre="$fixture_root/substituted-agent-set-pre.json"
 substituted_set="$fixture_root/substituted-agent-set.json"
-jq --arg replacement "$(hex64 18)" '
-  .agents[7].agent_pubkey = $replacement
+substituted_agent_pubkey=$(hex64 18)
+substituted_participant_commitment=$(participant_commitment "$mary_pubkey" "$substituted_agent_pubkey")
+substituted_participant_hash=$(db_participant_hash "$mary_pubkey" "$substituted_agent_pubkey")
+jq \
+  --arg replacement "$substituted_agent_pubkey" \
+  --arg participant_commitment "$substituted_participant_commitment" \
+  --arg participant_hash "$substituted_participant_hash" '
+  .identities.mary_pubkey as $mary
+  | .agents[7].agent_pubkey = $replacement
   | .agents[7].live_exchange.challenge_p_tags = [$replacement]
   | .agents[7].live_exchange.response_author_pubkey = $replacement
-  | .agents[7].dm_denial.probe_p_tags = [$replacement]
+  | .agents[7].dm_conversation.participant_pubkeys = ([$mary, $replacement] | sort)
+  | .agents[7].dm_conversation.open_p_tags = [$replacement]
+  | .agents[7].dm_conversation.channel_metadata.participant_p_tags =
+      ([$mary, $replacement] | sort)
+  | .agents[7].dm_conversation.channel_metadata.participant_set_commitment_sha256 =
+      $participant_commitment
+  | .agents[7].dm_conversation.membership_snapshot.participant_p_tags =
+      ([$mary, $replacement] | sort)
+  | .agents[7].dm_conversation.membership_snapshot.p_role_tags =
+      ([[$mary, "member"], [$replacement, "member"]] | sort_by(.[0]))
+  | .agents[7].dm_conversation.db_invariant.participant_pubkeys =
+      ([$mary, $replacement] | sort)
+  | .agents[7].dm_conversation.db_invariant.participant_hash_hex = $participant_hash
+  | .agents[7].dm_conversation.db_invariant.recomputed_participant_hash_hex = $participant_hash
+  | .agents[7].dm_conversation.db_invariant.recomputed_metadata_participant_set_commitment_sha256 =
+      $participant_commitment
+  | .agents[7].dm_conversation.turns |= map(
+      .challenge_p_tags = [$replacement]
+      | .response_author_pubkey = $replacement
+    )
+  | .dm_negative_probes[14].agent_pubkey = $replacement
+  | .dm_negative_probes[14].participant_pubkeys =
+      ([$mary, .identities.unauthorized_third_party_pubkey, $replacement] | sort)
+  | .dm_negative_probes[14].challenge_p_tags = [$replacement]
+  | .dm_negative_probes[15].agent_pubkey = $replacement
+  | .dm_negative_probes[15].participant_pubkeys =
+      ([.identities.unauthorized_third_party_pubkey, $replacement] | sort)
+  | .dm_negative_probes[15].challenge_p_tags = [$replacement]
   | .agent_inventory[7].agent_pubkey = $replacement
 ' "$valid" > "$substituted_set_pre"
 substituted_agent_set_sha256=$(jq -ce '[.agents[].agent_pubkey]' "$substituted_set_pre" | sha256_line)
@@ -500,14 +1108,39 @@ jq --arg expires "$(jq -nr --argjson time "$((now_epoch + 10))" '$time | todatei
       .runtime_application.applied_at |= shift
       | .live_exchange.challenge_created_at |= shift
       | .live_exchange.response_created_at |= shift
-      | .dm_denial.probe_created_at |= shift
-      | .dm_denial.observed_from |= shift
-      | .dm_denial.observed_until |= shift
+      | .dm_conversation.open_created_at |= shift
+      | .dm_conversation.channel_metadata.created_at |= shift
+      | .dm_conversation.channel_metadata.verified_at |= shift
+      | .dm_conversation.membership_snapshot.created_at |= shift
+      | .dm_conversation.membership_snapshot.verified_at |= shift
+      | .dm_conversation.db_invariant.checked_at |= shift
+      | .dm_conversation.turns |= map(
+          .challenge_created_at |= shift
+          | .response_created_at |= shift
+        )
+    )
+  | .dm_negative_probes |= map(
+      .challenge_created_at |= shift
+      | .observed_from |= shift
+      | .observed_until |= shift
     )
 ' "$valid" > "$old_fresh_near_now"
 expect_rejected old-fresh-near-now-expiry "$old_fresh_near_now"
 
 mutate_and_reject extra-key '.agents[0].provider_identifier = "forbidden-provider-id"'
+mutate_and_reject legacy-v1-dm-denial '
+  .schema = "personal-desktop-multi-user-acceptance/v1"
+  | .agents |= map(
+      .dm_denial = {
+        probe_event_id: .dm_conversation.open_event_id,
+        author_gate_decision: "denied_dm_external",
+        turn_started: false,
+        response_event_ids: []
+      }
+      | del(.dm_conversation)
+    )
+  | del(.dm_negative_probes, .all_dm_negative_probes_passed)
+'
 
 fresh_poison="$fixture_root/fresh-example-only-poison.json"
 jq '.example_only = true' "$valid" > "$fresh_poison"
@@ -516,7 +1149,7 @@ expect_rejected fresh-example-only-poison "$fresh_poison"
 duplicate_top="$fixture_root/duplicate-top-member.json"
 awk '
   !injected && /"schema":/ {
-    sub(/"schema":/, "\"schema\":\"personal-desktop-multi-user-acceptance/v1\",\"schema\":")
+    sub(/"schema":/, "\"schema\":\"personal-desktop-multi-user-acceptance/v2\",\"schema\":")
     injected = 1
   }
   { print }
@@ -570,6 +1203,7 @@ example_args=(
   --expected-final-audit-receipt-sha256 "$(hex64 303)"
   --expected-justin-pubkey "$(hex64 1)"
   --expected-mary-pubkey "$(hex64 2)"
+  --expected-unauthorized-third-party-pubkey "$(hex64 6)"
   --expected-common-stream-channel-sha256 "$(hex64 304)"
   --expected-hosted-buzz-unchanged-evidence-sha256 "$(hex64 305)"
   --expected-agent-set-sha256 "cfc47cdebdc6380f5d5e45485f503a40c4ce13fe5f1e486ae7e425dae534cec0"

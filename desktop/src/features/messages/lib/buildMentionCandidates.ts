@@ -28,7 +28,7 @@ type BuildMentionCandidatesInput = {
   channelId: string | null;
   channelType: ChannelType | null | undefined;
   currentPubkey: string | null;
-  directoryAgentPubkeys: ReadonlySet<string>;
+  explicitlyDeniedAgentPubkeys: ReadonlySet<string>;
   isArchivedDiscovery: (pubkey: string) => boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
   managedAgentPersonaIds: ReadonlySet<string>;
@@ -61,8 +61,9 @@ function formatSearchUserSecondaryLabel(user: UserSearchResult) {
 /**
  * Assemble mention identities while preserving the relay-policy boundary for
  * foreign agents. A verified active regular-channel member may pass the local
- * managed-agent filter, but the directory's explicit invocability result still
- * decides whether that member is shown. DMs never grant the membership bypass.
+ * managed-agent filter, but only an authenticated explicit policy denial hides
+ * that member. Sparse directory metadata is unknown. DMs never grant the
+ * membership bypass.
  */
 export function buildMentionCandidates({
   activePersonaById,
@@ -71,7 +72,7 @@ export function buildMentionCandidates({
   channelId,
   channelType,
   currentPubkey,
-  directoryAgentPubkeys,
+  explicitlyDeniedAgentPubkeys,
   isArchivedDiscovery,
   managedAgentNamesByPubkey,
   managedAgentPersonaIds,
@@ -114,7 +115,7 @@ export function buildMentionCandidates({
         isMember: candidate.isMember === true,
         pubkey,
         mentionableAgentPubkeys,
-        directoryAgentPubkeys,
+        explicitlyDeniedAgentPubkeys,
       })
     ) {
       return;
@@ -202,7 +203,7 @@ export function buildMentionCandidates({
       personaId:
         managedAgentPersonaIdsByPubkey.get(pubkey) ??
         (activePersonaById.has(pubkey) ? pubkey : undefined),
-      ownerPubkey: null,
+      ownerPubkey: agent.ownerPubkey,
       isAgent: true,
       isVerifiedAgent: false,
     });

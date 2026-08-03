@@ -78,6 +78,9 @@ type MockRelayAgentSeed = {
   capabilities?: string[];
   respondTo?: "owner-only" | "allowlist" | "anyone";
   respondToAllowlist?: string[];
+  invocationPolicyKnown?: boolean;
+  ownerPubkey?: string | null;
+  ownerPubkeyVerified?: boolean;
   channelNames?: string[];
   channelIds?: string[];
   status?: "online" | "away" | "offline";

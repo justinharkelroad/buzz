@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import {
   installMockBridge,
   openChannelBrowser,
+  openNewMessagePage,
   TEST_IDENTITIES,
 } from "../helpers/bridge";
 
@@ -30,6 +31,10 @@ const PROFILE_ONLY_AGENT_PUBKEY =
   "8f83d6b7f3d74f7d933ae3a54dd8c6cc85c7f98e531c16e5a827b953441a8d67";
 const EXPLICIT_POLICY_AGENT_PUBKEY =
   "7777777777777777777777777777777777777777777777777777777777777777";
+const SPARSE_POLICY_AGENT_PUBKEY =
+  "6666666666666666666666666666666666666666666666666666666666666666";
+const FOREIGN_ANYONE_AGENT_PUBKEY =
+  "5555555555555555555555555555555555555555555555555555555555555555";
 const OWNED_AGENT_PROFILE_PUBKEY =
   "1212121212121212121212121212121212121212121212121212121212121212";
 const SYSTEM_MESSAGE_KIND = 40099;
@@ -896,6 +901,66 @@ test("verified foreign members with explicit directory exclusions stay hidden in
   await expect(dropdown.getByText("nova", { exact: true })).toHaveCount(0);
 });
 
+test("verified foreign members with sparse directory policy remain discoverable in the active channel", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: SPARSE_POLICY_AGENT_PUBKEY,
+        displayName: "sora",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+    relayAgents: [
+      {
+        pubkey: SPARSE_POLICY_AGENT_PUBKEY,
+        name: "sora",
+        invocationPolicyKnown: false,
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        channelNames: ["general"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  const channelId = await page
+    .getByTestId("channel-general")
+    .getAttribute("data-channel-id");
+  if (!channelId) throw new Error("general channel is missing its id");
+  await page.evaluate(
+    async ({ activeChannelId, pubkey }) => {
+      const bridgeWindow = window as Window & {
+        __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+          command: string,
+          payload?: Record<string, unknown>,
+        ) => Promise<unknown>;
+        __BUZZ_E2E_QUERY_CLIENT__?: {
+          invalidateQueries: () => Promise<void>;
+        };
+      };
+      const invoke = bridgeWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+      if (!invoke) throw new Error("Mock bridge is not installed.");
+      await invoke("add_channel_members", {
+        channelId: activeChannelId,
+        pubkeys: [pubkey],
+        role: "bot",
+      });
+      await bridgeWindow.__BUZZ_E2E_QUERY_CLIENT__?.invalidateQueries();
+    },
+    { activeChannelId: channelId, pubkey: SPARSE_POLICY_AGENT_PUBKEY },
+  );
+
+  await page.getByTestId("message-input").fill("@sora");
+
+  const dropdown = autocomplete(page);
+  const soraRow = dropdown.locator("button", { hasText: "sora" });
+  await expect(soraRow).toBeVisible();
+  await expect(soraRow.getByTestId("mention-agent-icon")).toBeVisible();
+});
+
 test("foreign verified agents in an active forum can be selected and submitted as a forum mention", async ({
   page,
 }) => {
@@ -1007,6 +1072,53 @@ test("foreign verified member agents stay hidden in DMs", async ({ page }) => {
   await expect(dropdown.getByText("alina")).toBeVisible();
   await expect(dropdown.getByText("alice")).toHaveCount(0);
   await expect(input.locator(".mention-chip")).toHaveCount(0);
+});
+
+test("foreign anyone agents stay out of both New Message recipients and DM mentions", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        displayName: TEST_IDENTITIES.alice.username,
+      },
+      {
+        pubkey: FOREIGN_ANYONE_AGENT_PUBKEY,
+        displayName: "rhea",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+    relayAgents: [
+      {
+        pubkey: FOREIGN_ANYONE_AGENT_PUBKEY,
+        name: "rhea",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        respondTo: "anyone",
+        channelNames: ["general"],
+      },
+    ],
+  });
+  await page.goto("/");
+  await openNewMessagePage(page);
+
+  const recipientSearch = page.getByTestId("new-dm-search");
+  await recipientSearch.fill("rhea");
+  await expect(
+    page.getByTestId(`new-dm-result-${FOREIGN_ANYONE_AGENT_PUBKEY}`),
+  ).toHaveCount(0);
+
+  await recipientSearch.fill("alice");
+  await page
+    .getByTestId(`new-dm-result-${TEST_IDENTITIES.alice.pubkey}`)
+    .click();
+  const input = page.getByTestId("message-input");
+  await input.fill("@rhea");
+
+  await expect(
+    autocomplete(page).getByText("rhea", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("managed relay agents are visible in channel mentions regardless of relay policy", async ({
@@ -2355,4 +2467,54 @@ test("delayed inaccessible agent profile keeps all actions hidden", async ({
       `user-profile-popover-huddle-${DELAYED_RELAY_AGENT_PUBKEY}`,
     ),
   ).toHaveCount(0);
+});
+
+test("cold-open foreign owner-only agent panel never exposes Message while classification is pending", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    agentListDelayMs: 10_000,
+    usersBatchDelayMs: 10_000,
+    relayAgents: [
+      {
+        pubkey: DELAYED_RELAY_AGENT_PUBKEY,
+        name: "orbit",
+        respondTo: "owner-only",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        channelNames: ["general"],
+      },
+    ],
+    searchProfiles: [
+      {
+        pubkey: DELAYED_RELAY_AGENT_PUBKEY,
+        displayName: "orbit",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+  });
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+
+  await emitMockMessage(page, "general", "Orbit profile cold open.", {
+    pubkey: DELAYED_RELAY_AGENT_PUBKEY,
+  });
+  await waitForTimelineSettled(page);
+
+  const orbitMessage = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Orbit profile cold open." })
+    .first();
+  await orbitMessage.locator("button").first().click();
+
+  const panel = page.getByTestId("user-profile-panel");
+  await expect(panel).toBeVisible();
+  const baselineCommands = await readCommandLog(page);
+  await expect(panel.getByTestId("user-profile-message")).toHaveCount(0);
+  await expect
+    .poll(async () => commandCount(await readCommandLog(page), "open_dm"))
+    .toBe(commandCount(baselineCommands, "open_dm"));
 });

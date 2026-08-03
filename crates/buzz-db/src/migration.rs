@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -925,6 +925,51 @@ mod tests {
         assert!(webhook_idempotency.contains("webhook_idempotency_key"));
         assert!(webhook_idempotency.contains("webhook_payload_hash"));
         assert!(webhook_idempotency.contains("webhook_execution_lease_id"));
+
+        assert_eq!(migrations[27].version, 28);
+        let immutable_dms = migrations[27].sql.as_str();
+        assert!(immutable_dms.contains("immutable DM migration blocked"));
+        assert!(immutable_dms.contains("chk_channels_active_dm_shape"));
+        assert!(immutable_dms.contains("guard_immutable_dm_channel_shape"));
+        assert!(immutable_dms.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(immutable_dms.contains("assert_immutable_dm_participant_set"));
+    }
+
+    #[test]
+    fn immutable_dm_migration_contract_is_embedded() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 28)
+            .expect("migration 0028");
+        let sql = migration.sql.as_str();
+
+        for required in [
+            "LOCK TABLE channels IN SHARE ROW EXCLUSIVE MODE",
+            "members.member_count NOT BETWEEN 2 AND 9",
+            "NOT members.roles_valid",
+            "members.active_hash IS DISTINCT FROM c.participant_hash",
+            "DM channel visibility is immutable and must be private",
+            "channels.participant_hash is immutable after insert",
+            "channels cannot transition into or out of DM type",
+            "trg_channels_verify_immutable_dm_participants",
+            "trg_channel_members_verify_immutable_dm_participants",
+        ] {
+            assert!(sql.contains(required), "migration 0028 missing {required}");
+        }
+
+        let desired = include_str!("../../../schema/schema.sql");
+        for required in [
+            "chk_channels_active_dm_shape",
+            "guard_immutable_dm_channel_shape",
+            "assert_immutable_dm_participant_set",
+            "BOOL_AND(role = 'member')",
+            "trg_channel_members_verify_immutable_dm_participants",
+        ] {
+            assert!(
+                desired.contains(required),
+                "desired schema missing {required}"
+            );
+        }
     }
 
     #[test]
@@ -1167,7 +1212,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

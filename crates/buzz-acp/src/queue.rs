@@ -1000,6 +1000,12 @@ pub struct ContextMessage {
 pub struct PromptChannelInfo {
     pub name: String,
     pub channel_type: String,
+    /// Verified tri-state used by security decisions. Unknown must never be
+    /// interpreted as a regular channel.
+    pub classification: crate::relay::ChannelClassification,
+    /// Canonical two-party/group membership from relay-authored DM metadata.
+    /// `None` for regular channels or malformed/unavailable DM metadata.
+    pub participant_pubkeys: Option<Vec<String>>,
 }
 
 /// Minimal profile fields needed to label users in ACP prompts.
@@ -2981,6 +2987,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "engineering".into(),
             channel_type: "stream".into(),
+            classification: crate::relay::ChannelClassification::Regular,
+            participant_pubkeys: None,
         };
 
         let prompt = format_prompt(
@@ -3012,6 +3020,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
 
         let prompt = format_prompt(
@@ -3122,6 +3132,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
         let ctx = ConversationContext::Dm {
             messages: vec![ContextMessage {
@@ -3378,6 +3390,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
         // Thread context fetched (as the fetch path does for DM replies).
         let ctx = ConversationContext::Thread {
@@ -3435,6 +3449,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
 
         // No context fetched — hints only.
@@ -3930,6 +3946,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
 
         let prompt = format_prompt(
@@ -3993,6 +4011,8 @@ mod tests {
         let ci = PromptChannelInfo {
             name: "DM".into(),
             channel_type: "dm".into(),
+            classification: crate::relay::ChannelClassification::Dm,
+            participant_pubkeys: None,
         };
 
         let prompt = format_prompt(

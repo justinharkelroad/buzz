@@ -142,6 +142,7 @@ function useAgentCandidates() {
       managedAgentPubkeys: managedByPubkey.keys(),
       relayAgents,
       sharedChannelIds: getSharedChannelIds(channelsQuery.data),
+      context: "dm",
     });
 
     const candidates: AgentCandidate[] = managed.map((agent) => ({

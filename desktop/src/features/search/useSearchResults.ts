@@ -4,6 +4,7 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { isAgentClassificationUnavailable } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import {
   useUserSearchQuery,
@@ -19,6 +20,7 @@ import {
   parseSearchOperators,
   type OperatorResolveResult,
 } from "@/features/search/lib/parseSearchOperators";
+import { canOpenSearchUserDm } from "@/features/search/lib/searchAgentDmPolicy";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -95,11 +97,13 @@ function resolveAuthorFromOperator(
 export function useSearchResults({
   channelLabels,
   channels,
+  currentPubkey,
   enabled,
   limit = 12,
 }: {
   channelLabels?: Record<string, string>;
   channels: Channel[];
+  currentPubkey?: string;
   enabled: boolean;
   limit?: number;
 }) {
@@ -284,17 +288,45 @@ export function useSearchResults({
       ),
     [relayAgentsQuery.data],
   );
-  const eligibleAgentPubkeys = React.useMemo(() => {
-    const pubkeys = new Set(managedAgentPubkeys);
-
-    for (const agent of relayAgentsQuery.data ?? []) {
-      if (agent.respondTo === "anyone") {
-        pubkeys.add(normalizePubkey(agent.pubkey));
-      }
-    }
-
-    return pubkeys;
-  }, [managedAgentPubkeys, relayAgentsQuery.data]);
+  const relayAgentsByPubkey = React.useMemo(
+    () =>
+      new Map(
+        (relayAgentsQuery.data ?? []).map((agent) => [
+          normalizePubkey(agent.pubkey),
+          agent,
+        ]),
+      ),
+    [relayAgentsQuery.data],
+  );
+  const isAgentPolicyPending = isAgentClassificationUnavailable(
+    managedAgentsQuery.data,
+    relayAgentsQuery.data,
+  );
+  const canOpenUser = React.useCallback(
+    (candidate: UserSearchResult) => {
+      const pubkey = normalizePubkey(candidate.pubkey);
+      const isKnownAgent =
+        candidate.isAgent ||
+        managedAgentPubkeys.has(pubkey) ||
+        relayAgentPubkeys.has(pubkey);
+      return canOpenSearchUserDm({
+        candidateOwnerPubkey: candidate.ownerPubkey,
+        candidatePubkey: pubkey,
+        currentPubkey,
+        isKnownAgent,
+        isManagedAgent: managedAgentPubkeys.has(pubkey),
+        isPolicyPending: isAgentPolicyPending,
+        relayAgent: relayAgentsByPubkey.get(pubkey),
+      });
+    },
+    [
+      currentPubkey,
+      isAgentPolicyPending,
+      managedAgentPubkeys,
+      relayAgentPubkeys,
+      relayAgentsByPubkey,
+    ],
+  );
   const userResults = React.useMemo<UserSearchResult[]>(() => {
     if (ftsQuery.length < MIN_SEARCH_QUERY_LENGTH) {
       return [];
@@ -323,7 +355,13 @@ export function useSearchResults({
         managedAgentPubkeys.has(pubkey) ||
         relayAgentPubkeys.has(pubkey);
 
-      if (isKnownAgent && !eligibleAgentPubkeys.has(pubkey)) {
+      if (
+        !canOpenUser({
+          ...candidate,
+          pubkey,
+          isAgent: isKnownAgent,
+        })
+      ) {
         return;
       }
 
@@ -355,16 +393,12 @@ export function useSearchResults({
     }
 
     for (const agent of relayAgentsQuery.data ?? []) {
-      if (agent.respondTo !== "anyone") {
-        continue;
-      }
-
       const candidate = {
         pubkey: agent.pubkey,
         displayName: agent.name,
         avatarUrl: null,
         nip05Handle: null,
-        ownerPubkey: null,
+        ownerPubkey: agent.ownerPubkey,
         isAgent: true,
       };
 
@@ -395,7 +429,7 @@ export function useSearchResults({
       query: ftsQuery,
     });
   }, [
-    eligibleAgentPubkeys,
+    canOpenUser,
     ftsQuery,
     isArchivedDiscovery,
     limit,
@@ -466,9 +500,11 @@ export function useSearchResults({
   }, [results]);
 
   return {
+    canOpenUser,
     channelLookup,
     channelResults,
     debouncedQuery,
+    isAgentPolicyPending,
     isWaitingOnFromResolution: waitingOnFromResolution,
     messageResults,
     query,

@@ -99,7 +99,17 @@ CREATE TABLE channels (
     ttl_seconds     INT,
     ttl_deadline    TIMESTAMPTZ,
     PRIMARY KEY (community_id, id),
-    CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
+    CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid),
+    CONSTRAINT chk_channels_active_dm_shape CHECK (
+        deleted_at IS NOT NULL
+        OR (
+            channel_type = 'dm'
+            AND visibility = 'private'
+            AND participant_hash IS NOT NULL
+            AND octet_length(participant_hash) = 32
+        )
+        OR (channel_type <> 'dm' AND participant_hash IS NULL)
+    )
 );
 
 -- nip29 group id and DM participant hash are unique WITHIN a community, not globally.
@@ -130,6 +140,42 @@ CREATE TRIGGER trg_channels_community_id_immutable
     BEFORE UPDATE ON channels
     FOR EACH ROW EXECUTE FUNCTION channels_community_id_immutable();
 
+CREATE FUNCTION guard_immutable_dm_channel_shape() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.channel_type = 'dm' THEN
+        IF NEW.visibility <> 'private' THEN
+            RAISE EXCEPTION 'DM channel visibility is immutable and must be private'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF NEW.participant_hash IS NULL OR octet_length(NEW.participant_hash) <> 32 THEN
+            RAISE EXCEPTION 'DM participant_hash must be exactly 32 bytes'
+                USING ERRCODE = 'check_violation';
+        END IF;
+    ELSIF NEW.participant_hash IS NOT NULL THEN
+        RAISE EXCEPTION 'non-DM channels cannot carry participant_hash'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.participant_hash IS DISTINCT FROM NEW.participant_hash THEN
+            RAISE EXCEPTION 'channels.participant_hash is immutable after insert'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (OLD.channel_type = 'dm' OR NEW.channel_type = 'dm')
+           AND OLD.channel_type IS DISTINCT FROM NEW.channel_type THEN
+            RAISE EXCEPTION 'channels cannot transition into or out of DM type'
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_channels_immutable_dm_shape
+    BEFORE INSERT OR UPDATE ON channels
+    FOR EACH ROW EXECUTE FUNCTION guard_immutable_dm_channel_shape();
+
 -- ── Channel members ───────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". PK leads with community_id.
 
@@ -150,6 +196,93 @@ CREATE TABLE channel_members (
 
 CREATE INDEX idx_channel_members_pubkey ON channel_members (community_id, pubkey)
     WHERE removed_at IS NULL;
+
+CREATE FUNCTION assert_immutable_dm_participant_set(
+    checked_community_id UUID,
+    checked_channel_id UUID
+) RETURNS VOID AS $$
+DECLARE
+    stored_type channel_type;
+    stored_hash BYTEA;
+    member_count INTEGER;
+    pubkeys_valid BOOLEAN;
+    roles_valid BOOLEAN;
+    active_hash BYTEA;
+BEGIN
+    SELECT channel_type, participant_hash
+    INTO stored_type, stored_hash
+    FROM channels
+    WHERE community_id = checked_community_id
+      AND id = checked_channel_id;
+
+    IF NOT FOUND OR stored_type <> 'dm' THEN
+        RETURN;
+    END IF;
+
+    SELECT
+        COUNT(*)::integer,
+        COALESCE(BOOL_AND(octet_length(pubkey) = 32), FALSE),
+        COALESCE(BOOL_AND(role = 'member'), FALSE),
+        digest(
+            COALESCE(string_agg(pubkey, ''::bytea ORDER BY pubkey), ''::bytea),
+            'sha256'
+        )
+    INTO member_count, pubkeys_valid, roles_valid, active_hash
+    FROM channel_members
+    WHERE community_id = checked_community_id
+      AND channel_id = checked_channel_id
+      AND removed_at IS NULL;
+
+    IF member_count NOT BETWEEN 2 AND 9
+       OR NOT pubkeys_valid
+       OR NOT roles_valid
+       OR active_hash IS DISTINCT FROM stored_hash THEN
+        RAISE EXCEPTION
+            'immutable DM participant set mismatch for %.% (active members: %)',
+            checked_community_id,
+            checked_channel_id,
+            member_count
+            USING ERRCODE = 'check_violation';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION verify_immutable_dm_channel_trigger() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM assert_immutable_dm_participant_set(NEW.community_id, NEW.id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_channels_verify_immutable_dm_participants
+    AFTER INSERT OR UPDATE ON channels
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION verify_immutable_dm_channel_trigger();
+
+CREATE FUNCTION verify_immutable_dm_member_trigger() RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP <> 'INSERT' THEN
+        PERFORM assert_immutable_dm_participant_set(OLD.community_id, OLD.channel_id);
+    END IF;
+    IF TG_OP <> 'DELETE'
+       AND (
+           TG_OP <> 'UPDATE'
+           OR NEW.community_id IS DISTINCT FROM OLD.community_id
+           OR NEW.channel_id IS DISTINCT FROM OLD.channel_id
+       ) THEN
+        PERFORM assert_immutable_dm_participant_set(NEW.community_id, NEW.channel_id);
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_channel_members_verify_immutable_dm_participants
+    AFTER INSERT OR UPDATE OR DELETE ON channel_members
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION verify_immutable_dm_member_trigger();
 
 -- ── Users ─────────────────────────────────────────────────────────────────────
 -- Conformance: "Users, profiles, NIP-05, and user search". One profile per

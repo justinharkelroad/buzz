@@ -1,6 +1,18 @@
 import type { Channel, ChannelType, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
+export type AgentInvocationContext = "regular-channel" | "dm";
+export type RelayAgentInvocationAccess = "allowed" | "denied" | "unknown";
+
+/** Initial query errors leave React Query data undefined after `isPending`
+ * becomes false. Agent/human classification must remain unavailable in that
+ * state; cached arrays, including an empty successful result, are usable. */
+export function isAgentClassificationUnavailable(
+  ...sources: readonly unknown[]
+) {
+  return sources.some((source) => source === undefined);
+}
+
 export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
   return new Set(
     (channels ?? [])
@@ -10,24 +22,83 @@ export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
 }
 
 export function relayAgentIsSharedWithUser(
-  agent: Pick<RelayAgent, "channelIds" | "respondTo" | "respondToAllowlist">,
+  agent: Pick<
+    RelayAgent,
+    | "channelIds"
+    | "invocationPolicyKnown"
+    | "ownerPubkey"
+    | "ownerPubkeyVerified"
+    | "respondTo"
+    | "respondToAllowlist"
+  >,
   sharedChannelIds: ReadonlySet<string>,
   currentPubkey?: string | null,
+  context: AgentInvocationContext = "regular-channel",
 ) {
+  return (
+    relayAgentInvocationAccess(
+      agent,
+      sharedChannelIds,
+      currentPubkey,
+      context,
+    ) === "allowed"
+  );
+}
+
+/** Resolve authenticated invocation policy without conflating a sparse
+ * directory record with an explicit denial. */
+export function relayAgentInvocationAccess(
+  agent: Pick<
+    RelayAgent,
+    | "channelIds"
+    | "invocationPolicyKnown"
+    | "ownerPubkey"
+    | "ownerPubkeyVerified"
+    | "respondTo"
+    | "respondToAllowlist"
+  >,
+  sharedChannelIds: ReadonlySet<string>,
+  currentPubkey?: string | null,
+  context: AgentInvocationContext = "regular-channel",
+): RelayAgentInvocationAccess {
   const normalizedCurrentPubkey = currentPubkey
     ? normalizePubkey(currentPubkey)
     : null;
-
-  if (agent.respondTo === "allowlist" && normalizedCurrentPubkey) {
-    return agent.respondToAllowlist
-      .map((pubkey) => normalizePubkey(pubkey))
-      .includes(normalizedCurrentPubkey);
+  if (
+    normalizedCurrentPubkey &&
+    agent.ownerPubkey &&
+    agent.ownerPubkeyVerified &&
+    normalizePubkey(agent.ownerPubkey) === normalizedCurrentPubkey
+  ) {
+    return "allowed";
+  }
+  if (!agent.invocationPolicyKnown || agent.respondTo === null) {
+    return "unknown";
   }
 
-  return (
-    agent.respondTo === "anyone" &&
-    agent.channelIds.some((channelId) => sharedChannelIds.has(channelId))
-  );
+  if (agent.respondTo === "allowlist") {
+    if (!normalizedCurrentPubkey) return "unknown";
+    return agent.respondToAllowlist
+      .map((pubkey) => normalizePubkey(pubkey))
+      .includes(normalizedCurrentPubkey)
+      ? "allowed"
+      : "denied";
+  }
+
+  if (agent.respondTo === "owner-only") return "denied";
+
+  // `anyone` is intentionally never enough to authorize a foreign user in a
+  // DM. For a regular channel, a known directory membership is useful, but an
+  // empty channel list is merely unknown because managed-agent kind:30177 does
+  // not carry channel ids; active channel membership is checked separately.
+  if (context === "dm") return "denied";
+  if (agent.channelIds.some((channelId) => sharedChannelIds.has(channelId))) {
+    return "allowed";
+  }
+  // A non-intersecting directory channel list can be stale or partial. It is
+  // insufficient for generic discovery, but is not an audience-policy denial
+  // when authoritative active-channel membership says the agent is present.
+  return "unknown";
 }
 
 export function getMentionableAgentPubkeys({
@@ -35,23 +106,80 @@ export function getMentionableAgentPubkeys({
   managedAgentPubkeys,
   relayAgents,
   sharedChannelIds,
+  context = "regular-channel",
 }: {
   currentPubkey?: string | null;
   managedAgentPubkeys: Iterable<string>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
+  context?: AgentInvocationContext;
 }) {
   const pubkeys = new Set(
     [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
   );
 
   for (const agent of relayAgents ?? []) {
-    if (relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)) {
+    if (
+      relayAgentIsSharedWithUser(
+        agent,
+        sharedChannelIds,
+        currentPubkey,
+        context,
+      )
+    ) {
       pubkeys.add(normalizePubkey(agent.pubkey));
     }
   }
 
   return pubkeys;
+}
+
+export function getExplicitlyDeniedAgentPubkeys({
+  currentPubkey,
+  relayAgents,
+  sharedChannelIds,
+  context = "regular-channel",
+}: {
+  currentPubkey?: string | null;
+  relayAgents: readonly RelayAgent[] | undefined;
+  sharedChannelIds: ReadonlySet<string>;
+  context?: AgentInvocationContext;
+}) {
+  const denied = new Set<string>();
+  for (const agent of relayAgents ?? []) {
+    if (
+      relayAgentInvocationAccess(
+        agent,
+        sharedChannelIds,
+        currentPubkey,
+        context,
+      ) === "denied"
+    ) {
+      denied.add(normalizePubkey(agent.pubkey));
+    }
+  }
+  return denied;
+}
+
+export function canDirectMessageAgent({
+  currentPubkey,
+  isOwned,
+  relayAgent,
+}: {
+  currentPubkey?: string | null;
+  isOwned: boolean;
+  relayAgent: RelayAgent | undefined;
+}) {
+  if (isOwned) return true;
+  if (!relayAgent) return false;
+  return (
+    relayAgentInvocationAccess(
+      relayAgent,
+      new Set<string>(),
+      currentPubkey,
+      "dm",
+    ) === "allowed"
+  );
 }
 
 export function isAgentIdentityInManagedList(
@@ -101,13 +229,13 @@ export function shouldHideAgentFromMentions({
   isMember,
   pubkey,
   mentionableAgentPubkeys,
-  directoryAgentPubkeys,
+  explicitlyDeniedAgentPubkeys,
 }: {
   isAgent: boolean;
   isMember: boolean;
   pubkey: string;
   mentionableAgentPubkeys: ReadonlySet<string>;
-  directoryAgentPubkeys: ReadonlySet<string>;
+  explicitlyDeniedAgentPubkeys: ReadonlySet<string>;
 }) {
   if (!isAgent) return false;
   const normalized = normalizePubkey(pubkey);
@@ -115,18 +243,9 @@ export function shouldHideAgentFromMentions({
   if (mentionableAgentPubkeys.has(normalized)) return false;
   // Non-member, non-invocable => hide (preserves prior behavior).
   if (!isMember) return true;
-  // Member (Option B): hide only when we have an explicit not-invocable
-  // signal — a relay directory (kind:10100) entry that excludes us.
-  // Unknown invocability (not in directory) => show.
-  //
-  // NOTE: this assumes `directoryAgentPubkeys` and `mentionableAgentPubkeys`
-  // share the same source query (`relayAgentsQuery.data`), so directory
-  // presence without membership in `mentionableAgentPubkeys` is a real
-  // explicit-exclusion signal. If a future change sources the directory set
-  // from a different query, an agent that's directory-present but whose
-  // mentionability is still loading could be hidden prematurely — keep the
-  // two sets derived from the same query.
-  return directoryAgentPubkeys.has(normalized);
+  // Verified active member: unknown policy remains discoverable and the ACP
+  // runtime is authoritative. Only an authenticated explicit denial hides it.
+  return explicitlyDeniedAgentPubkeys.has(normalized);
 }
 
 type AgentAutocompleteCandidate = {

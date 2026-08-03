@@ -7,11 +7,15 @@
 //! or borrowed events and return models. This makes them trivially
 //! testable with hand-crafted events (see the `tests` module below).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use nostr::{Event, ToBech32};
+use nostr::{Event, Kind, PublicKey, ToBech32};
 use serde_json::{json, Value};
 
+use crate::managed_agents::{
+    agent_events::ManagedAgentEventContent, validate_respond_to_allowlist, RelayAgentInfo,
+    RespondTo,
+};
 use crate::models::*;
 
 mod user_search;
@@ -67,20 +71,19 @@ pub(crate) fn profile_valid_oa_owner_pubkey(event: &Event) -> Option<String> {
         return None;
     };
 
-    for tag in event.tags.iter() {
-        let slice = tag.as_slice();
-        if slice.first().map(String::as_str) != Some("auth") || slice.len() != 4 {
-            continue;
-        }
-        let Ok(json) = serde_json::to_string(slice) else {
-            continue;
-        };
-        if let Ok(owner_pubkey) = buzz_sdk_pkg::nip_oa::verify_auth_tag(&json, &target_pubkey) {
-            return Some(owner_pubkey.to_hex());
-        }
+    // NIP-IA treats the profile's owner binding as singular. More than one
+    // `auth` tag is ambiguous even when one (or every one) verifies, so never
+    // select a convenient first match or fall back past a malformed duplicate.
+    let mut auth_tags = tags_named(event, "auth");
+    let auth_tag = auth_tags.next()?;
+    if auth_tags.next().is_some() || auth_tag.len() != 4 {
+        return None;
     }
 
-    None
+    let json = serde_json::to_string(auth_tag).ok()?;
+    buzz_sdk_pkg::nip_oa::verify_auth_tag(&json, &target_pubkey)
+        .ok()
+        .map(|owner_pubkey| owner_pubkey.to_hex())
 }
 
 pub(crate) fn profile_has_valid_oa_owner(event: &Event) -> bool {
@@ -454,6 +457,14 @@ pub fn agents_from_events(events: &[Event]) -> Value {
             // authoritative source even if the content claims otherwise.
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("pubkey".to_string(), json!(pubkey.clone()));
+                // kind:10100 is self-authenticated by the agent identity. It
+                // can describe a legacy invocation policy, but it cannot
+                // attest who owns that identity. Only a cryptographically
+                // verified NIP-OA auth tag on the latest kind:0 profile may
+                // populate `owner_pubkey` during the discovery merge below.
+                obj.remove("owner_pubkey");
+                obj.remove("owner_pubkey_verified");
+                obj.insert("owner_pubkey_verified".to_string(), json!(false));
                 let fallback_name = obj
                     .get("display_name")
                     .and_then(Value::as_str)
@@ -478,6 +489,13 @@ pub fn agents_from_events(events: &[Event]) -> Value {
                 if !obj.get("status").is_some_and(Value::is_string) {
                     obj.insert("status".to_string(), json!("offline"));
                 }
+                // kind:10100 is directory/channel-add metadata, not an
+                // authenticated runtime invocation policy. Never project its
+                // audience fields as trusted: only the current verified OA
+                // owner's kind:30177 may populate them in the merge below.
+                obj.remove("respond_to");
+                obj.remove("respond_to_allowlist");
+                obj.insert("invocation_policy_known".to_string(), json!(false));
             } else {
                 v = json!({
                     "pubkey": pubkey,
@@ -487,12 +505,253 @@ pub fn agents_from_events(events: &[Event]) -> Value {
                     "channel_ids": [],
                     "capabilities": [],
                     "status": "offline",
+                    "invocation_policy_known": false,
                 });
             }
             v
         })
         .collect();
     json!({ "agents": arr })
+}
+
+/// Collect agent identity pubkeys named by authenticated discovery events.
+///
+/// kind:10100 is authored by the agent, while kind:30177 is authored by its
+/// owner and carries the agent pubkey in `d`. The latter is only a query hint;
+/// [`relay_agents_from_discovery_events`] still requires the owner to match the
+/// agent's cryptographically verified NIP-OA kind:0 profile before trusting it.
+pub(crate) fn agent_identity_pubkeys_from_discovery_events(events: &[Event]) -> Vec<String> {
+    const KIND_AGENT_PROFILE: u16 = 10100;
+    const KIND_MANAGED_AGENT: u16 = 30177;
+
+    let mut pubkeys = BTreeSet::new();
+    for event in events {
+        if event.verify().is_err() {
+            continue;
+        }
+        match event.kind.as_u16() {
+            KIND_AGENT_PROFILE => {
+                pubkeys.insert(event.pubkey.to_hex());
+            }
+            KIND_MANAGED_AGENT => {
+                let Some(d_tag) = first_tag_value(event, "d") else {
+                    continue;
+                };
+                let Ok(pubkey) = PublicKey::from_hex(d_tag) else {
+                    continue;
+                };
+                pubkeys.insert(pubkey.to_hex());
+            }
+            _ => {}
+        }
+    }
+    pubkeys.into_iter().collect()
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedAgentIdentity {
+    owner_pubkey: String,
+    display_name: Option<String>,
+}
+
+fn event_is_newer(candidate: &Event, current: &Event) -> bool {
+    candidate.created_at > current.created_at
+        || (candidate.created_at == current.created_at
+            && candidate.id.to_hex() < current.id.to_hex())
+}
+
+/// Merge public agent directory records with owner-authored managed-agent
+/// invocation policy.
+///
+/// Security boundary: a kind:30177 event is accepted only when all three
+/// signatures/links agree: the event itself verifies, its `d` tag names the
+/// agent, and that agent's verified kind:0 NIP-OA auth tag names the 30177
+/// author as owner. A third party can therefore publish a syntactically valid
+/// 30177 claim, but cannot make another owner's agent appear delegated.
+pub(crate) fn relay_agents_from_discovery_events(
+    agent_profile_events: &[Event],
+    managed_agent_events: &[Event],
+    identity_profile_events: &[Event],
+) -> Vec<RelayAgentInfo> {
+    // Relay query responses are expected to contain replaceable heads, but
+    // select them here too: a stale duplicate must never resurrect an old
+    // owner auth tag or overwrite a newer directory document by input order.
+    let mut latest_identity_profiles: BTreeMap<String, &Event> = BTreeMap::new();
+    for event in identity_profile_events
+        .iter()
+        .filter(|event| event.kind == Kind::Metadata && event.verify().is_ok())
+    {
+        let pubkey = event.pubkey.to_hex();
+        let replace = latest_identity_profiles
+            .get(&pubkey)
+            .is_none_or(|current| event_is_newer(event, current));
+        if replace {
+            latest_identity_profiles.insert(pubkey, event);
+        }
+    }
+    let verified_identities: BTreeMap<String, VerifiedAgentIdentity> = latest_identity_profiles
+        .into_iter()
+        .filter_map(|(pubkey, event)| {
+            let owner_pubkey = profile_valid_oa_owner_pubkey(event)?;
+            let display_name = profile_info_from_event(event)
+                .ok()
+                .and_then(|profile| profile.display_name)
+                .and_then(|name| {
+                    let trimmed = name.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                });
+            Some((
+                pubkey,
+                VerifiedAgentIdentity {
+                    owner_pubkey,
+                    display_name,
+                },
+            ))
+        })
+        .collect();
+
+    let mut latest_agent_profiles: BTreeMap<String, &Event> = BTreeMap::new();
+    for event in agent_profile_events
+        .iter()
+        .filter(|event| event.kind.as_u16() == 10100 && event.verify().is_ok())
+    {
+        let pubkey = event.pubkey.to_hex();
+        let replace = latest_agent_profiles
+            .get(&pubkey)
+            .is_none_or(|current| event_is_newer(event, current));
+        if replace {
+            latest_agent_profiles.insert(pubkey, event);
+        }
+    }
+    let verified_agent_profiles: Vec<Event> =
+        latest_agent_profiles.into_values().cloned().collect();
+    let parsed_directory = agents_from_events(&verified_agent_profiles)
+        .get("agents")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let directory_agents: Vec<RelayAgentInfo> =
+        serde_json::from_value(parsed_directory).unwrap_or_default();
+
+    let mut agents_by_pubkey = BTreeMap::new();
+    for mut agent in directory_agents {
+        let Ok(pubkey) = PublicKey::from_hex(&agent.pubkey) else {
+            continue;
+        };
+        let pubkey = pubkey.to_hex();
+        agent.pubkey = pubkey.clone();
+        // Defense in depth: a directory document never establishes ownership,
+        // even if a future parser accidentally starts projecting that field.
+        agent.owner_pubkey = None;
+        agent.owner_pubkey_verified = false;
+        if let Some(identity) = verified_identities.get(&pubkey) {
+            agent.owner_pubkey = Some(identity.owner_pubkey.clone());
+            agent.owner_pubkey_verified = true;
+            if let Some(display_name) = &identity.display_name {
+                agent.name = display_name.clone();
+            }
+            // A verified OA identity establishes the only owner that may
+            // publish invocation policy. Missing or malformed current-owner
+            // kind:30177 is unknown. This also prevents an owner rotation from
+            // retaining the prior owner's audience.
+            agent.respond_to = None;
+            agent.respond_to_allowlist.clear();
+            agent.invocation_policy_known = false;
+        }
+        agents_by_pubkey.insert(pubkey, agent);
+    }
+
+    // Select the canonical replaceable head BEFORE parsing its content. A
+    // malformed newer head must fail closed to unknown policy, never fall back
+    // to an older valid grant. Buzz's same-second tie rule is lowest event id.
+    let mut managed_heads: BTreeMap<(String, String), &Event> = BTreeMap::new();
+    for event in managed_agent_events {
+        if event.kind.as_u16() != 30177 || event.verify().is_err() {
+            continue;
+        }
+        let Some(d_tag) = first_tag_value(event, "d") else {
+            continue;
+        };
+        let Ok(agent_pubkey) = PublicKey::from_hex(d_tag) else {
+            continue;
+        };
+        let agent_pubkey = agent_pubkey.to_hex();
+        let coordinate = (event.pubkey.to_hex(), agent_pubkey);
+        let replace = managed_heads
+            .get(&coordinate)
+            .is_none_or(|current| event_is_newer(event, current));
+        if replace {
+            managed_heads.insert(coordinate, event);
+        }
+    }
+
+    for ((event_owner, agent_pubkey), event) in managed_heads {
+        let Some(identity) = verified_identities.get(&agent_pubkey) else {
+            continue;
+        };
+        if identity.owner_pubkey != event_owner {
+            continue;
+        }
+
+        let fallback_name = identity
+            .display_name
+            .clone()
+            .unwrap_or_else(|| agent_pubkey.clone());
+        let agent = agents_by_pubkey
+            .entry(agent_pubkey.clone())
+            .or_insert_with(|| RelayAgentInfo {
+                pubkey: agent_pubkey.clone(),
+                name: fallback_name.clone(),
+                agent_type: "agent".to_string(),
+                channels: Vec::new(),
+                channel_ids: Vec::new(),
+                capabilities: Vec::new(),
+                status: "offline".to_string(),
+                respond_to: None,
+                respond_to_allowlist: Vec::new(),
+                invocation_policy_known: false,
+                owner_pubkey: Some(identity.owner_pubkey.clone()),
+                owner_pubkey_verified: true,
+            });
+        if identity.display_name.is_some() {
+            agent.name = fallback_name;
+        }
+        agent.owner_pubkey = Some(identity.owner_pubkey.clone());
+        agent.owner_pubkey_verified = true;
+        // The verified current owner has an authoritative 30177 head. Clear
+        // any legacy kind:10100 audience projection before validating it so a
+        // malformed current head becomes unknown rather than resurrecting an
+        // older/secondary grant.
+        agent.respond_to = None;
+        agent.respond_to_allowlist.clear();
+        agent.invocation_policy_known = false;
+
+        let Ok(content) = serde_json::from_str::<ManagedAgentEventContent>(&event.content) else {
+            continue;
+        };
+        let Ok(normalized_allowlist) = validate_respond_to_allowlist(&content.respond_to_allowlist)
+        else {
+            continue;
+        };
+        if content.respond_to == RespondTo::Allowlist && normalized_allowlist.is_empty() {
+            continue;
+        }
+
+        if identity.display_name.is_none() {
+            let projected_name = content.name.trim();
+            if !projected_name.is_empty() {
+                agent.name = projected_name.to_string();
+            }
+        }
+        agent.respond_to = Some(content.respond_to);
+        agent.respond_to_allowlist = if content.respond_to == RespondTo::Allowlist {
+            normalized_allowlist
+        } else {
+            Vec::new()
+        };
+        agent.invocation_policy_known = true;
+    }
+
+    agents_by_pubkey.into_values().collect()
 }
 
 // ── kind:13534 (relay membership list) ──────────────────────────────────────
@@ -578,434 +837,5 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use nostr::{EventBuilder, Keys, Kind, Tag};
-
-    /// Build a signed event for testing with the given kind, content, and tags.
-    fn ev(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
-        let keys = Keys::generate();
-        let parsed: Vec<Tag> = tags
-            .into_iter()
-            .map(|t| Tag::parse(t).expect("parse tag"))
-            .collect();
-        EventBuilder::new(Kind::from_u16(kind), content)
-            .tags(parsed)
-            .sign_with_keys(&keys)
-            .expect("sign")
-    }
-
-    /// Build a kind:0 profile with a valid NIP-OA auth tag.
-    fn oa_profile_event(content: &str) -> (Event, String) {
-        let agent_keys = Keys::generate();
-        let owner_keys = Keys::generate();
-        let agent_pubkey = agent_keys.public_key();
-        let tag_json = buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, "")
-            .expect("compute auth tag");
-        let tag_values: Vec<String> = serde_json::from_str(&tag_json).expect("parse auth tag json");
-        let auth_tag = Tag::parse(tag_values).expect("parse auth tag");
-
-        let event = EventBuilder::new(Kind::Metadata, content)
-            .tags(vec![auth_tag])
-            .sign_with_keys(&agent_keys)
-            .expect("sign");
-        (event, owner_keys.public_key().to_hex())
-    }
-
-    #[test]
-    fn channel_info_minimal() {
-        let e = ev(
-            39000,
-            "",
-            vec![
-                vec!["d", "chan-uuid-1"],
-                vec!["name", "general"],
-                vec!["about", "main channel"],
-                vec!["t", "stream"],
-                vec!["public"],
-            ],
-        );
-        let info = channel_info_from_event(&e, None, None).unwrap();
-        assert_eq!(info.id, "chan-uuid-1");
-        assert_eq!(info.name, "general");
-        assert_eq!(info.description, "main channel");
-        assert_eq!(info.channel_type, "stream");
-        assert_eq!(info.visibility, "open");
-        assert_eq!(info.member_count, 0);
-        assert!(info.is_member);
-    }
-
-    #[test]
-    fn channel_info_private_when_visibility_tag_present() {
-        let e = ev(
-            39000,
-            "",
-            vec![
-                vec!["d", "u"],
-                vec!["name", "n"],
-                vec!["t", "forum"],
-                vec!["visibility", "private"],
-                vec!["ttl", "86400"],
-            ],
-        );
-        let info = channel_info_from_event(&e, None, None).unwrap();
-        assert_eq!(info.visibility, "private");
-        assert_eq!(info.channel_type, "forum");
-        assert_eq!(info.ttl_seconds, Some(86400));
-    }
-
-    #[test]
-    fn channel_info_open_when_neither_public_nor_private() {
-        // Neither tag present → open (matches NIP-29 default).
-        let e = ev(
-            39000,
-            "",
-            vec![vec!["d", "u"], vec!["name", "n"], vec!["t", "forum"]],
-        );
-        let info = channel_info_from_event(&e, None, None).unwrap();
-        assert_eq!(info.visibility, "open");
-    }
-
-    #[test]
-    fn channel_info_dm_inferred_from_hidden_tag() {
-        // Fallback: relays without ["t", "dm"] still emit ["hidden"] for DMs.
-        let e = ev(
-            39000,
-            "",
-            vec![vec!["d", "u"], vec!["name", "n"], vec!["hidden"]],
-        );
-        let info = channel_info_from_event(&e, None, None).unwrap();
-        assert_eq!(info.channel_type, "dm");
-    }
-
-    #[test]
-    fn channel_info_merges_summary() {
-        let chan = ev(39000, "", vec![vec!["d", "u"], vec!["name", "n"]]);
-        let summary = ev(
-            40901,
-            r#"{"member_count": 7, "last_message_at": "2026-01-01T00:00:00Z"}"#,
-            vec![vec!["d", "u"]],
-        );
-        let info = channel_info_from_event(&chan, Some(&summary), None).unwrap();
-        assert_eq!(info.member_count, 7);
-        assert_eq!(
-            info.last_message_at.as_deref(),
-            Some("2026-01-01T00:00:00Z")
-        );
-    }
-
-    #[test]
-    fn channel_info_missing_d_errors() {
-        let e = ev(39000, "", vec![vec!["name", "n"]]);
-        assert!(channel_info_from_event(&e, None, None).is_err());
-    }
-
-    #[test]
-    fn channel_detail_basic() {
-        let e = ev(
-            39000,
-            "",
-            vec![
-                vec!["d", "uuid"],
-                vec!["name", "n"],
-                vec!["about", "desc"],
-                vec!["topic", "tt"],
-                vec!["purpose", "pp"],
-                vec!["t", "dm"],
-                vec!["visibility", "private"],
-                vec!["ttl", "86400"],
-                vec!["ttl_deadline", "2026-06-11T00:00:00Z"],
-            ],
-        );
-        let d = channel_detail_from_event(&e).unwrap();
-        assert_eq!(d.id, "uuid");
-        assert_eq!(d.topic.as_deref(), Some("tt"));
-        assert_eq!(d.purpose.as_deref(), Some("pp"));
-        assert_eq!(d.channel_type, "dm");
-        assert_eq!(d.visibility, "private");
-        assert_eq!(d.ttl_seconds, Some(86400));
-        assert_eq!(d.ttl_deadline.as_deref(), Some("2026-06-11T00:00:00Z"));
-        assert!(d.created_at.ends_with("Z"));
-        assert_eq!(d.created_by, e.pubkey.to_hex());
-    }
-
-    #[test]
-    fn channel_members_extracts_p_tags() {
-        let pk1 = "a".repeat(64);
-        let pk2 = "b".repeat(64);
-        let e = ev(
-            39002,
-            "",
-            vec![
-                vec!["d", "uuid"],
-                vec!["p", &pk1, "", "admin"],
-                vec!["p", &pk2],
-                // Duplicate must be deduped.
-                vec!["p", &pk1, "wss://x", "owner"],
-            ],
-        );
-        let r = channel_members_from_event(&e).unwrap();
-        assert_eq!(r.members.len(), 2);
-        assert_eq!(r.members[0].pubkey, pk1);
-        assert_eq!(r.members[0].role, "admin");
-        assert!(r.members[0].joined_at.is_none());
-        assert_eq!(r.members[1].role, "member"); // default
-    }
-
-    #[test]
-    fn channel_members_missing_d_errors() {
-        let e = ev(39002, "", vec![]);
-        assert!(channel_members_from_event(&e).is_err());
-    }
-
-    #[test]
-    fn profile_info_parses_content() {
-        let e = ev(
-            0,
-            r#"{"name":"alice","display_name":"Alice","picture":"http://x/a.png","about":"hi","nip05":"alice@x"}"#,
-            vec![],
-        );
-        let p = profile_info_from_event(&e).unwrap();
-        assert_eq!(p.display_name.as_deref(), Some("Alice"));
-        assert_eq!(p.avatar_url.as_deref(), Some("http://x/a.png"));
-        assert_eq!(p.about.as_deref(), Some("hi"));
-        assert_eq!(p.nip05_handle.as_deref(), Some("alice@x"));
-        assert_eq!(p.pubkey, e.pubkey.to_hex());
-        assert!(p.owner_pubkey.is_none());
-    }
-
-    #[test]
-    fn profile_info_extracts_valid_nip_oa_owner() {
-        let (event, owner_pubkey) = oa_profile_event(r#"{"display_name":"Mira"}"#);
-        let p = profile_info_from_event(&event).unwrap();
-
-        assert_eq!(p.owner_pubkey.as_deref(), Some(owner_pubkey.as_str()));
-    }
-
-    #[test]
-    fn profile_info_falls_back_to_name() {
-        let e = ev(0, r#"{"name":"bob"}"#, vec![]);
-        let p = profile_info_from_event(&e).unwrap();
-        assert_eq!(p.display_name.as_deref(), Some("bob"));
-    }
-
-    #[test]
-    fn profile_info_invalid_json_errors() {
-        let e = ev(0, "not-json", vec![]);
-        assert!(profile_info_from_event(&e).is_err());
-    }
-
-    #[test]
-    fn users_batch_keeps_latest_and_reports_missing() {
-        let e1 = ev(0, r#"{"name":"old"}"#, vec![]);
-        // Same author, newer event with display_name.
-        let keys = Keys::generate();
-        let e_old = EventBuilder::new(Kind::Metadata, r#"{"name":"old"}"#)
-            .custom_created_at(nostr::Timestamp::from(1000))
-            .sign_with_keys(&keys)
-            .unwrap();
-        let e_new = EventBuilder::new(Kind::Metadata, r#"{"display_name":"New"}"#)
-            .custom_created_at(nostr::Timestamp::from(2000))
-            .sign_with_keys(&keys)
-            .unwrap();
-        let pk = keys.public_key().to_hex();
-        let other_pk = e1.pubkey.to_hex();
-
-        let missing_pk = "f".repeat(64);
-        let resp = users_batch_from_events(
-            &[e1, e_old, e_new],
-            &[pk.clone(), other_pk.clone(), missing_pk.clone()],
-        );
-        assert_eq!(resp.profiles.len(), 2);
-        assert_eq!(resp.profiles[&pk].display_name.as_deref(), Some("New"));
-        assert_eq!(resp.missing, vec![missing_pk]);
-    }
-
-    #[test]
-    fn users_batch_marks_valid_nip_oa_profiles_as_agents() {
-        let (agent, owner_pubkey) = oa_profile_event(r#"{"display_name":"Mira"}"#);
-        let pubkey = agent.pubkey.to_hex();
-        let resp =
-            users_batch_from_events(std::slice::from_ref(&agent), std::slice::from_ref(&pubkey));
-
-        assert!(resp.profiles[&pubkey].is_agent);
-        assert_eq!(
-            resp.profiles[&pubkey].owner_pubkey.as_deref(),
-            Some(owner_pubkey.as_str())
-        );
-    }
-
-    #[test]
-    fn user_notes_builds_cursor_from_last() {
-        let e1 = ev(1, "first", vec![]);
-        let e2 = ev(1, "second", vec![]);
-        let r = user_notes_from_events(&[e1, e2]);
-        assert_eq!(r.notes.len(), 2);
-        assert_eq!(r.notes[0].content, "first");
-        let cursor = r.next_cursor.expect("cursor");
-        assert_eq!(cursor.before_id, r.notes[1].id);
-    }
-
-    #[test]
-    fn user_notes_empty_has_no_cursor() {
-        let r = user_notes_from_events(&[]);
-        assert!(r.notes.is_empty());
-        assert!(r.next_cursor.is_none());
-    }
-
-    #[test]
-    fn contact_list_preserves_tags_and_content() {
-        let pk = "1".repeat(64);
-        let e = ev(3, "rel-json", vec![vec!["p", &pk]]);
-        let r = contact_list_from_event(&e).unwrap();
-        assert_eq!(r.content, "rel-json");
-        assert_eq!(r.tags.len(), 1);
-        assert_eq!(r.tags[0], vec!["p".to_string(), pk]);
-    }
-
-    #[test]
-    fn search_response_assigns_descending_scores() {
-        let e1 = ev(1, "one", vec![vec!["h", "chan"]]);
-        let e2 = ev(1, "two", vec![]);
-        let r = search_response_from_events(&[e1, e2]);
-        assert_eq!(r.found, 2);
-        assert!(r.hits[0].score > r.hits[1].score);
-        assert_eq!(r.hits[0].channel_id.as_deref(), Some("chan"));
-        assert!(r.hits[1].channel_id.is_none());
-    }
-
-    #[test]
-    fn search_response_single_hit_full_score() {
-        let e = ev(1, "only", vec![]);
-        let r = search_response_from_events(&[e]);
-        assert_eq!(r.hits.len(), 1);
-        assert_eq!(r.hits[0].score, 1.0);
-    }
-
-    #[test]
-    fn agents_overwrites_pubkey_from_event_author() {
-        let e = ev(10100, r#"{"pubkey":"forged","name":"agent-1"}"#, vec![]);
-        let v = agents_from_events(std::slice::from_ref(&e));
-        let arr = v.get("agents").and_then(Value::as_array).unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(
-            arr[0].get("pubkey").and_then(Value::as_str).unwrap(),
-            e.pubkey.to_hex()
-        );
-        assert_eq!(arr[0].get("name").and_then(Value::as_str), Some("agent-1"));
-    }
-
-    #[test]
-    fn agents_handles_invalid_content() {
-        let e = ev(10100, "not-json", vec![]);
-        let v = agents_from_events(std::slice::from_ref(&e));
-        let arr = v.get("agents").and_then(Value::as_array).unwrap();
-        assert_eq!(
-            arr[0].get("pubkey").and_then(Value::as_str).unwrap(),
-            e.pubkey.to_hex()
-        );
-    }
-
-    #[test]
-    fn agents_default_sparse_agent_profiles_for_directory_parse() {
-        let e = ev(
-            10100,
-            r#"{"channel_add_policy":"owner-only","display_name":"Scout"}"#,
-            vec![],
-        );
-        let v = agents_from_events(std::slice::from_ref(&e));
-        let agents = v.get("agents").cloned().unwrap();
-        let parsed: Vec<crate::managed_agents::RelayAgentInfo> =
-            serde_json::from_value(agents).unwrap();
-
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].pubkey, e.pubkey.to_hex());
-        assert_eq!(parsed[0].name, "Scout");
-        assert_eq!(parsed[0].agent_type, "agent");
-        assert_eq!(parsed[0].channels, Vec::<String>::new());
-        assert_eq!(parsed[0].capabilities, Vec::<String>::new());
-        assert_eq!(parsed[0].status, "offline");
-        assert_eq!(parsed[0].respond_to, None);
-    }
-
-    #[test]
-    fn agents_preserves_public_respond_to_mode_for_directory_parse() {
-        let e = ev(10100, r#"{"name":"Scout","respond_to":"anyone"}"#, vec![]);
-        let v = agents_from_events(std::slice::from_ref(&e));
-        let agents = v.get("agents").cloned().unwrap();
-        let parsed: Vec<crate::managed_agents::RelayAgentInfo> =
-            serde_json::from_value(agents).unwrap();
-
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(
-            parsed[0].respond_to,
-            Some(crate::managed_agents::RespondTo::Anyone)
-        );
-    }
-
-    #[test]
-    fn agents_preserves_allowlist_metadata_for_directory_parse() {
-        let e = ev(
-            10100,
-            r#"{"name":"Scout","respond_to":"allowlist","respond_to_allowlist":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"#,
-            vec![],
-        );
-        let v = agents_from_events(std::slice::from_ref(&e));
-        let agents = v.get("agents").cloned().unwrap();
-        let parsed: Vec<crate::managed_agents::RelayAgentInfo> =
-            serde_json::from_value(agents).unwrap();
-
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(
-            parsed[0].respond_to,
-            Some(crate::managed_agents::RespondTo::Allowlist)
-        );
-        assert_eq!(parsed[0].respond_to_allowlist, vec!["a".repeat(64)]);
-    }
-
-    #[test]
-    fn relay_members_dedupes_and_defaults_role() {
-        let pk1 = "a".repeat(64);
-        let pk2 = "b".repeat(64);
-        // Current relay format: ["member", pubkey, role]
-        let e = ev(
-            13534,
-            "",
-            vec![
-                vec!["member", &pk1, "owner"],
-                vec!["member", &pk2],
-                vec!["member", &pk1, "moderator"], // dupe — ignored
-            ],
-        );
-        let v = relay_members_from_event(&e);
-        let arr = v.get("members").and_then(Value::as_array).unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].get("role").and_then(Value::as_str), Some("owner"));
-        assert_eq!(arr[1].get("role").and_then(Value::as_str), Some("member"));
-    }
-
-    #[test]
-    fn relay_members_fallback_p_tags() {
-        let pk1 = "a".repeat(64);
-        let pk2 = "b".repeat(64);
-        // Legacy/fallback format: ["p", pubkey, relay_url?, role?]
-        let e = ev(
-            13534,
-            "",
-            vec![vec!["p", &pk1, "", "admin"], vec!["p", &pk2]],
-        );
-        let v = relay_members_from_event(&e);
-        let arr = v.get("members").and_then(Value::as_array).unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0].get("role").and_then(Value::as_str), Some("admin"));
-        assert_eq!(arr[1].get("role").and_then(Value::as_str), Some("member"));
-    }
-
-    #[test]
-    fn timestamp_to_iso_known_value() {
-        // 2021-01-01T00:00:00Z = 1609459200
-        assert_eq!(timestamp_to_iso(1_609_459_200), "2021-01-01T00:00:00Z");
-        // Epoch
-        assert_eq!(timestamp_to_iso(0), "1970-01-01T00:00:00Z");
-    }
-}
+#[path = "nostr_convert_tests.rs"]
+mod tests;

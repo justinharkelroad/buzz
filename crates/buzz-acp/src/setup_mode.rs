@@ -74,7 +74,11 @@ use crate::{
     author_allowed,
     config::Config,
     effective_instruction_author, event_mentions_agent, filter,
-    relay::{HarnessRelay, RelayEventPublisher},
+    relay::{
+        membership_retry_action, membership_subscription_decision, CurrentMembershipState,
+        HarnessRelay, MembershipRetryAction, MembershipRetryDisposition,
+        MembershipSubscriptionDecision, RelayEventPublisher, RestClient,
+    },
 };
 
 // ── Payload ───────────────────────────────────────────────────────────────────
@@ -313,7 +317,8 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         "buzz-acp entering setup mode"
     );
 
-    let pubkey_hex = config.keys.public_key().to_hex();
+    let agent_pubkey = config.keys.public_key();
+    let pubkey_hex = agent_pubkey.to_hex();
 
     // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
@@ -359,6 +364,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     );
 
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
+    let mut subscribed_channel_ids = HashSet::new();
 
     // Build subscription rules: mentions only (setup mode must not react to
     // every message in a channel).
@@ -376,6 +382,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         if let Err(e) = relay.subscribe_channel(*channel_id, filter.clone()).await {
             tracing::warn!("setup-mode: failed to subscribe to channel {channel_id}: {e}");
         } else {
+            subscribed_channel_ids.insert(*channel_id);
             tracing::info!("setup-mode: subscribed to channel {channel_id}");
         }
     }
@@ -384,10 +391,15 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let rest_client = relay.rest_client();
     let trusted_relay_pubkey = relay.relay_signing_pubkey().cloned();
 
-    let channel_info = crate::pool::ChannelInfoResolver::new(channel_info_map, rest_client.clone());
+    let channel_info = crate::pool::ChannelInfoResolver::new(
+        channel_info_map,
+        rest_client.clone(),
+        trusted_relay_pubkey,
+    );
 
     // Deduplicate by event-id so reconnect replay cannot double-nudge.
     let mut nudged_event_ids: HashSet<EventId> = HashSet::new();
+    let mut membership_triggers = crate::relay::MembershipTriggerTracker::default();
 
     loop {
         let Some(buzz_event) = relay.next_event().await else {
@@ -406,7 +418,62 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
             || kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION
         {
-            handle_setup_membership(&mut relay, &buzz_event, &config, &rules, &channel_ids).await;
+            let event_id = buzz_event.event.id.to_hex();
+            if !membership_triggers.accept(&event_id) {
+                tracing::debug!(
+                    channel_id = %buzz_event.channel_id,
+                    %event_id,
+                    "setup-mode: skipping duplicate membership trigger"
+                );
+                continue;
+            }
+            let outcome = handle_setup_membership(
+                &mut relay,
+                &buzz_event,
+                SetupMembershipContext {
+                    config: &config,
+                    rules: &rules,
+                    subscribed_channel_ids: &mut subscribed_channel_ids,
+                    channel_info: &channel_info,
+                    rest_client: &rest_client,
+                    agent_pubkey: &agent_pubkey,
+                    trusted_relay_pubkey: trusted_relay_pubkey.as_ref(),
+                },
+            )
+            .await;
+            match outcome {
+                SetupMembershipOutcome::Resolved => membership_triggers.resolved(&event_id),
+                SetupMembershipOutcome::Retry => {
+                    match setup_membership_retry_action(
+                        kind_u32,
+                        membership_triggers.retry_or_consume(&event_id),
+                    ) {
+                        MembershipRetryAction::ScheduleReplay => {
+                            relay.schedule_membership_recheck(std::time::Duration::from_secs(5));
+                        }
+                        MembershipRetryAction::EnsureUnsubscribed => {
+                            tracing::warn!(
+                                channel_id = %buzz_event.channel_id,
+                                %event_id,
+                                "setup-mode: authenticated REMOVE retry budget exhausted; failing closed by unsubscribing"
+                            );
+                            let _ = ensure_setup_unsubscribed(
+                                &mut relay,
+                                buzz_event.channel_id,
+                                &mut subscribed_channel_ids,
+                            )
+                            .await;
+                        }
+                        MembershipRetryAction::Consume => {
+                            tracing::warn!(
+                                channel_id = %buzz_event.channel_id,
+                                %event_id,
+                                "setup-mode: membership trigger retry budget exhausted; consuming event without granting access"
+                            );
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -427,16 +494,23 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         }
 
         // Apply the same author gate as normal mode so the nudge only goes
-        // to authors the real agent would have answered. Same DM hardening:
-        // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
+        // to authors the real agent would have answered. External allowlist
+        // grants work only in relay-verified 1:1 DMs; group/unknown DMs fail
+        // closed while owner/sibling behavior is preserved.
         let author_hex =
             effective_instruction_author(&buzz_event.event, trusted_relay_pubkey.as_ref());
-        let is_dm = crate::is_dm_channel(buzz_event.channel_id, &channel_info).await;
+        let channel = crate::resolve_author_gate_channel(
+            buzz_event.channel_id,
+            &pubkey_hex,
+            &author_hex,
+            &channel_info,
+        )
+        .await;
         let allowed = author_allowed(
             &config.respond_to,
             &config.respond_to_allowlist,
             &author_hex,
-            is_dm,
+            channel,
             &owner_cache,
             &rest_client,
         )
@@ -560,32 +634,170 @@ fn mentions_rule(kinds: Vec<u32>) -> filter::SubscriptionRule {
 
 /// Handle membership add/remove events in setup mode.
 ///
-/// Subscribe new channels; unsubscribe removed ones. No queue/session
-/// teardown — there is no pool.
+/// The live notification is only a wake-up trigger. The signer-pinned current
+/// kind:39002 coordinate decides whether the setup listener subscribes or
+/// unsubscribes, so stale valid add/remove notifications cannot invert state.
+/// No queue/session teardown is needed because setup mode has no pool.
+fn setup_membership_action(
+    trigger_kind: u32,
+    current: CurrentMembershipState,
+    outer_tracks_channel: bool,
+) -> MembershipSubscriptionDecision {
+    if !matches!(
+        trigger_kind,
+        KIND_MEMBER_ADDED_NOTIFICATION | KIND_MEMBER_REMOVED_NOTIFICATION
+    ) {
+        return MembershipSubscriptionDecision::Retry;
+    }
+    membership_subscription_decision(current, outer_tracks_channel)
+}
+
+fn setup_membership_retry_action(
+    trigger_kind: u32,
+    disposition: MembershipRetryDisposition,
+) -> MembershipRetryAction {
+    membership_retry_action(trigger_kind, disposition)
+}
+
+async fn resolve_setup_membership_action(
+    rest_client: &RestClient,
+    channel_id: Uuid,
+    agent_pubkey: &nostr::PublicKey,
+    trusted_relay_pubkey: &nostr::PublicKey,
+    trigger_kind: u32,
+    outer_tracks_channel: bool,
+) -> Result<MembershipSubscriptionDecision, crate::relay::RelayError> {
+    let current = rest_client
+        .current_channel_membership(channel_id, agent_pubkey, trusted_relay_pubkey)
+        .await?;
+    Ok(setup_membership_action(
+        trigger_kind,
+        current,
+        outer_tracks_channel,
+    ))
+}
+
+struct SetupMembershipContext<'a> {
+    config: &'a Config,
+    rules: &'a [filter::SubscriptionRule],
+    subscribed_channel_ids: &'a mut HashSet<Uuid>,
+    channel_info: &'a crate::pool::ChannelInfoResolver,
+    rest_client: &'a RestClient,
+    agent_pubkey: &'a nostr::PublicKey,
+    trusted_relay_pubkey: Option<&'a nostr::PublicKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupMembershipOutcome {
+    Resolved,
+    Retry,
+}
+
+async fn ensure_setup_unsubscribed(
+    relay: &mut HarnessRelay,
+    channel_id: Uuid,
+    subscribed_channel_ids: &mut HashSet<Uuid>,
+) -> SetupMembershipOutcome {
+    let was_tracked = subscribed_channel_ids.remove(&channel_id);
+    if let Err(error) = relay.unsubscribe_channel(channel_id).await {
+        tracing::warn!(%channel_id, %error, "setup-mode: failed to unsubscribe from channel");
+        SetupMembershipOutcome::Retry
+    } else {
+        tracing::info!(
+            %channel_id,
+            was_tracked,
+            "setup-mode: ensured current non-member channel is unsubscribed"
+        );
+        SetupMembershipOutcome::Resolved
+    }
+}
+
 async fn handle_setup_membership(
     relay: &mut HarnessRelay,
     buzz_event: &crate::relay::BuzzEvent,
-    config: &Config,
-    rules: &[filter::SubscriptionRule],
-    _initial_channel_ids: &[Uuid],
-) {
+    context: SetupMembershipContext<'_>,
+) -> SetupMembershipOutcome {
     let kind_u32 = buzz_event.event.kind.as_u16() as u32;
     let channel_id = buzz_event.channel_id;
+    let Some(trusted_relay_pubkey) = context.trusted_relay_pubkey else {
+        tracing::warn!(
+            channel_id = %channel_id,
+            "setup-mode: membership trigger has no trusted NIP-11 identity; retry requested"
+        );
+        return SetupMembershipOutcome::Retry;
+    };
+    let action = match resolve_setup_membership_action(
+        context.rest_client,
+        channel_id,
+        context.agent_pubkey,
+        trusted_relay_pubkey,
+        kind_u32,
+        context.subscribed_channel_ids.contains(&channel_id),
+    )
+    .await
+    {
+        Ok(action) => action,
+        Err(error) => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                %error,
+                "setup-mode: current membership lookup failed; retry requested"
+            );
+            return SetupMembershipOutcome::Retry;
+        }
+    };
 
-    if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
-        // Subscribe to the newly-joined channel.
-        let ids = vec![channel_id];
-        let filters = crate::config::resolve_channel_filters(config, &ids, rules);
-        for (cid, filter) in filters {
-            if let Err(e) = relay.subscribe_channel(cid, filter).await {
-                tracing::warn!("setup-mode: failed to subscribe to new channel {cid}: {e}");
+    match action {
+        MembershipSubscriptionDecision::EnsureSubscribed => {
+            let ids = vec![channel_id];
+            let filters =
+                crate::config::resolve_channel_filters(context.config, &ids, context.rules);
+            let mut mutation_failed = false;
+            for (cid, filter) in filters {
+                if context
+                    .channel_info
+                    .prefetch_for_subscription(channel_id)
+                    .await
+                    .is_none()
+                {
+                    tracing::warn!(
+                        channel_id = %channel_id,
+                        "setup-mode: channel metadata unavailable before subscription; external DM delegation will fail closed"
+                    );
+                }
+                let replay_since = Some(buzz_event.event.created_at.as_secs());
+                if let Err(e) = relay
+                    .subscribe_channel_from(cid, filter, replay_since)
+                    .await
+                {
+                    tracing::warn!(
+                        "setup-mode: failed to ensure current member subscription {cid}: {e}"
+                    );
+                    mutation_failed = true;
+                } else {
+                    let already_tracked = context.subscribed_channel_ids.contains(&cid);
+                    context.subscribed_channel_ids.insert(cid);
+                    tracing::info!(
+                        already_tracked,
+                        "setup-mode: ensured current member channel {cid} subscription with replay"
+                    );
+                }
+            }
+            if mutation_failed {
+                SetupMembershipOutcome::Retry
             } else {
-                tracing::info!("setup-mode: subscribed to new channel {cid}");
+                SetupMembershipOutcome::Resolved
             }
         }
-    } else if kind_u32 == KIND_MEMBER_REMOVED_NOTIFICATION {
-        if let Err(e) = relay.unsubscribe_channel(channel_id).await {
-            tracing::warn!("setup-mode: failed to unsubscribe from channel {channel_id}: {e}");
+        MembershipSubscriptionDecision::EnsureUnsubscribed => {
+            ensure_setup_unsubscribed(relay, channel_id, context.subscribed_channel_ids).await
+        }
+        MembershipSubscriptionDecision::Retry => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                "setup-mode: no valid current kind:39002 head; retry requested"
+            );
+            SetupMembershipOutcome::Retry
         }
     }
 }
@@ -1043,6 +1255,166 @@ mod tests {
             !second,
             "replay of the same event-id must be rejected (dedup)"
         );
+    }
+
+    #[test]
+    fn setup_membership_stale_add_cannot_override_current_removal_snapshot() {
+        assert_eq!(
+            setup_membership_action(
+                KIND_MEMBER_ADDED_NOTIFICATION,
+                CurrentMembershipState::NonMember,
+                true,
+            ),
+            MembershipSubscriptionDecision::EnsureUnsubscribed,
+            "kind:44100 is only a trigger; current trusted kind:39002 removal is authoritative"
+        );
+    }
+
+    #[test]
+    fn setup_membership_stale_remove_cannot_override_current_member_snapshot() {
+        assert_eq!(
+            setup_membership_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                CurrentMembershipState::Member,
+                true,
+            ),
+            MembershipSubscriptionDecision::EnsureSubscribed,
+            "kind:44101 is only a trigger; current trusted kind:39002 membership is authoritative"
+        );
+        assert_eq!(
+            setup_membership_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                CurrentMembershipState::Unknown,
+                true,
+            ),
+            MembershipSubscriptionDecision::Retry,
+            "missing or malformed current state must not mutate setup subscriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_exhausted_remove_fails_closed_through_unsubscribe_path() {
+        assert_eq!(
+            setup_membership_retry_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                MembershipRetryDisposition::Consume,
+            ),
+            MembershipRetryAction::EnsureUnsubscribed
+        );
+        assert_eq!(
+            setup_membership_retry_action(
+                KIND_MEMBER_ADDED_NOTIFICATION,
+                MembershipRetryDisposition::Consume,
+            ),
+            MembershipRetryAction::Consume,
+            "an exhausted ADD must not grant setup-mode access"
+        );
+
+        let channel_id = Uuid::new_v4();
+        let (mut relay, mut unsubscribe_rx) = HarnessRelay::test_unsubscribe_pair();
+        let mut subscribed_channel_ids = HashSet::from([channel_id]);
+        assert_eq!(
+            ensure_setup_unsubscribed(&mut relay, channel_id, &mut subscribed_channel_ids,).await,
+            SetupMembershipOutcome::Resolved
+        );
+        assert_eq!(unsubscribe_rx.recv().await, Some(channel_id));
+        assert!(!subscribed_channel_ids.contains(&channel_id));
+    }
+
+    fn setup_member_snapshot_event(
+        relay: &nostr::Keys,
+        channel_id: Uuid,
+        members: &[(nostr::PublicKey, &str)],
+    ) -> nostr::Event {
+        let mut tags = vec![nostr::Tag::parse(["d", &channel_id.to_string()]).unwrap()];
+        tags.extend(
+            members.iter().map(|(pubkey, role)| {
+                nostr::Tag::parse(["p", &pubkey.to_hex(), "", *role]).unwrap()
+            }),
+        );
+        nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16),
+            "",
+        )
+        .tags(tags)
+        .sign_with_keys(relay)
+        .unwrap()
+    }
+
+    async fn setup_membership_rest_client(
+        response: serde_json::Value,
+    ) -> (RestClient, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let body = response.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: nostr::Keys::generate(),
+                auth_tag_json: None,
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn setup_membership_notifications_requery_current_signed_39002() {
+        let relay = nostr::Keys::generate();
+        let agent = nostr::Keys::generate().public_key();
+        let other = nostr::Keys::generate().public_key();
+        let channel_id = Uuid::new_v4();
+
+        let removed_head = setup_member_snapshot_event(&relay, channel_id, &[(other, "member")]);
+        let (removed_rest, removed_server) =
+            setup_membership_rest_client(serde_json::json!([removed_head])).await;
+        assert_eq!(
+            resolve_setup_membership_action(
+                &removed_rest,
+                channel_id,
+                &agent,
+                &relay.public_key(),
+                KIND_MEMBER_ADDED_NOTIFICATION,
+                true,
+            )
+            .await
+            .unwrap(),
+            MembershipSubscriptionDecision::EnsureUnsubscribed,
+            "a stale ADD trigger cannot override the current relay-signed removal head"
+        );
+        removed_server.await.unwrap();
+
+        let member_head = setup_member_snapshot_event(&relay, channel_id, &[(agent, "bot")]);
+        let (member_rest, member_server) =
+            setup_membership_rest_client(serde_json::json!([member_head])).await;
+        assert_eq!(
+            resolve_setup_membership_action(
+                &member_rest,
+                channel_id,
+                &agent,
+                &relay.public_key(),
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                true,
+            )
+            .await
+            .unwrap(),
+            MembershipSubscriptionDecision::EnsureSubscribed,
+            "a stale REMOVE trigger cannot override the current relay-signed member head"
+        );
+        member_server.await.unwrap();
     }
 
     // ── availability round-trip tests ─────────────────────────────────────────

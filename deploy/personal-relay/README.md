@@ -177,14 +177,84 @@ that job has no outputs and cannot upload proof. A fresh clean job fetches the
 GitHub-controlled run, job, and step conclusions, binds them to the exact
 protected workflow file and command contract, reruns only trusted fixtures, and
 alone scans and uploads the source-result proof. Candidate logs are not trusted
-or synthesized. The source-result v2 seal binds an exact 13-command contract.
-Its Mary-facing matrix includes
-`test_allowlist_accepts_explicit_external_pubkey` for a regular-channel member
-whose external pubkey is explicitly allowlisted, plus
-`test_allowlist_rejects_non_sibling_not_in_allowlist`,
-`test_owner_only_rejects_stranger_so_no_steer`, and
-`test_dm_rejects_allowlisted_external_pubkey` for the non-allowlisted,
-owner-only, and DM fail-closed cases. The control-plane conclusion proves the
+or synthesized. The source-result v6 seal binds this ordered, exact 55-command
+inventory (the workflow and receipt also bind every argv element):
+
+```text
+1.  buzz-admin-migrate
+2.  buzz-relay-workflow-owner-attribution
+3.  author_gate_tests::trusted_relay_workflow_uses_attributed_owner_for_author_gate
+4.  author_gate_tests::forged_workflow_marker_cannot_replace_actual_signer
+5.  author_gate_tests::relay_signed_non_workflow_event_cannot_replace_actual_signer
+6.  author_gate_tests::missing_trusted_relay_identity_fails_closed_to_actual_signer
+7.  author_gate_tests::invalid_signature_fails_closed_to_actual_signer
+8.  author_gate_tests::wrong_kind_fails_closed_to_actual_signer
+9.  author_gate_tests::duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer
+10. author_gate_tests::test_allowlist_accepts_explicit_external_pubkey
+11. author_gate_tests::test_allowlist_rejects_non_sibling_not_in_allowlist
+12. author_gate_tests::test_owner_only_rejects_stranger_so_no_steer
+13. author_gate_tests::test_dm_accepts_explicit_allowlisted_external_pubkey
+14. author_gate_tests::test_dm_rejects_allowlisted_external_pubkey_in_group
+15. author_gate_tests::test_dm_rejects_external_pubkey_absent_from_allowlist
+16. author_gate_tests::test_dm_rejects_stranger_under_anyone
+17. author_gate_tests::test_author_gate_resolver_caches_verified_immutable_dm_metadata
+18. author_gate_tests::test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off
+19. author_gate_tests::test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message
+20. relay::tests::nip11_identity_lookup_retries_boundedly_and_recovers
+21. dm::tests::relay_channel_metadata_verifier_is_strict_and_fail_closed
+22. handlers::side_effects::tests::immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations
+23. handlers::side_effects::tests::immutable_dm_discovery_tags_are_sorted_and_committed
+24. handlers::side_effects::tests::immutable_dm_reconciliation_matcher_rejects_unmarked_metadata
+25. nip11::tests::nip11_dev_fallback_identity_is_advertised_for_harness_verification
+26. tests::channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window
+27. tests::reconcile_replacement_bumps_past_trusted_wrong_d_and_ignores_wrong_signer
+28. dm::tests::immutable_dm_database_guards_reject_mutations_and_allow_create_dm
+29. dm::tests::relay_group_role_discovery_verifier_is_strict_and_fail_closed
+30. kind::tests::nip29_relay_authored_discovery_snapshots_are_relay_only
+31. handlers::ingest::tests::relay_authored_discovery_and_membership_triggers_are_rejected_from_client_ingest
+32. relay::tests::membership_discovery_rejects_forged_invalid_or_stale_snapshots
+33. relay::tests::merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata
+34. dm::tests::relay_membership_notification_verifier_is_strict_and_target_bound
+35. dm::tests::relay_channel_metadata_rejects_signed_nonempty_content
+36. relay::tests::current_membership_state_is_tri_state_and_stale_notification_safe
+37. relay::tests::merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata
+38. relay::tests::merge_discovered_channels_accepts_only_fully_verified_dm_metadata
+39. relay::tests::membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor
+40. setup_mode::tests::setup_membership_notifications_requery_current_signed_39002
+41. pool::tests::lazy_metadata_lookup_ignores_newer_wrong_signer_sibling
+42. pool::tests::lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid
+43. handlers::side_effects::tests::channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata
+44. handlers::side_effects::tests::channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata
+45. tests::reconcile_channels_repairs_missing_members_snapshot_with_valid_metadata
+46. dm::tests::create_dm_rejects_duplicate_participants_before_opening_transaction
+47. migration::tests::immutable_dm_migration_contract_is_embedded
+48. setup_mode::tests::setup_membership_stale_add_cannot_override_current_removal_snapshot
+49. setup_mode::tests::setup_membership_stale_remove_cannot_override_current_member_snapshot
+50. relay::tests::verified_member_requires_ensure_subscribe_despite_stale_outer_tracking
+51. relay::tests::membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable
+52. relay::tests::readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking
+53. relay::tests::exhausted_remove_fails_closed_but_add_waits_for_distinct_repair
+54. membership_removal_cleanup_tests::authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path
+55. setup_mode::tests::setup_exhausted_remove_fails_closed_through_unsubscribe_path
+```
+
+Commands 10-16 are the Mary-facing audience matrix: only an exact 1:1 DM may
+use the explicit external allowlist; group/unknown context, absent allowlist,
+owner-only, and `anyone` all fail closed. Commands 17-33 bind immutable-DM
+metadata caching and retry behavior, first-message replay, NIP-11 identity
+recovery, strict kind `39000` verification, relay mutation/discovery and
+reconciliation behavior, durable reconciliation scheduling, canonical admin
+replacement, live database guards, relay-only discovery kinds, and trusted
+metadata and membership discovery. Commands 34-55 bind strict membership
+notification targets, current-head and malformed-head handling, verified DM
+classification, replay-safe membership rechecks, cold-start metadata trust,
+runtime and admin reconciliation repair, duplicate-participant preflight,
+the embedded immutable-DM migration, stale add/remove safety, re-add
+subscription repair despite stale outer tracking, a bounded Unknown-state
+retry budget that still permits a distinct later re-add, background state
+recovery after a relay `CLOSED`, kind-aware terminal REMOVE handling, the full
+normal-mode unsubscribe/queue/session cleanup path, and setup-mode parity. The
+control-plane conclusion proves the
 protected commands exited successfully; the distinct code reviewer remains responsible for the
 honesty of candidate-owned test code. Protected validation executes only the
 trusted `main` verifier and creates a sealed receipt. A separate protected OIDC
@@ -369,26 +439,53 @@ idempotency, failure, and receipt gates pass. The support workflow remains
 disabled until same-thread Triage then Dumb It Down behavior is proven with a
 synthetic fixture.
 
+Both personal staging and personal production must set the provider environment
+variable `BUZZ_RECONCILE_CHANNELS=true` before Mary's acceptance begins. A
+missing, empty, or different value blocks release. Retain the provider configuration receipt and
+successful startup reconciliation evidence in the
+Gate 1 evidence; the checked-in `env.example` inventory alone is not proof of a
+deployed setting. Confirm the sweep used the expected durable relay key and
+community, repaired any missing, legacy, wrong-signer, or stale kind `39000`
+metadata, and completed before collecting Mary's DM evidence.
+
 Desktop acceptance has two stages. The pre-build staging receipt proves the
 approved relay, Gate 1, smoke, and control inputs, but it cannot prove behavior
 after the exact DMG is installed. After Justin separately approves installation
 of that exact staging DMG and before cutover, create a private evidence bundle
-that is short-lived plus a `personal-desktop-multi-user-acceptance/v1` manifest.
+that is short-lived plus a `personal-desktop-multi-user-acceptance/v2` manifest.
 The manifest binds the bundle, the exact DMG, attestation predicate, final v3 audit
 receipt, relay, channel, hosted-Buzz, identity, and eight-agent inventory records.
+For each agent it also binds recipient discovery and selection, an exact 1:1 DM
+opened by Mary with kind `41010`, the explicit-allowlist author-gate decision,
+the current relay-signed kind `39000` DM metadata, the current relay-signed kind
+`39002` membership snapshot, a distinct database invariant receipt, and two
+completed, continuously threaded kind `9` challenge/response turns. It also
+binds, per agent, one denied Mary-authored group-DM probe and one denied
+unauthorized-third-party exact 1:1 DM probe, each with a unique event, nonce,
+participant/channel receipt, policy-decision receipt, and 120-second no-turn
+receipt. The metadata and membership snapshot must be created and verified
+after the DM open and the DB invariant must be checked before the first
+challenge.
 Keep both the bundle and manifest private with no group or world permission
 bits, and human-review both. Do not commit either file or publish either one as
 a public Actions artifact. The checked-in example is poisoned with
 `example_only: true` and must be rejected.
 
 Run `validate-desktop-multi-user-acceptance.sh` with independently retained
-expected values, never values copied from the manifest. Its v1 summary checks
+expected values, never values copied from the manifest. Its resulting
+`personal-desktop-multi-user-acceptance-summary/v2` checks
 structure, descriptor-safe files, hashes, cross-bindings, and freshness. It does not authenticate
 the opaque bundle or event signatures. It rejects symlinks and same-inode
 manifest/bundle aliases, then uses a sealed private snapshot of the safely
 opened manifest for every later read. It also rejects an expiry with less than
 one hour left from current validation time. A passing summary says
 `manifest_claimed_all_agents_passed: true` and
+`manifest_claimed_all_dm_conversations_passed: true`, plus the deliberately
+qualified `manifest_claimed_all_dm_channels_current_and_safe: true` and
+`manifest_claimed_all_dm_negative_probes_passed: true`. It records exactly
+eight DM conversations, eight metadata events, eight membership snapshots,
+eight DB invariant checks, sixteen DM turns completed, and sixteen denied DM
+probes split evenly between group and unauthorized-third-party contexts, and says
 `manifest_contract_passed: true`, while it remains explicit that
 `evidence_bundle_authenticated: false` and `cutover_authorized: false`; it never
 emits an unqualified summary `all_agents_passed` field. The validator summary alone never authorizes
@@ -401,17 +498,60 @@ rerun the validator, and reject a summary-only handoff.
 Mary's production acceptance is a hard release blocker. Mary must complete it
 while signed in as her own identity, as a member of the personal relay and the
 regular test channel. She must discover and mention every authorized custom
-agent and have her exact 64-hex pubkey explicitly configured in each agent's
+agent. Retained discovery evidence must show the agent's verified NIP-OA kind
+`0` owner binding to Justin and the accepted owner-authored kind `30177`
+invocation policy, not merely a directory or synthetic row. Mary must have her
+exact 64-hex pubkey explicitly configured in each agent's
 `respond_to=allowlist` (the value is intentionally not recorded here). After quiescence and Justin's
 manual confirmation, every changed local runtime must be restarted and every
 provider-hosted runtime must be explicitly redeployed. Mary must then send a
 unique kind `9` challenge that has the addressed agent's pubkey as its exact sole
 `p` tag. The kind `9` same-thread response must have both root and parent set to
 that challenge and have Mary's pubkey as its exact sole `p` tag. After runtime
-application, each kind `9` DM denial probe must use a real, distinct per-agent DM
-channel and a continuous observation window covering the probe for at least 120 seconds
-with no turn or response. DMs remain owner/sibling-only and must fail
-closed for the externally allowlisted identity. Mary must never sign in as Justin
+application, Mary must discover and select each agent as a DM recipient, then
+open a distinct exact 1:1 DM herself. The kind `41010` open event must be authored
+by Mary with the agent as its exact sole `p` tag, and the participant set must be
+an exact lexicographically sorted two-key array containing only Mary and that
+agent. Before the first challenge, retain the latest accepted relay-signed kind
+`39000` metadata for that DM. It must have a valid signature by the expected
+relay, exactly one `d` tag equal to the canonical lowercase hyphenated channel
+UUID, exactly one `t=dm`, one each of the bare `private`, `hidden`, and `closed`
+markers, no `public` or `open` marker, and exactly two unique strictly sorted
+bare `p` tags for Mary and the agent. `dm_channel_sha256` is SHA-256 of the exact
+ASCII `d`-tag UUID with no newline. The metadata must also have exactly one
+`["buzz:dm-participants","v1","<commitment>"]` tag. Recompute that lowercase
+hex commitment as SHA-256 of the bytes `buzz:dm-participants:v1\0`, followed by
+one unsigned participant-count byte, followed by each sorted 32-byte x-only
+pubkey. Also retain the latest accepted relay-signed kind `39002` membership
+snapshot for the same canonical `d` tag. It must have a valid signature by the
+expected relay, be the current head, and contain exactly Mary and the agent as
+strictly sorted `p` entries with role `member` for both. Retain a separate
+database receipt proving the same channel remains an undeleted private DM with
+an immutable participant set and current membership equal to those same two
+keys. The database receipt must separately bind the stored
+`channels.participant_hash` and an independently recomputed SHA-256 of the
+concatenated sorted raw pubkeys; those two hashes must match. That database hash
+is intentionally different from the domain-and-count kind `39000` commitment.
+Recompute the metadata commitment independently from the same database
+participant keys and require it to match kind `39000`. The agent author gate must record
+`allowed_explicit_allowlist`. Mary must complete two kind `9` turns with that
+agent: turn one starts the thread, and turn two roots at turn one's challenge and
+parents turn one's response; each response roots at turn one's challenge and
+parents its own challenge. Every challenge targets only the agent and every
+response targets only Mary. Open, stale, unsigned, wrong-signer, wrong-`d`,
+public, unhidden, unclosed, unmarked, participant-substituted,
+commitment-invalid, membership-snapshot-invalid, raw-hash-invalid, or
+DB-invariant-failing channels block acceptance. After the positive turns, send
+one Mary-authored kind `9` invocation in a three-party DM containing Mary, that
+agent, and the independently retained unauthorized third party; retain the
+exact participant set and a `denied_group_dm` decision plus 120 seconds of no
+turn and no response. Then send one kind `9` invocation authored by that
+unauthorized third party in its exact 1:1 DM with the agent; retain
+`denied_not_allowlisted` plus the same no-turn/no-response interval. All
+negative probe channels, event IDs, nonces, and receipts must be unique and
+distinct from the positive evidence. Group or unknown DM contexts, unlisted
+external identities, and `anyone` mode still fail closed; only the exact
+explicit allowlist in an exact 1:1 DM grants Mary access. Mary must never sign in as Justin
 or share or receive Justin's credentials. Missing any one of these proofs blocks
 cutover; this is not advisory.
 
