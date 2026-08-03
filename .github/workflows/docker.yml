@@ -127,8 +127,8 @@ jobs:
               max-parallelism = 2
 
       - name: Log in to GHCR
-        # Skip on pull_request from forks — no GHCR creds, build-only.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        # Pull requests are build-only and must never write registry state.
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
@@ -380,7 +380,7 @@ jobs:
             [worker.oci]
               max-parallelism = 2
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
         with:
           registry: ghcr.io
