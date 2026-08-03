@@ -35,11 +35,16 @@ on:
     branches: [main]
     tags: ["chart-v[0-9]*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "deploy/charts/buzz/**"
       - "deploy/charts/buzz-push-gateway/**"
       - ".github/workflows/helm-chart.yml"
       - "ct.yaml"
+
+concurrency:
+  group: helm-chart-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Match docker.yml: deny-by-default, each job grants only what it needs.
 permissions: {}
@@ -55,6 +60,7 @@ env:
 jobs:
   lint-and-unittest:
     name: lint + unittest + render matrix
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
