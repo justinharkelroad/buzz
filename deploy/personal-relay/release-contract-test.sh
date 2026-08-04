@@ -37,7 +37,7 @@ provider_config="$provider_src/config.rs"
 
 validate_workflow_yaml() {
   local workflow=$1
-  ruby -rpsych - "$workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$workflow" <<'RUBY'
 path = ARGV.fetch(0)
 
 def reject(path, node, message)
@@ -84,7 +84,7 @@ RUBY
 }
 
 validate_workflow_action_references() {
-  ruby -rpsych - "$@" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$@" <<'RUBY'
 class ActionReferenceContractError < StandardError; end
 
 def require_action_reference(condition, message)
@@ -168,7 +168,7 @@ RUBY
 }
 
 validate_workflow_permissions() {
-  ruby -rpsych - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
 relay, gate1, desktop = ARGV
 expected = {
   relay => {
@@ -221,7 +221,7 @@ RUBY
 }
 
 validate_pr_image_workflow_permissions() {
-  ruby -rpsych - "$docker_workflow" "$sprig_workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$docker_workflow" "$sprig_workflow" <<'RUBY'
 docker_path, sprig_path = ARGV
 checkout_action = "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10"
 setup_buildx_action = "docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5"
@@ -799,7 +799,7 @@ RUBY
 }
 
 validate_release_flow() {
-  ruby -rpsych - "$relay_workflow" "$relay_dockerfile" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$relay_workflow" "$relay_dockerfile" <<'RUBY'
 path = ARGV.fetch(0)
 dockerfile_path = ARGV.fetch(1)
 workflow = Psych.safe_load_file(path, aliases: false)
@@ -1185,7 +1185,7 @@ RUBY
 }
 
 validate_desktop_flow() {
-  ruby -rpsych -ropen3 - "$desktop_workflow" "$desktop_volume_validator" "$desktop_audit_validator" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych -ropen3 - "$desktop_workflow" "$desktop_volume_validator" "$desktop_audit_validator" <<'RUBY'
 path = ARGV.fetch(0)
 volume_validator_path = ARGV.fetch(1)
 audit_validator_path = ARGV.fetch(2)
@@ -2299,7 +2299,7 @@ RUBY
 }
 
 validate_gate1_flow() {
-  ruby -rpsych - "$gate1_workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$gate1_workflow" <<'RUBY'
 path = ARGV.fetch(0)
 workflow = Psych.safe_load_file(path, aliases: false)
 workflow_text = File.read(path)
@@ -2660,7 +2660,7 @@ RUBY
 }
 
 validate_main_protection_callers() {
-  ruby -rpsych - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
 ARGV.each do |path|
   workflow = Psych.safe_load_file(path, aliases: false)
   calls = workflow.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }
@@ -2675,7 +2675,7 @@ RUBY
 }
 
 validate_workflow_run_syntax() {
-  ruby -rpsych -ropen3 - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych -ropen3 - "$relay_workflow" "$gate1_workflow" "$desktop_workflow" <<'RUBY'
 ARGV.each do |path|
   workflow = Psych.safe_load_file(path, aliases: false)
   workflow.fetch("jobs").each do |job_name, job|
@@ -2695,7 +2695,7 @@ validate_trivy_policy_inputs() {
   local release_yaml=$1
   local gate1_yaml=$2
   local desktop_yaml=$3
-  ruby -rpsych - "$release_yaml" "$gate1_yaml" "$desktop_yaml" <<'RUBY'
+  ruby -E UTF-8:UTF-8 -rpsych - "$release_yaml" "$gate1_yaml" "$desktop_yaml" <<'RUBY'
 release_yaml, gate1_yaml, desktop_yaml = ARGV
 trivy_action = "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25"
 expected_outputs = {
@@ -3066,9 +3066,12 @@ bash -n "$desktop_audit_validator_test"
 bash -n "$desktop_multi_user_acceptance_validator"
 bash -n "$desktop_multi_user_acceptance_test"
 [[ -f "$desktop_audit_validator_test" && -r "$desktop_audit_validator_test" && -x "$desktop_audit_validator_test" && ! -L "$desktop_audit_validator_test" ]]
-[[ $(grep -Fc 'case_root=$(clone_valid_fixture ' "$desktop_audit_validator_test") -eq 9 ]]
+[[ $(grep -Fc 'case_root=$(clone_valid_fixture ' "$desktop_audit_validator_test") -eq 12 ]]
 grep -Fq 'desktop attestation audit evidence passed' "$desktop_audit_validator_test"
 for desktop_audit_mutation in \
+  ledger-schema-downgrade \
+  ledger-reviewer-controls \
+  ledger-non-owner-authorization \
   remount-hash-mismatch \
   remount-semantic-bypass \
   remount-schema-downgrade \
