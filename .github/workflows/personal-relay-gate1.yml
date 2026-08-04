@@ -435,7 +435,7 @@ jobs:
               and .event == "workflow_dispatch"
               and .head_sha == $workflow_sha
               and .head_branch == "main"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
               and .repository.full_name == "justinharkelroad/buzz"
             ' /tmp/personal-relay-gate1-source-run.raw.json >/dev/null
           jq '{
@@ -1382,7 +1382,7 @@ jobs:
               and .event == "workflow_dispatch"
               and .head_sha == $workflow_sha
               and .head_branch == "main"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
               and .repository.full_name == "justinharkelroad/buzz"
               and .actor.login == "justinharkelroad"
               and .triggering_actor.login == "justinharkelroad"
@@ -1593,7 +1593,7 @@ jobs:
               and .event == "workflow_dispatch"
               and .head_sha == $source_sha
               and .head_branch == "main"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
               and .repository.full_name == "justinharkelroad/buzz"
             ' "$source_proof/source-test-run.json" >/dev/null
           [[ "$(sha256sum "$source_proof/source-test-job.json" | awk '{print $1}')" \
@@ -1641,7 +1641,7 @@ jobs:
               and .conclusion == "success"
               and .head_sha == $source_sha
               and .head_branch == "main"
-              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .path == ".github/workflows/personal-relay-image.yml"
               and .repository.full_name == "justinharkelroad/buzz"
             ' /tmp/personal-relay-release-run.json >/dev/null
 
@@ -2096,7 +2096,7 @@ jobs:
               and .head_branch == "main"
               and .head_sha == $source_sha
               and .event == "workflow_dispatch"
-              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .path == ".github/workflows/personal-relay-image.yml"
               and .repository.full_name == $repository
               and .actor.login == "justinharkelroad"
               and .triggering_actor.login == "justinharkelroad"
@@ -2248,7 +2248,7 @@ jobs:
               and .run_attempt == 1
               and .head_sha == $workflow_sha
               and .head_branch == "main"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
               and .actor.login == "justinharkelroad"
               and .triggering_actor.login == "justinharkelroad"
               and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}

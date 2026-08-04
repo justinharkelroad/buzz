@@ -292,7 +292,7 @@ jobs:
               and .head_branch == "main"
               and .head_sha == $sha
               and .event == "workflow_dispatch"
-              and .path == ".github/workflows/personal-desktop-release.yml@main"
+              and .path == ".github/workflows/personal-desktop-release.yml"
               and .repository.full_name == $repository
               and .actor.login == "justinharkelroad"
               and (.actor.id | type == "number" and . >= 1 and floor == .)
@@ -519,7 +519,7 @@ jobs:
               and .event == "workflow_dispatch"
               and .status == "completed"
               and .conclusion == "success"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
             ' /tmp/personal-relay-gate1-workflow-run.json >/dev/null
           jq -S '{
               id,
@@ -3542,7 +3542,7 @@ jobs:
               and .event == "workflow_dispatch"
               and .status == "completed"
               and .conclusion == "success"
-              and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .path == ".github/workflows/personal-relay-gate1.yml"
             ' "$authorization/personal-relay-gate1-workflow-run.json" >/dev/null
           export DOCKER_CONFIG=/tmp/personal-desktop-attest-gate1-docker-config
           mkdir -p "$DOCKER_CONFIG"
@@ -3812,7 +3812,7 @@ jobs:
               and .head_branch == "main"
               and .head_sha == $sha
               and .event == "workflow_dispatch"
-              and .path == ".github/workflows/personal-desktop-release.yml@main"
+              and .path == ".github/workflows/personal-desktop-release.yml"
               and .repository.full_name == $repository
               and .actor.login == "justinharkelroad"
               and .triggering_actor.login == "justinharkelroad"
