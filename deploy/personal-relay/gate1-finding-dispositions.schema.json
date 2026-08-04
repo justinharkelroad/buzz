@@ -28,7 +28,7 @@
     "evidence_reference"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "approval_type": { "const": "personal-relay-gate1-finding-dispositions" },
     "repository": { "const": "justinharkelroad/buzz" },
     "source_sha": { "$ref": "#/$defs/gitSha" },

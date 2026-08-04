@@ -1,11 +1,12 @@
 # Personal Buzz Relay and Desktop Staging Release
 
-This runbook produces reviewed artifacts for Justin's personal Buzz staging
-environment. It does not authorize a Railway deployment, desktop installation,
-production cutover, hosted history migration, or retirement of hosted Buzz.
+This runbook produces owner-authorized artifacts for Justin's personal Buzz
+staging environment. It does not authorize a Railway deployment, desktop
+installation, production cutover, hosted history migration, or retirement of
+hosted Buzz.
 
 The release invariant preserves exact candidate source parity while allowing a
-later protected verifier commit to contain the reviewed approval:
+later protected verifier commit to contain Justin's recorded authorization:
 
 ```text
 relay publication input source_sha == relay publication github.sha == relay ledger source_sha
@@ -27,20 +28,21 @@ inspection.
 - Relay pull requests build `runtime-personal` without package-write or OIDC
   permission.
 - Same-repository write access is a trust boundary for GitHub Actions. Keep it
-  limited to Justin. A distinct environment reviewer may have read or triage
-  access, but must not receive repository write access. The credential-free PR
-  image jobs and their structural contracts prevent accidental privilege drift;
-  they cannot defend against a writer who edits both a workflow and its
-  candidate-side validator before the PR runs.
-- Manual relay publication begins with a clean, protected release-approval job.
-  That job alone can read the exact approved candidate SHA and administrator-
-  bypass receipt hash; candidate tests and registry/OIDC jobs do not hold the
+  limited to Justin. The solo-owner contract requires no collaborator, code
+  reviewer, or environment reviewer. The credential-free PR image jobs and
+  their structural contracts prevent accidental privilege drift; they cannot
+  defend against the repository owner intentionally editing both a workflow and
+  its candidate-side validator. Justin accepts and owns that residual risk.
+- Manual relay publication begins with a clean, protected owner-authorization
+  job. That job alone can read the exact authorized candidate SHA; candidate
+  tests and registry/OIDC jobs do not hold the
   `personal-relay-release` environment.
 - Relay publication makes a best-effort create-only candidate marker, but never
   reads that mutable tag to determine the release digest. The digest comes from
   Buildx create metadata and a raw, hash-verified merged index. Its ledger
   remains candidate-only and `deployment_eligible: false` until a separate
-  protected Gate 1 review accepts every remaining HIGH and CRITICAL finding.
+  protected Gate 1 disposition by Justin accepts every remaining HIGH and
+  CRITICAL finding.
 - The desktop workflow is unsigned and staging-only. It consumes an unexpired,
   custom-attested Gate 1 receipt for the exact relay digest before checking out
   or building the approved source.
@@ -51,20 +53,21 @@ inspection.
   and hash-bound live branch metadata, effective rules, and sanitized applicable
   ruleset details for their exact verifier SHA. The qualifying active branch
   ruleset must be repository-sourced, have no bypass actors, and contain the
-  complete policy. An environment branch allowlist alone is not branch
-  protection.
+  complete policy. The branch evidence also proves that GitHub's separate
+  classic `required_pull_request_reviews` protection is absent; a configured
+  classic review rule fails closed. An environment branch allowlist alone is
+  not branch protection.
 
-At the time this hardening change was prepared, the fork reported `main` as
-unprotected and neither `personal-relay-gate1` nor `personal-staging` existed.
-These workflows are therefore intentionally fail-closed. Creating the
-environments, protecting `main`, adding a distinct trusted reviewer, and
-disabling administrator bypass are later settings operations requiring separate
-authorization; this code change performs none of them.
+The three GitHub environments are retained for job isolation, secret and
+variable scoping, exact-SHA authorization, and a `main`-only deployment branch
+policy. Their required-reviewer lists must be empty. Protecting `main` and
+creating or updating the environments are settings operations that require
+Justin's authorization; no collaborator is part of the contract.
 
 ## Exact source preparation
 
-Before requesting artifacts, create a reviewed candidate commit and run the
-repository gates required by `AGENTS.md`. At minimum, the release evidence must
+Before requesting artifacts, create an owner-selected candidate commit and run
+the repository gates required by `AGENTS.md`. At minimum, the release evidence must
 include these exact workflow security tests:
 
 ```bash
@@ -107,18 +110,15 @@ Configure:
 | Location | Name | Contract |
 |---|---|---|
 | Protected `personal-relay-release` environment variable | `PERSONAL_APPROVED_RELAY_SHA` | Exact 40-character candidate SHA |
-| Protected `personal-relay-release` environment variable | `PERSONAL_RELAY_RELEASE_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256` | Exact SHA-256 of the separate human settings receipt proving administrator bypass is disabled |
 | Repository secret | `PERSONAL_RULESET_EVIDENCE_TOKEN` | Admin-owned fine-grained PAT scoped only to `justinharkelroad/buzz`, with read-only Metadata and Administration permission; never grant write permission |
 
-Protect `personal-relay-release` with exactly one configured reviewer of type
-User, enable
-self-review prevention, disable administrator bypass, and configure exactly one
-custom deployment branch policy named `main`. Exactly one configured User must
-approve the run, and that reviewer must differ from both the actor and triggering
-actor. If GitHub exposes `can_admins_bypass`, it must be `false`; if it does not,
-the sealed record says `not-exposed`. The 64-hex settings-receipt hash is always
-required in either case. `PERSONAL_APPROVED_RELAY_SHA` is an independent
-approval record, not a second copy typed into the workflow input.
+Configure `personal-relay-release` with no required reviewers and exactly one
+custom deployment branch policy named `main`.
+The environment remains a protected variable and job-isolation boundary; it is
+not a human approval queue. `PERSONAL_APPROVED_RELAY_SHA` is Justin's
+independently recorded, explicit
+authorization for one exact candidate, not a second copy typed into the
+workflow input.
 
 `PERSONAL_RULESET_EVIDENCE_TOKEN` exists only because the normal workflow token
 can hide `bypass_actors` on the ruleset-detail endpoint. The workflow fail-closes
@@ -131,7 +131,7 @@ seals `ghcr.io/justinharkelroad/buzz-relay-personal` and the deterministic
 `sha-<40-character-source-sha>` candidate marker. Every push, tag mutation, and
 OIDC guard exact-compares those sealed target fields before acting.
 
-Request publication from the exact reviewed commit on protected `main`:
+Request publication from the exact owner-authorized commit on protected `main`:
 
 ```bash
 gh workflow run personal-relay-image.yml \
@@ -146,14 +146,14 @@ The workflow:
 1. Requires the exact `PUBLISH_PERSONAL_RELAY` confirmation, protected `main`,
    fresh run attempt 1, `source_sha`, `github.sha`, and the protected
    `PERSONAL_APPROVED_RELAY_SHA` to agree.
-2. Runs a fresh `release-approval` job before candidate tests. The clean job
-   executes no candidate source, requires the protected environment review, and
+2. Runs a fresh owner-authorization job before candidate tests. The clean job
+   executes no candidate source, requires the protected environment, and
    captures the live `main` branch/effective rules/rulesets, normalized
-   environment config with exactly one User reviewer, exactly one
-   `{id,node_id,name}` branch policy for `main`,
-   sanitized approval history, immutable run actors/path, the exact configured
-   User reviewer, and the administrator-bypass receipt hash.
-3. Secret-scans and uploads those nine immutable records, then binds the
+   environment config with an empty reviewer list, exactly one
+   `{id,node_id,name}` branch policy for `main`, immutable run actor/path, and
+   Justin's exact-SHA authorization. The actor and triggering actor must both be
+   the repository owner `justinharkelroad`.
+3. Secret-scans and uploads those immutable records, then binds the
    artifact by ID, run, source/run/attempt-qualified name, digest, and expiry.
    Candidate tests and both mutation jobs exact-download and revalidate it.
 4. Fails before building if `sha-<full-sha>` already exists in GHCR.
@@ -173,8 +173,8 @@ The workflow:
    and require a separate protected disposition before deployment eligibility.
 9. Immediately before each platform push, the manifest/tag mutation, and
    provenance OIDC, re-fetches and byte-compares the live protected-main,
-   environment, normalized branch-policy, approval-history, run-identity, and
-   reviewer records to the sealed approval artifact. A remote setting can still
+   environment, normalized branch-policy, run-identity, and owner-authorization
+   records to the sealed authorization artifact. A remote setting can still
    change after a recheck and before a network mutation completes; eliminating
    that unavoidable network boundary requires an external transactional policy
    system.
@@ -212,7 +212,7 @@ absence twice and never intentionally moves a preexisting marker. Registries do
 not provide an atomic create-only tag operation, so the marker remains untrusted
 and is never used for digest resolution or deployment. A failure after untagged
 platform manifests are pushed does not make them eligible. A failure after the
-candidate tag is created requires a new reviewed recovery decision.
+candidate tag is created requires a new explicit decision from Justin.
 Even a successful run publishes only a candidate artifact. It does not grant
 deployment eligibility or authorize staging.
 
@@ -224,7 +224,7 @@ descriptor chain, SBOM, scans, and provenance passed these gates is eligible.
 When changing a frontend, base, Buildx, or BuildKit pin, inspect the replacement
 multi-platform index with `docker buildx imagetools inspect`, verify AMD64 and
 ARM64 coverage, update the workflow/Dockerfile and structural contract in the
-same reviewed pull request, and rerun the complete release gate.
+same protected pull request, and rerun the complete release gate.
 
 The ledger's only deployment identity is:
 
@@ -246,13 +246,14 @@ gh attestation verify \
 
 Keep the full JSON and inspect each
 `verificationResult.statement.predicate`. A successful cryptographic
-verification does not replace source review or the exact-candidate gate.
+verification does not replace Justin's source review or the exact-candidate
+gate.
 
 ## Protected Gate 1 disposition receipt
 
 The successful relay publication artifact is deliberately candidate-only. To
-prepare a review, first query the exact successful run and artifact through the
-GitHub API. Record the run ID and attempt plus the artifact ID, name, REST
+prepare Justin's disposition, first query the exact successful run and artifact
+through the GitHub API. Record the run ID and attempt plus the artifact ID, name, REST
 `digest`, and `expires_at`. Download the archive, verify its digest, extract it
 without links or unsafe paths, then generate the complete disposition template:
 
@@ -268,14 +269,16 @@ bash ./deploy/personal-relay/gate1-receipt.sh prepare \
 ```
 
 The generated file enumerates every remaining HIGH and CRITICAL finding from
-both architecture image and SPDX reports. A reviewer must fill every row with a
-decision, substantive rationale, timestamp, evidence reference, and immutable
-GitHub identity `{login,id,node_id}`. Accepted risk requires an unexpired
+both architecture image and SPDX reports. Justin must fill every row with a
+decision, substantive rationale, timestamp, evidence reference, and his
+immutable GitHub identity `{login,id,node_id}`. The existing `approved_by` and
+`reviewed_by` fields are owner-authored audit fields; they do not represent a
+GitHub environment reviewer or collaborator. Accepted risk requires an unexpired
 per-finding deadline. The top-level eligibility deadline may not exceed 90 days,
 any accepted-risk deadline, or the exact release artifact expiration.
 
-Commit the completed non-secret approval through a separately reviewed PR at
-this deterministic path on `main`:
+Commit the completed non-secret owner authorization through the protected PR
+flow at this deterministic path on `main`:
 
 ```text
 deploy/personal-relay/gate1-approvals/<release-source-sha>-<image-digest-hex>.json
@@ -287,10 +290,11 @@ Do not store the full approval in an environment variable. Canonicalize it:
 bash ./deploy/personal-relay/canonical-json-sha256.sh approval.json
 ```
 
-Configure `personal-relay-gate1` with at least one required reviewer,
-`prevent_self_review: true`, and exactly one custom deployment branch policy for
-`main`. Configure these non-secret protected environment variables with exact
-values:
+Configure `personal-relay-gate1` with no required reviewers and exactly one
+custom deployment branch policy for `main`. The environment scopes the exact
+authorization variables and isolates the receipt job; it does not delegate
+release authority. Configure these non-secret protected environment variables
+with exact values:
 
 | Name | Value |
 |---|---|
@@ -300,23 +304,26 @@ values:
 
 Protect repository `main` independently of that environment policy. One active
 repository-sourced ruleset with an empty bypass-actor list must prevent deletion
-and non-fast-forward updates, require a pull request with at least one approval,
-dismiss stale approvals, require approval of the last push by someone else,
-require review-thread resolution, and require the strict status check context
-`Gate 1 receipt contract` from GitHub Actions application ID `15368`. Gate 1
+and non-fast-forward updates, require the pull-request flow with zero required
+approvals and no last-push approval, require review-thread resolution, and
+require the strict status check context `Gate 1 receipt contract` from GitHub
+Actions application ID `15368`. Gate 1
 captures the exact branch response, normalized effective rules, and sanitized
 details for every applicable ruleset; validates them against its verifier SHA;
-and includes all three hashes in the receipt. A required workflow or unrelated
-status check does not satisfy this contract.
+and includes all three hashes in the receipt. The hashed branch record includes
+`classic_required_pull_request_reviews: false`; only an authoritative `404`
+from GitHub's classic-review endpoint establishes that state. A required
+workflow, required deployment, additional status check, or classic review rule
+does not satisfy this contract.
 
 GitHub's required-status rule binds the context and GitHub Actions application,
 but it cannot bind that context to this exact workflow file in a personal
-repository. A different Actions job could reuse the same name. The distinct
-reviewer and last-push approval are therefore part of the trust boundary: the
-reviewer must inspect changes to every workflow and reject any additional job
-that emits `Gate 1 receipt contract`. An organization-level immutable required
-workflow or equivalent external check identity would be required to remove this
-platform limitation.
+repository. A different Actions job could reuse the same name. Under this
+solo-owner contract, Justin is solely responsible for inspecting workflow
+changes and preventing any additional job from emitting `Gate 1 receipt
+contract`. No second person is claimed as a mitigation. An organization-level
+immutable required workflow or equivalent external check identity would be
+required to remove this platform limitation.
 
 Dispatch a fresh attempt from the protected `main` ref:
 
@@ -420,12 +427,12 @@ and setup-mode parity.
 
 The clean job never accepts or fabricates candidate test logs. This proves that GitHub recorded the
 protected test step as successful, not that candidate-owned test code is
-intrinsically honest; distinct review of the last push remains part of the trust
-boundary. Protected validation runs only trusted `main` verifier code without
+intrinsically honest; Justin's solo-owner review of the exact change remains
+part of the trust boundary. Protected validation runs only trusted `main` verifier code without
 OIDC; and a fresh protected receipt-only job receives OIDC solely to custom
 attest the canonical receipt against the exact merged image digest. Every proof
 handoff is downloaded by artifact ID and verified against its exact archive
-digest. Run attempt 1, immutable triggering/reviewer IDs, the protected branch
+digest. Run attempt 1, immutable owner actor IDs, the protected branch
 policy, actual trusted fixture and runtime logs, raw secret reports, raw release
 evidence, and artifact expirations are all fail-closed. Immediately before
 OIDC, the receipt job re-fetches live main, effective rules, rulesets,
@@ -445,8 +452,8 @@ repository and do not use a branch, version, or SHA tag as the deployment
 source.
 
 Do not promote solely because the artifact workflow passed. First complete the
-separate protected Gate 1 review above. The protected workflow verifies the
-human-reviewed disposition file and issues a custom-attested receipt that
+separate protected Gate 1 owner authorization above. The protected workflow
+verifies Justin's disposition file and issues a custom-attested receipt that
 changes `deployment_eligible` from false to true for only this exact digest.
 
 Compare the dashboard to
@@ -480,15 +487,16 @@ Staging must prove:
 
 Copy the structure in
 `deploy/personal-relay/smoke-approved-origin.example.json` into a protected
-evidence location. A reviewer, in a separate review step, records:
+evidence location. Justin records:
 
 - `environment: personal-staging`.
 - The exact staging HTTPS origin.
 - The offline-derived staging relay pubkey.
 - Hosted Buzz and personal-production HTTPS origins as forbidden.
-- Reviewer, timestamp, and evidence reference.
+- Justin's owner identity, timestamp, and evidence reference.
 
-Do not create the record and run the smoke test as one self-approved operation.
+The record is an explicit, auditable owner authorization for the exact staging
+origin. It is not an environment review and requires no collaborator.
 Run:
 
 ```bash
@@ -508,31 +516,24 @@ Configure only these variables in the protected `personal-staging` environment:
 |---|---|
 | `PERSONAL_DESKTOP_PRODUCT_NAME` | Owned visible base product name; staging app adds `Staging` |
 | `PERSONAL_DESKTOP_BUNDLE_ID` | Owned reverse-domain base identifier; staging app adds `.staging` |
-| `PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON` | Canonical reviewed JSON linking staging origins, deployed relay digest, relay pubkey, forbidden origins, and smoke proof |
-| `PERSONAL_STAGING_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256` | SHA-256 of the separate human settings receipt proving administrator bypass is disabled |
+| `PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON` | Canonical owner-authorized JSON linking staging origins, deployed relay digest, relay pubkey, forbidden origins, and smoke proof |
 
 Do not configure Apple certificates, notarization credentials, updater private
 keys, updater public keys, or independent relay URL overrides for this workflow.
 
 Configure the environment itself with all of these controls before dispatch:
 
-- At least one trusted GitHub user reviewer who is distinct from both the
-  triggering actor and current actor. A second trusted collaborator is required
-  when Justin triggers the run.
-- `prevent_self_review: true`.
-- Administrator bypass disabled in the environment settings.
+- No required reviewers. No collaborator or second human is part of this lane.
 - Custom deployment branches enabled, protected branches disabled, and exactly
   one branch policy of type `branch` named `main`.
 
 The workflow reads and retains the live environment configuration, exact branch
-policy list, sanitized approval history, and run identities. The staging
-receipt's `approved_by` is the immutable object `{login,id,node_id}` and must
-exactly match both a configured user reviewer and an approved environment review
-while differing from both run actors. The GitHub review-history API does not
-include an approval timestamp, so it proves approval state and immutable
-identity but not the receipt time. The receipt time is independently required
-to be strict UTC RFC3339 and the workflow enforces
-`smoke_completed_at <= approved_at <= evaluated_at`.
+policy list, and run identities. The staging receipt's `authorized_by` is the
+immutable owner object `{login,id,node_id}` and must exactly identify Justin and
+match the repository owner actor recorded for the run. It is an owner-authored
+audit field, not an environment-review event. The receipt time is required to
+be strict UTC RFC3339 and the workflow enforces
+`smoke_completed_at <= authorized_at <= evaluated_at`.
 The receipt accepts only the documented top-level keys; extra fields are
 rejected so unrelated or secret-bearing data cannot enter the sealed artifact.
 
@@ -545,27 +546,17 @@ outputs rather than through `GITHUB_ENV`; the base product and bundle variables
 exist only in this pre-candidate step. The verifier then seals a separate
 authorization artifact containing the Gate 1 receipt, bundle, run and artifact
 metadata, the build contract, both protected-main evidence sets, the canonical
-staging receipt, and the staging environment, policy, approval, and run-identity
-evidence. Its exact artifact ID, name, run ID, REST digest, and expiration become
+staging receipt, and the staging environment, policy, owner authorization, and
+run-identity evidence. Its exact artifact ID, name, run ID, REST digest, and expiration become
 immutable job outputs. Candidate build steps cannot replace this authorization
 boundary with later workspace or `/tmp` files.
 
-GitHub's environment API may omit the administrator-bypass setting. If it
-exposes `can_admins_bypass`, the workflow requires `false`; otherwise the ledger
-records `not-exposed`, and a human settings receipt showing administrator bypass
-disabled remains required. Put that receipt's exact SHA-256 in both the staging
-deployment receipt and protected
-`PERSONAL_STAGING_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256` variable; the workflow
-requires an exact match and carries it through the sealed authorization and
-desktop ledger. Do not interpret `not-exposed` as proof that bypass is disabled.
-
 Create the receipt from
 `deploy/personal-relay/staging-deployment-receipt.example.json` only after the
-digest-qualified relay is deployed and the independently approved smoke test
+digest-qualified relay is deployed and the owner-authorized smoke test
 passes. It must contain:
 
 - Exact staging HTTPS and WSS origins.
-- The exact SHA-256 of the separate human administrator-bypass settings receipt.
 - Independently recorded hosted and personal-production HTTPS origins, both in
   `forbidden_origins`.
 - The actual Railway digest-qualified relay image, matching the relay ledger.
@@ -574,10 +565,10 @@ passes. It must contain:
   attestation bundle SHA-256.
 - The offline-derived relay pubkey.
 - The smoke approval record SHA-256 and passing timestamp.
-- Immutable GitHub reviewer object `{login,id,node_id}`, approval timestamp, and
-  evidence reference.
+- Immutable GitHub owner object `{login,id,node_id}`, authorization timestamp,
+  and evidence reference. The object must identify Justin.
 
-A reviewer creates the canonical hash separately:
+Justin creates the canonical hash:
 
 ```bash
 bash ./deploy/personal-relay/canonical-json-sha256.sh approved-staging-deployment.json
@@ -624,7 +615,7 @@ The workflow queries the referenced run and requires:
 - The protected deployment receipt hash matches the dispatch input, names the
   same digest-qualified relay image, and identifies distinct staging, hosted,
   and personal-production origins.
-- The receipt records the relay pubkey and independently approved smoke proof.
+- The receipt records the relay pubkey and Justin's explicit smoke authorization.
 - The downloaded Gate 1 artifact contains the exact historical protected-main
   branch metadata, normalized effective rules, and sanitized applicable
   repository-ruleset details whose hashes appear in the receipt; the desktop
@@ -634,9 +625,9 @@ The workflow queries the referenced run and requires:
 - The current desktop verifier independently captures and validates its own
   protected-main branch metadata, effective rules, and sanitized applicable
   ruleset details for the current `github.sha`, with the same no-bypass rule.
-- The live `personal-staging` configuration, exact `main` branch policy,
-  sanitized approval history, and immutable run actors match the receipt and
-  are hash-bound into the desktop ledger.
+- The live `personal-staging` configuration, empty required-reviewer list, exact
+  `main` branch policy, and immutable owner run actors match the receipt and are
+  hash-bound into the desktop ledger.
 
 Only after those checks does the build job replace the verifier checkout with
 the exact Gate 1 `source_sha` and build. The unsigned, updater-disabled DMG
@@ -644,8 +635,8 @@ embeds all six sidecars built from that same source: `buzz`, `buzz-acp`,
 `buzz-agent`, `buzz-backend-kubernetes`, `buzz-dev-mcp`, and
 `git-credential-nostr`. Its ledger records the distinct desktop verifier SHA,
 exact staging product name and bundle identifier, receipt-derived relay origins,
-build-contract hash, administrator-bypass settings receipt hash, the exact
-sidecar manifest, and the Gate 1 run/artifact/receipt hashes and expirations.
+build-contract hash, owner-authorization evidence, the exact sidecar manifest,
+and the Gate 1 run/artifact/receipt hashes and expirations.
 The build job publishes two immutable same-run artifacts: separately sealed
 authorization evidence and an exact ten-file candidate root containing one DMG,
 the six target-qualified sidecars, the checksum file, sidecar manifest, and
@@ -694,7 +685,7 @@ does not mount the DMG, invoke candidate code, or run a third-party scanner.
 It depends on `build`, `inspect`, and `remount`; exact-downloads the candidate,
 authorization, inspection, immutable mounted-volume, and independent-remount
 artifacts; and independently revalidates the complete ledger, Gate 1 custom
-attestation, protected-main evidence, staging controls, reviewer separation,
+attestation, protected-main evidence, staging controls, solo-owner authorization,
 candidate hashes, six-sidecar manifest, inspection receipt, full-volume
 metadata/projection, zero-secret reports, and fresh-remount receipt. It
 constructs the predicate anew from verified values. The durable predicate binds
@@ -733,9 +724,9 @@ Trivy reports, uses `diff`/`cmp` to prove every scan root remains byte-identical
 to the immutable candidate, raw volume projection, attestation inputs, remount
 receipt, and freshly regenerated independent verification, then runs the
 protected cross-binding validator. That validator consumes expectations schema
-`personal-desktop-attestation-audit-expectations/v2` and emits summary schema
-`personal-desktop-attestation-audit-summary/v2`. The job seals audit receipt
-schema `personal-desktop-staging-attestation-audit/v3` and uploads exactly seven
+`personal-desktop-attestation-audit-expectations/v3` and emits summary schema
+`personal-desktop-attestation-audit-summary/v3`. The job seals audit receipt
+schema `personal-desktop-staging-attestation-audit/v4` and uploads exactly seven
 files: that receipt, three scan reports, regenerated independent verification,
 the remount receipt, and the cross-binding summary.
 
@@ -764,7 +755,8 @@ approves all of these together:
 - Tauri updater key custody, exact feed origin and path, signature verification,
   publication, rollout, and rollback policy.
 - `buzz://` deep-link coexistence with installed Block Buzz.
-- Protected production environment reviewers and secret-scoping design.
+- Protected production environment isolation, secret-scoping, main-only policy,
+  and exact-SHA owner-authorization design.
 
 Removing the incomplete production lane is intentional. An unsigned staging DMG
 is never production-eligible, regardless of source or relay parity.
@@ -781,8 +773,8 @@ records. Keep workflows disabled through individual authorization, sequence,
 idempotency, retry, and failure gates. Keep support disabled until same-thread
 Triage then Dumb It Down proof passes with a synthetic fixture.
 
-Gate 9 is a human stop. No production relay promotion, desktop installation,
-cutover, DNS or traffic change, or Agency Brain destination change occurs until
+Gate 9 is Justin's explicit owner stop. No production relay promotion, desktop
+installation, cutover, DNS or traffic change, or Agency Brain destination change occurs until
 Justin explicitly approves it. Do not import or replay hosted messages,
 workflow runs, audits, media, repositories, or historical support tickets. Do
 not dual-send one logical Agency Brain event.
@@ -839,8 +831,8 @@ from the validator's current time, not merely one hour after the recorded
 completion. It deliberately does not authenticate the opaque bundle, verify
 event signatures, or convert receipt hashes into proof.
 
-The resulting `personal-desktop-multi-user-acceptance-summary/v2` is only a
-review aid. A passing summary uses the deliberately qualified flags
+The resulting `personal-desktop-multi-user-acceptance-summary/v2` is only an
+owner review aid. A passing summary uses the deliberately qualified flags
 `manifest_claimed_all_agents_passed: true` and
 `manifest_claimed_all_dm_conversations_passed: true`, plus
 `manifest_claimed_all_dm_channels_current_and_safe: true` and
@@ -851,7 +843,7 @@ group-DM probes, and eight denied unauthorized-third-party probes, and retains
 `manifest_contract_passed: true`, while retaining the fail-closed flags
 `evidence_bundle_authenticated: false` and `cutover_authorized: false`. It never
 emits an unqualified summary `all_agents_passed` field. The validator summary alone never authorizes
-cutover. A human must
+cutover. Justin must
 review the private evidence bundle and exact manifest, and Mary's own-identity
 live acceptance below remains mandatory. Preserve the manifest and evidence as
 one inseparable acceptance record. Any future production or promotion lane must exact-download
@@ -964,7 +956,7 @@ separate later approval from Justin.
 
 Record:
 
-- Operator, reviewer, protected environment approval, repository, ref,
+- Operator, Justin's owner authorization, protected environment, repository, ref,
   `github.sha`, and workflow run URLs.
 - Relay image, candidate marker, immutable digest, attestation verification and
   predicate, platform SBOMs, image and SBOM Trivy reports, scanner database

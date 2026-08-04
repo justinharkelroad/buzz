@@ -14,6 +14,14 @@ crate manifest, and mobile derives both source and marketing version from the
 exact candidate tag. The mobile handoff to the private `buzz-releases` pipeline
 remains manual because OSS CI cannot trigger private CI.
 
+These upstream release lanes are separate from Justin's self-hosted personal
+lane. The personal lane in `docs/personal-relay-release.md` uses a solo-owner
+authorization contract: Justin is the sole release authority, no collaborator
+or human reviewer is required, and the personal GitHub environments isolate
+jobs and scope exact-SHA variables and secrets rather than collecting approvals.
+The trusted-approval requirement below continues to describe the upstream
+Desktop tagging lane only.
+
 ## Quick Start
 
 Prepare desktop releases locally from an up-to-date, clean `main` checkout:

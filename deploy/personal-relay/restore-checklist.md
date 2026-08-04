@@ -142,7 +142,8 @@ because it handles the recovered relay private key. Choose one approved method:
 
 Identity drill controls:
 
-- [ ] Approval names the operator, reviewer, exact key package, and method.
+- [ ] Justin's explicit authorization names the operator, exact key package, and
+      method. No collaborator or second reviewer is required.
 - [ ] No public DNS, inbound internet, or outbound network path exists.
 - [ ] Plaintext key material never enters source control, shell history, logs,
       screenshots, filenames, or the non-secret receipt.
@@ -158,7 +159,8 @@ requires both at the cadence Justin approves.
 
 Record without secret values:
 
-- Date, operators, reviewers, drill type, hostname, and provider resource IDs.
+- Date, operators, Justin's owner authorization, drill type, hostname, and
+  provider resource IDs.
 - Source SHA, digest-qualified image, artifact checksums, attestation evidence,
   and migration state.
 - Freeze start, freeze complete, freeze release, capture IDs, off-provider copy
@@ -178,5 +180,5 @@ Record without secret values:
 - [ ] Do not replay drill history or redirect production traffic.
 - [ ] Do not retire hosted Buzz. Retirement requires separate later approval.
 
-Gate 9 remains a human stop. A successful drill is evidence for Justin; it is
+Gate 9 remains Justin's explicit owner stop. A successful drill is evidence; it is
 not permission to promote, install, cut over, or retire anything.

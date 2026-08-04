@@ -911,22 +911,22 @@ require_flow(
 )
 require_flow(workflow_text.scan('user/packages/container/${package_name}/versions?per_page=100').length == 2, "private user-owned GHCR package checks must use the authenticated-user endpoint")
 require_flow(!workflow_text.include?("users/justinharkelroad/packages/container/"), "public-package GHCR versions endpoint is unsafe for the private personal package")
-require_flow(!prepare.key?("needs"), "source binding must run before the protected release approval")
+require_flow(!prepare.key?("needs"), "source binding must run before the protected release authorization")
 prepare_contract = prepare.fetch("steps")[step_index(prepare, "Verify invocation contract")].fetch("run")
 require_flow(prepare_contract.include?("image_name=ghcr.io/justinharkelroad/buzz-relay-personal"), "relay target must be the single hardcoded personal image")
 require_flow(!workflow_text.include?("PERSONAL_RELAY_IMAGE"), "mutable PERSONAL_RELAY_IMAGE must not steer publication")
-require_flow(approval["needs"] == "prepare", "release approval must directly need the prepared source binding")
-require_flow(approval["environment"] == "personal-relay-release", "release approval must be the only protected personal-relay-release job")
-require_flow(release_gate.fetch("needs").include?("release-approval"), "candidate tests must need release approval directly")
+require_flow(approval["needs"] == "prepare", "release authorization must directly need the prepared source binding")
+require_flow(approval["environment"] == "personal-relay-release", "release authorization must be the only protected personal-relay-release job")
+require_flow(release_gate.fetch("needs").include?("release-approval"), "candidate tests must need release authorization directly")
 require_flow(!release_gate.key?("environment"), "candidate release tests must not hold the protected release environment")
-require_flow(build.fetch("needs").include?("release-approval"), "platform mutation must need release approval directly")
-require_flow(publish.fetch("needs").include?("release-approval"), "final mutation must need release approval directly")
+require_flow(build.fetch("needs").include?("release-approval"), "platform mutation must need release authorization directly")
+require_flow(publish.fetch("needs").include?("release-approval"), "final mutation must need release authorization directly")
 require_flow(approval.fetch("outputs").keys.sort == %w[
   authorization_artifact_digest authorization_artifact_expires_at
   authorization_artifact_id authorization_artifact_name
 ].sort, "authorization artifact outputs changed")
 require_order(approval, [
-  "Capture and validate protected release approval",
+  "Capture and validate protected owner authorization",
   "Stage sealed release authorization evidence",
   "Create trusted authorization secret-scan policy",
   "Reject secrets in sealed release authorization evidence",
@@ -935,29 +935,31 @@ require_order(approval, [
   "Upload sealed release authorization evidence",
   "Bind sealed release authorization artifact identity"
 ])
-capture = approval.fetch("steps")[step_index(approval, "Capture and validate protected release approval")].fetch("run")
+capture = approval.fetch("steps")[step_index(approval, "Capture and validate protected owner authorization")].fetch("run")
 %w[
   PUBLISH_PERSONAL_RELAY refs/heads/main personal-relay-image.yml@refs/heads/main
   personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json
   personal-relay-release-main-rulesets.json personal-relay-release-authorization.json
-  PERSONAL_APPROVED_RELAY_SHA PERSONAL_RELAY_RELEASE_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256
+  PERSONAL_APPROVED_RELAY_SHA justinharkelroad GITHUB_ACTOR GITHUB_TRIGGERING_ACTOR
   personal-relay-release-environment.json personal-relay-release-branch-policies.json
-  personal-relay-release-approval-history.json personal-relay-release-run-identity.json
-  personal-relay-release-reviewer.json personal-relay-release-authorization/v2
-  prevent_self_review can_admins_bypass_exposed deployment-branch-policies approvals
+  personal-relay-release-run-identity.json personal-relay-release-authorization/v3
+  required_reviewers deployment-branch-policies
   ghcr.io/justinharkelroad/buzz-relay-personal candidate_tag image_name sha-${GITHUB_SHA}
 ].each { |token| require_flow(capture.include?(token), "authorization capture is missing #{token}") }
 require_flow(capture.include?('[[ "$GITHUB_RUN_ATTEMPT" == "1" ]]'), "authorization must reject reruns")
-require_flow(approval.fetch("steps").none? { |step| step["uses"].to_s.start_with?("actions/checkout@") }, "release approval must not checkout or execute candidate source")
-require_flow(approval.fetch("steps").none? { |step| step.fetch("run", "").match?(/cargo\s|pnpm\s|docker\s+(run|pull|build)/) }, "release approval must not execute candidate code")
+require_flow(capture.include?('all(.[] | select(.type == "pull_request"); zero_review_pull_request)'), "release authorization capture must reject any effective PR rule that reintroduces review")
+require_flow(capture.include?('all(.[] | select(.type == "required_status_checks"); exact_gate1_status_checks)'), "release authorization capture must reject extra or substituted status checks")
+require_flow(capture.include?('all(.[]; .type != "workflows" and .type != "required_deployments")'), "release authorization capture must reject workflow and deployment gates")
+require_flow(approval.fetch("steps").none? { |step| step["uses"].to_s.start_with?("actions/checkout@") }, "release authorization must not checkout or execute candidate source")
+require_flow(approval.fetch("steps").none? { |step| step.fetch("run", "").match?(/cargo\s|pnpm\s|docker\s+(run|pull|build)/) }, "release authorization must not execute candidate code")
 authorization_name = approval.fetch("steps")[step_index(approval, "Resolve release authorization artifact name")].fetch("run")
-require_flow(authorization_name.include?("personal-relay-release-approval-${GITHUB_SHA}-${GITHUB_RUN_ID}-1"), "approval artifact name is not source/run/attempt bound")
+require_flow(authorization_name.include?("personal-relay-release-authorization-${GITHUB_SHA}-${GITHUB_RUN_ID}-1"), "authorization artifact name is not source/run/attempt bound")
 authorization_upload = approval.fetch("steps")[step_index(approval, "Upload sealed release authorization evidence")]
 require_flow(authorization_upload.dig("with", "path") == "/tmp/personal-relay-release-authorization-evidence/", "authorization upload root drifted")
 
 require_order(release_gate, [
-  "Download exact sealed release approval",
-  "Revalidate sealed independent approval before candidate tests",
+  "Download exact sealed owner authorization",
+  "Revalidate sealed owner authorization before candidate tests",
   "Verify personal release contracts",
   "Fail if the candidate tag already exists",
   "Run workflow engine tests with HTTP support",
@@ -976,20 +978,20 @@ dispatch_regressions = release_gate.fetch("steps")[step_index(release_gate, "Run
   require_flow(dispatch_regressions.include?(token), "database-backed release regression must fail closed on missing exact test: #{token}")
 end
 require_flow(release_gate.dig("services", "postgres", "image") == "postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193", "release test Postgres service must use the reviewed OCI index digest")
-release_gate_download = release_gate.fetch("steps")[step_index(release_gate, "Download exact sealed release approval")].fetch("run")
+release_gate_download = release_gate.fetch("steps")[step_index(release_gate, "Download exact sealed owner authorization")].fetch("run")
 %w[--artifact-id --run-id --name --digest --expires-at --metadata-output --archive-output].each do |argument|
   require_flow(release_gate_download.include?(argument), "candidate test exact approval download is missing #{argument}")
 end
-release_gate_revalidation = release_gate.fetch("steps")[step_index(release_gate, "Revalidate sealed independent approval before candidate tests")].fetch("run")
-%w[personal-relay-release-authorization/v2 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-approval-history.json personal-relay-release-run-identity.json personal-relay-release-reviewer.json candidate_tag image_name].each do |token|
-  require_flow(release_gate_revalidation.include?(token), "candidate test approval validation is missing #{token}")
+release_gate_revalidation = release_gate.fetch("steps")[step_index(release_gate, "Revalidate sealed owner authorization before candidate tests")].fetch("run")
+%w[personal-relay-release-authorization/v3 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-run-identity.json candidate_tag image_name justinharkelroad].each do |token|
+  require_flow(release_gate_revalidation.include?(token), "candidate test authorization validation is missing #{token}")
 end
 
 require_order(build, [
   "Download exact sealed release authorization",
-  "Revalidate sealed independent approval before platform mutation",
+  "Revalidate sealed owner authorization before platform mutation",
   "Log in to personal GHCR",
-  "Fresh release-approval and protected-main recheck immediately before platform build and push",
+  "Fresh owner-authorization and protected-main recheck immediately before platform build and push",
   "Build and push platform manifest by digest",
   "Remove GHCR credentials after pinned platform build",
   "Export platform digest",
@@ -999,21 +1001,21 @@ build_download = build.fetch("steps")[step_index(build, "Download exact sealed r
 %w[--artifact-id --run-id --name --digest --expires-at --metadata-output --archive-output].each do |argument|
   require_flow(build_download.include?(argument), "platform mutation exact artifact download is missing #{argument}")
 end
-build_revalidation = build.fetch("steps")[step_index(build, "Revalidate sealed independent approval before platform mutation")].fetch("run")
+build_revalidation = build.fetch("steps")[step_index(build, "Revalidate sealed owner authorization before platform mutation")].fetch("run")
 require_flow(build_revalidation.include?("validate-main-protection.sh") && build_revalidation.include?("--rulesets-json"), "platform mutation does not revalidate sealed protection evidence")
-%w[personal-relay-release-authorization/v2 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-approval-history.json personal-relay-release-run-identity.json personal-relay-release-reviewer.json candidate_tag image_name].each do |token|
-  require_flow(build_revalidation.include?(token), "platform mutation approval validation is missing #{token}")
+%w[personal-relay-release-authorization/v3 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-run-identity.json candidate_tag image_name justinharkelroad].each do |token|
+  require_flow(build_revalidation.include?(token), "platform mutation authorization validation is missing #{token}")
 end
-fresh_platform_name = "Fresh release-approval and protected-main recheck immediately before platform build and push"
+fresh_platform_name = "Fresh owner-authorization and protected-main recheck immediately before platform build and push"
 fresh_platform_step = build.fetch("steps")[step_index(build, fresh_platform_name)]
 fresh_platform = fresh_platform_step.fetch("run")
 require_flow(fresh_platform_step.dig("env", "BASH_ENV") == "" && fresh_platform_step.dig("env", "ENV") == "", "fresh platform mutation guard must clear shell startup hooks")
 require_flow(fresh_platform_step.dig("env", "PATH") == "/usr/bin:/bin", "fresh platform mutation guard must use the trusted absolute PATH")
-%w[gh\ api --hostname\ github.com validate-main-protection.sh cmp sealed_branch sealed_rules sealed_rulesets sealed_environment sealed_branch_policies sealed_approval_history sealed_run_identity sealed_reviewer AUTHORIZATION_ARTIFACT_EXPIRES_AT fromdateiso8601 candidate_tag image_name].each do |token|
+%w[gh\ api --hostname\ github.com validate-main-protection.sh cmp sealed_branch sealed_rules sealed_rulesets sealed_environment sealed_branch_policies sealed_run_identity AUTHORIZATION_ARTIFACT_EXPIRES_AT fromdateiso8601 candidate_tag image_name justinharkelroad].each do |token|
   require_flow(fresh_platform.include?(token.tr("\\", "")), "fresh platform protection recheck is missing #{token.tr("\\", "")}")
 end
 require_flow(fresh_platform.scan("fromdateiso8601").length == 1, "fresh platform guard must contain exactly one terminal approval-expiry check")
-require_flow(fresh_platform.index("fromdateiso8601") > fresh_platform.rindex('cmp "$sealed_reviewer" "$live_reviewer"'), "fresh platform approval-expiry check must follow the final reviewer byte comparison")
+require_flow(fresh_platform.index("fromdateiso8601") > fresh_platform.rindex('cmp "$sealed_run_identity" "$live_run_identity"'), "fresh platform authorization-expiry check must follow the final run-identity byte comparison")
 require_flow(fresh_platform.rstrip.end_with?("' >/dev/null"), "fresh platform approval-expiry check must be the guard's last command")
 login_index = step_index(build, "Log in to personal GHCR")
 cleanup_index = step_index(build, "Remove GHCR credentials after pinned platform build")
@@ -1079,12 +1081,12 @@ require_flow(scan_upload["if"].to_s.include?("bind-secret-scan-evidence.outcome 
 
 require_order(publish, [
   "Download exact sealed release authorization",
-  "Revalidate sealed independent approval before final mutation",
+  "Revalidate sealed owner authorization before final mutation",
   "Log in to personal GHCR",
-  "Fresh release-approval and protected-main recheck immediately before manifest and tag creation",
+  "Fresh owner-authorization and protected-main recheck immediately before manifest and tag creation",
   "Create non-overwriting candidate tag and resolve digest",
   "Verify the exact merged descriptor union by digest",
-  "Fresh release-approval and protected-main recheck immediately before provenance attestation",
+  "Fresh owner-authorization and protected-main recheck immediately before provenance attestation",
   "Attest merged image provenance",
   "Remove GHCR credentials after registry attestation",
   "Write non-secret release ledger",
@@ -1097,14 +1099,14 @@ publish_download = publish.fetch("steps")[step_index(publish, "Download exact se
 %w[--artifact-id --run-id --name --digest --expires-at --metadata-output --archive-output].each do |argument|
   require_flow(publish_download.include?(argument), "final mutation exact artifact download is missing #{argument}")
 end
-publish_revalidation = publish.fetch("steps")[step_index(publish, "Revalidate sealed independent approval before final mutation")].fetch("run")
+publish_revalidation = publish.fetch("steps")[step_index(publish, "Revalidate sealed owner authorization before final mutation")].fetch("run")
 require_flow(publish_revalidation.include?("validate-main-protection.sh") && publish_revalidation.include?("--rulesets-json"), "final mutation does not revalidate sealed protection evidence")
-%w[personal-relay-release-authorization/v2 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-approval-history.json personal-relay-release-run-identity.json personal-relay-release-reviewer.json candidate_tag image_name].each do |token|
-  require_flow(publish_revalidation.include?(token), "final mutation approval validation is missing #{token}")
+%w[personal-relay-release-authorization/v3 personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-run-identity.json candidate_tag image_name justinharkelroad].each do |token|
+  require_flow(publish_revalidation.include?(token), "final mutation authorization validation is missing #{token}")
 end
 require_flow(publish.fetch("steps").none? { |step| step["uses"].to_s.start_with?("./") }, "OIDC/packages-write publish must not execute a local candidate action")
-fresh_manifest_name = "Fresh release-approval and protected-main recheck immediately before manifest and tag creation"
-fresh_attest_name = "Fresh release-approval and protected-main recheck immediately before provenance attestation"
+fresh_manifest_name = "Fresh owner-authorization and protected-main recheck immediately before manifest and tag creation"
+fresh_attest_name = "Fresh owner-authorization and protected-main recheck immediately before provenance attestation"
 require_flow(step_index(publish, fresh_manifest_name) + 1 == step_index(publish, "Create non-overwriting candidate tag and resolve digest"), "fresh manifest protection recheck must be immediately adjacent to tag mutation")
 require_flow(step_index(publish, fresh_attest_name) + 1 == step_index(publish, "Attest merged image provenance"), "fresh protection recheck must be immediately adjacent to provenance attestation")
 [fresh_manifest_name, fresh_attest_name].each do |name|
@@ -1112,11 +1114,11 @@ require_flow(step_index(publish, fresh_attest_name) + 1 == step_index(publish, "
   run = guard_step.fetch("run")
   require_flow(guard_step.dig("env", "BASH_ENV") == "" && guard_step.dig("env", "ENV") == "", "#{name} must clear shell startup hooks")
   require_flow(guard_step.dig("env", "PATH") == "/usr/bin:/bin", "#{name} must use the trusted absolute PATH")
-  %w[gh\ api --hostname\ github.com validate-main-protection.sh cmp sealed_branch sealed_rules sealed_rulesets sealed_environment sealed_branch_policies sealed_approval_history sealed_run_identity sealed_reviewer AUTHORIZATION_ARTIFACT_EXPIRES_AT fromdateiso8601 candidate_tag image_name].each do |token|
+  %w[gh\ api --hostname\ github.com validate-main-protection.sh cmp sealed_branch sealed_rules sealed_rulesets sealed_environment sealed_branch_policies sealed_run_identity AUTHORIZATION_ARTIFACT_EXPIRES_AT fromdateiso8601 candidate_tag image_name justinharkelroad].each do |token|
     require_flow(run.include?(token.tr("\\", "")), "#{name} is missing #{token.tr("\\", "")}")
   end
   require_flow(run.scan("fromdateiso8601").length == 1, "#{name} must contain exactly one terminal approval-expiry check")
-  require_flow(run.index("fromdateiso8601") > run.rindex('cmp "$sealed_reviewer" "$live_reviewer"'), "#{name} approval-expiry check must follow the final reviewer byte comparison")
+  require_flow(run.index("fromdateiso8601") > run.rindex('cmp "$sealed_run_identity" "$live_run_identity"'), "#{name} authorization-expiry check must follow the final run-identity byte comparison")
   require_flow(run.rstrip.end_with?("' >/dev/null"), "#{name} approval-expiry check must be the guard's last command")
 end
 publish_cleanup = publish.fetch("steps")[step_index(publish, "Remove GHCR credentials after registry attestation")].fetch("run")
@@ -1155,7 +1157,7 @@ jobs.each do |job_name, job|
   job.fetch("steps", []).each do |step|
     run = step.fetch("run", "")
     api_calls = run.scan(/\bgh api\b/).length
-    require_flow(api_calls == run.scan(/\bgh api --hostname github\.com\b/).length, "relay gh api call is not pinned to github.com: #{job_name}: #{step["name"]}")
+    require_flow(api_calls == run.scan(/\bgh api\s+(?:\\\s*)?--hostname github\.com\b/).length, "relay gh api call is not pinned to github.com: #{job_name}: #{step["name"]}")
     attestation_calls = run.scan(/\bgh attestation verify\b/).length
     next if attestation_calls.zero?
     require_flow(run.scan(/--hostname github\.com/).length >= attestation_calls, "relay gh attestation call is not pinned to github.com: #{job_name}: #{step["name"]}")
@@ -1166,16 +1168,17 @@ require_flow(workflow_text.scan('GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hos
 require_flow(workflow_text.scan('has("bypass_actors")').length >= 6 && workflow_text.scan('(.bypass_actors | type == "array")').length >= 6, "relay ruleset-detail evidence must fail closed when bypass actors are hidden")
 require_flow(workflow_text.scan('def canonical:').length == 6, "all sealed/live relay effective-rule captures must recursively canonicalize parameter objects")
 require_flow(workflow_text.scan('sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")').length == 6, "all sealed/live effective-rule captures must use one canonical order")
-require_flow(workflow_text.scan("| jq -S '{name, protected, commit: {sha: .commit.sha}}'").length == 6, "all sealed/live relay branch captures must use the stable exact projection")
+require_flow(workflow_text.scan('protection/required_pull_request_reviews').length == 6, "all sealed/live relay branch captures must prove classic review protection is absent")
+require_flow(workflow_text.scan('classic_required_pull_request_reviews: false').length == 6, "all sealed/live relay branch captures must record classic review absence")
 require_flow(workflow_text.scan('bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))').length == 6, "all sealed/live ruleset details must canonicalize bypass actors")
-require_flow(capture.include?('reviewers | type == "array" and length == 1') && capture.include?('reviewers[0].type == "User"'), "release approval must require exactly one configured User reviewer")
+require_flow(capture.include?('select(.type == "required_reviewers")] | length) == 0'), "release authorization environment must require no reviewer")
 ledger = publish.fetch("steps")[step_index(publish, "Write non-secret release ledger")].fetch("run")
-require_flow(ledger.include?('release_approval: {environment: "personal-relay-release", image_name: $authorization[0].image_name, candidate_tag: $authorization[0].candidate_tag'), "release ledger must cross-bind the sealed image name and candidate tag inside release_approval")
-%w[main_protection release_approval candidate_tag image_name branch_metadata_sha256 effective_rules_sha256 rulesets_sha256 environment_sha256 branch_policies_sha256 approval_history_sha256 run_identity_sha256 reviewer_sha256 admin_bypass_api_state admin_bypass_settings_receipt_sha256 authorization_sha256 evidence_artifact authorization_artifact_expires_at].each do |token|
+require_flow(ledger.include?('release_authorization: {environment: "personal-relay-release", authorized_owner: "justinharkelroad", image_name: $authorization[0].image_name, candidate_tag: $authorization[0].candidate_tag'), "release ledger must cross-bind the owner, sealed image name, and candidate tag inside release_authorization")
+%w[main_protection release_authorization authorized_owner candidate_tag image_name branch_metadata_sha256 effective_rules_sha256 rulesets_sha256 environment_sha256 branch_policies_sha256 run_identity_sha256 authorization_sha256 evidence_artifact authorization_artifact_expires_at].each do |token|
   require_flow(ledger.include?(token), "release ledger is missing protected-main binding #{token}")
 end
 stage = publish.fetch("steps")[step_index(publish, "Stage release evidence at one deterministic artifact root")].fetch("run")
-%w[personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json personal-relay-release-main-rulesets.json personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-approval-history.json personal-relay-release-run-identity.json personal-relay-release-reviewer.json personal-relay-release-authorization.json].each do |filename|
+%w[personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json personal-relay-release-main-rulesets.json personal-relay-release-environment.json personal-relay-release-branch-policies.json personal-relay-release-run-identity.json personal-relay-release-authorization.json].each do |filename|
   require_flow(stage.include?(filename), "final release evidence omits #{filename}")
 end
 RUBY
@@ -1242,7 +1245,7 @@ require_desktop(!workflow.to_s.include?("$GITHUB_ENV"), "desktop trust values mu
 require_desktop(!build.fetch("env", {}).key?("BASE_PRODUCT_NAME"), "base product name must not be job-scoped")
 require_desktop(!build.fetch("env", {}).key?("BASE_BUNDLE_ID"), "base bundle ID must not be job-scoped")
 require_desktop(build.fetch("steps").none? { |step| step["uses"].to_s.start_with?("actions/cache/") }, "desktop candidate build must not restore or save a cross-run cache")
-candidate_checkout_index = desktop_step_index(build, "Checkout exact approved source for the desktop build")
+candidate_checkout_index = desktop_step_index(build, "Checkout exact owner-authorized source for the desktop build")
 build.fetch("steps")[(candidate_checkout_index + 1)..].each do |step|
   next unless step["run"]
   require_desktop(step.dig("env", "BASH_ENV") == "" && step.dig("env", "ENV") == "", "post-candidate desktop run step must blank shell startup hooks: #{step["name"]}")
@@ -1263,7 +1266,7 @@ workflow.fetch("jobs").each do |job_name, job|
   job.fetch("steps", []).each do |step|
     run = step.fetch("run", "")
     api_calls = run.scan(/\bgh api\b/).length
-    pinned_api_calls = run.scan(/\bgh api --hostname github\.com\b/).length
+    pinned_api_calls = run.scan(/\bgh api\s+(?:\\\s*)?--hostname github\.com\b/).length
     require_desktop(api_calls == pinned_api_calls, "desktop gh api call is not pinned to github.com: #{job_name}: #{step["name"]}")
     attestation_calls = run.scan(/\bgh attestation verify\b/).length
     next if attestation_calls.zero?
@@ -1331,13 +1334,17 @@ require_desktop(audit.fetch("outputs", {}) == {}, "desktop audit must not export
 build_contract = desktop_step(build, "Create immutable desktop build contract")
 controls = desktop_step(build, "Validate protected main and personal-staging controls").fetch("run")
 [
-  "{name, protected, commit: {sha: .commit.sha}}",
-  'keys == ["commit", "name", "protected"]',
+  "protection/required_pull_request_reviews",
+  "classic_required_pull_request_reviews: false",
+  'keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]',
+  '.classic_required_pull_request_reviews == false',
   '(.commit | keys) == ["sha"]',
   "personal-staging-environment.raw.json",
-  "can_admins_bypass_exposed",
-  "protection_rules:",
-  "sort_by(.type, .reviewer.id, .reviewer.node_id, .reviewer.login)",
+  "protection_rules: [.protection_rules[]] | sort_by(.type)",
+  'select(.type == "required_reviewers")] | length) == 0',
+  "personal-staging-run-identity.json",
+  '.actor.login == "justinharkelroad"',
+  '.triggering_actor.login == "justinharkelroad"',
   "def canonical:",
   "parameters: (.parameters | canonical)",
   'sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson)',
@@ -1346,8 +1353,9 @@ controls = desktop_step(build, "Validate protected main and personal-staging con
   require_desktop(controls.include?(token), "desktop sealed control evidence lacks deterministic normalization: #{token}")
 end
 require_desktop(
-  workflow_text.scan("| jq -S '{name, protected, commit: {sha: .commit.sha}}'").length == 2,
-  "Desktop sealed/live main-branch evidence must use exactly one shared stable projection each",
+  workflow_text.scan('protection/required_pull_request_reviews').length == 2 &&
+    workflow_text.scan('classic_required_pull_request_reviews: false').length == 2,
+  "Desktop sealed/live main-branch evidence must prove and record classic review absence",
 )
 require_desktop(build_contract.dig("env", "BASE_PRODUCT_NAME") == "${{ vars.PERSONAL_DESKTOP_PRODUCT_NAME }}", "desktop build contract lost protected base product input")
 require_desktop(build_contract.dig("env", "BASE_BUNDLE_ID") == "${{ vars.PERSONAL_DESKTOP_BUNDLE_ID }}", "desktop build contract lost protected base bundle input")
@@ -1356,7 +1364,7 @@ require_desktop(build_contract.dig("env", "BASE_BUNDLE_ID") == "${{ vars.PERSONA
 end
 authorization_stage = desktop_step(build, "Seal pre-candidate authorization and control evidence").fetch("run")
 require_desktop(authorization_stage.include?("personal-desktop-build-contract.json"), "desktop authorization artifact omits the build contract")
-require_desktop(authorization_stage.include?('== 17'), "desktop authorization artifact file count is not exact")
+require_desktop(authorization_stage.include?('== 16'), "desktop authorization artifact file count is not exact")
 
 generate = desktop_step(build, "Generate staging-only Tauri configuration")
 %w[BUZZ_RELAY_HTTP BUZZ_RELAY_URL EXPECTED_BUNDLE_ID EXPECTED_PRODUCT_NAME].each do |key|
@@ -1408,16 +1416,30 @@ require_desktop(candidate_stage.include?('== 10'), "desktop candidate artifact i
   require_desktop(candidate_stage.include?(filename), "desktop candidate artifact omits #{filename}")
 end
 ledger = desktop_step(build, "Write non-secret staging ledger")
-%w[BUILD_CONTRACT_SHA BUNDLE_ID PRODUCT_NAME RELAY_HTTPS RELAY_WSS ADMIN_BYPASS_SETTINGS_RECEIPT_SHA].each do |key|
+%w[BUILD_CONTRACT_SHA BUNDLE_ID PRODUCT_NAME RELAY_HTTPS RELAY_WSS STAGING_AUTHORIZED_BY].each do |key|
   require_desktop(ledger.fetch("env").key?(key), "desktop ledger lacks immutable #{key}")
 end
-%w[build_contract_sha256 bundle_id product_name relay_https relay_wss admin_bypass_settings_receipt_sha256].each do |token|
+%w[build_contract_sha256 bundle_id product_name relay_https relay_wss authorized_owner].each do |token|
   require_desktop(ledger.fetch("run").include?(token), "desktop ledger omits #{token}")
 end
+require_desktop(ledger.fetch("run").include?('schema: "personal-desktop-staging/v2"'), "desktop candidate ledger schema must be personal-desktop-staging/v2")
+initial_gate1_receipt_verifier = desktop_step(build, "Validate and independently verify exact Gate 1 receipt").fetch("run")
 fresh_ledger_verifier = desktop_step(attest, "Resolve and verify sealed desktop ledger").fetch("run")
+[
+  '.schema_version == 2',
+  '.receipt_type == "personal-relay-gate1"',
+  '.gate1_workflow.authorized_owner as $authorized_owner',
+  '($authorized_owner | keys | sort) == ["id", "login", "node_id"]',
+  '$authorized_owner.login == "justinharkelroad"',
+  '.release_evidence.release_authorization.authorized_owner == "justinharkelroad"',
+].each do |token|
+  [initial_gate1_receipt_verifier, fresh_ledger_verifier].each do |verifier|
+    require_desktop(verifier.include?(token), "Desktop Gate 1 receipt verifier omits #{token}")
+  end
+end
 %w[
   personal-desktop-build-contract.json
-  admin_bypass_settings_receipt_sha256
+  authorized_owner
   gate1_eligibility_expires_at
   gate1_release_evidence_expires_at
   build_contract_sha256
@@ -1425,6 +1447,7 @@ fresh_ledger_verifier = desktop_step(attest, "Resolve and verify sealed desktop 
   require_desktop(fresh_ledger_verifier.include?(token), "fresh desktop ledger verification omits #{token}")
 end
 require_desktop(fresh_ledger_verifier.scan("keys | sort").length >= 8, "fresh desktop ledger verification lost exact top-level or nested key sets")
+require_desktop(fresh_ledger_verifier.include?('.schema == "personal-desktop-staging/v2"'), "fresh desktop ledger verifier must reject schema downgrade")
 require_desktop(fresh_ledger_verifier.include?(".gate1_eligibility_expires_at == $gate1_eligibility_expires_at"), "desktop eligibility deadline is not bound to the sealed Gate 1 receipt")
 require_desktop(fresh_ledger_verifier.include?(".gate1_release_evidence_expires_at == $gate1_release_evidence_expires_at"), "desktop release-evidence deadline is not bound to the sealed Gate 1 receipt")
 require_desktop(build.fetch("steps").none? { |step| step["uses"] == trivy_action }, "desktop build must seal immutable candidate bytes before any third-party scanner runs")
@@ -1445,7 +1468,7 @@ require_desktop(inspect_download.include?('[[ "$GITHUB_REF" == "refs/heads/main"
 
 inspection_inputs = desktop_step(inspect, "Resolve immutable desktop inspection inputs").fetch("run")
 [
-  '== 10', '== 17', '! -type f', 'personal-desktop-staging.json',
+  '== 10', '== 16', '! -type f', 'personal-desktop-staging.json',
   'personal-desktop-checksums.txt', 'personal-desktop-sidecars.json',
   'buzz-acp-${EXPECTED_TARGET}', 'and (.entries | length) == 6',
   'while IFS=$\'\t\' read -r candidate_name expected_sha; do',
@@ -1834,13 +1857,14 @@ live = desktop_step(attest, "Revalidate live protected main immediately before O
   require_desktop(live.include?(token), "pre-OIDC live-main revalidation omits #{token}")
 end
 [
-  "{name, protected, commit: {sha: .commit.sha}}",
-  'keys == ["commit", "name", "protected"]',
+  "protection/required_pull_request_reviews",
+  "classic_required_pull_request_reviews: false",
+  'keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]',
+  '.classic_required_pull_request_reviews == false',
   '(.commit | keys) == ["sha"]',
   "personal-desktop-live-staging-environment.raw.json",
-  "can_admins_bypass_exposed",
-  "protection_rules:",
-  "sort_by(.type, .reviewer.id, .reviewer.node_id, .reviewer.login)",
+  "protection_rules: [.protection_rules[]] | sort_by(.type)",
+  'select(.type == "required_reviewers")] | length) == 0',
   "def canonical:",
   "parameters: (.parameters | canonical)",
   'sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson)',
@@ -1917,27 +1941,27 @@ require_desktop(!workflow.to_s.include?("actions/attest-build-provenance@"), "ge
 require_desktop(attest_action.fetch("with") == {
   "subject-name" => "${{ steps.dmg.outputs.name }}",
   "subject-digest" => "sha256:${{ steps.dmg.outputs.sha256 }}",
-  "predicate-type" => "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1",
+  "predicate-type" => "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2",
   "predicate-path" => "/tmp/personal-desktop-staging-attestation-predicate.json",
   "push-to-registry" => false,
   "show-summary" => false,
 }, "Desktop custom attestation input map drifted")
 require_desktop(attest_action.dig("with", "subject-name") == "${{ steps.dmg.outputs.name }}", "Desktop custom attestation subject name drifted")
 require_desktop(attest_action.dig("with", "subject-digest") == "sha256:${{ steps.dmg.outputs.sha256 }}", "Desktop custom attestation subject digest drifted")
-require_desktop(attest_action.dig("with", "predicate-type") == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1", "Desktop custom predicate type drifted")
+require_desktop(attest_action.dig("with", "predicate-type") == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2", "Desktop custom predicate type drifted")
 require_desktop(attest_action.dig("with", "predicate-path") == "/tmp/personal-desktop-staging-attestation-predicate.json", "Desktop custom predicate path drifted")
 require_desktop(attest_action.dig("with", "push-to-registry") == false && attest_action.dig("with", "show-summary") == false, "Desktop custom attestation must not publish to a registry or mutable summary")
 verification_step = desktop_step(attest, "Verify repository-scoped attestation and inspect predicate")
 verification = verification_step.fetch("run")
 [
   '--bundle personal-desktop-attestation-bundle.json',
-  '--predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1',
+  '--predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2',
   '--source-digest "$GITHUB_SHA"',
   '--source-ref "$GITHUB_REF"',
   '--signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-desktop-release.yml',
   '--signer-digest "$GITHUB_SHA"',
   "length == 1",
-  '.predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"',
+  '.predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"',
   '--slurpfile predicate /tmp/personal-desktop-staging-attestation-predicate.json',
   '.predicate == $predicate[0]',
   'any(.subject[]?; .name == $name and .digest.sha256 == $digest)'
@@ -2026,7 +2050,10 @@ require_desktop(audit_download.scan("download-exact-artifact.sh").length == 5, "
   '[[ "$observed_names" == "$expected_names" ]]',
   '[[ "$(find "$candidate" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d \'[:space:]\')" == 10 ]]',
   '[[ "$dmg_count" == 1 && -n "$dmg" && ! -L "$dmg" ]]',
-  '[[ "$dmg_sha" == "$(jq -r .dmg_sha256 "$candidate/personal-desktop-staging.json")" ]]',
+  'ledger="$candidate/personal-desktop-staging.json"',
+  "jq -e '.schema == \"personal-desktop-staging/v2\"' \"$ledger\" >/dev/null",
+  'and .ledger.schema == "personal-desktop-staging/v2"',
+  '[[ "$dmg_sha" == "$(jq -r .dmg_sha256 "$ledger")" ]]',
   'personal-desktop-independent-remount-receipt.json',
   '[[ "$(find "$remount" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d \'[:space:]\')" == 1 ]]',
   '[[ "$(sha256sum "$remount_receipt" | awk \'{print $1}\')" == "${{ needs.remount.outputs.receipt_sha256 }}" ]]',
@@ -2040,7 +2067,7 @@ audit_verification = desktop_step(audit, "Independently verify exact attestation
 [
   'gh attestation verify "$dmg"',
   '--bundle "$input/personal-desktop-attestation-bundle.json"',
-  '--predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1',
+  '--predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2',
   '--source-digest "$GITHUB_SHA"', '--source-ref refs/heads/main',
   '--signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-desktop-release.yml',
   '--signer-digest "$GITHUB_SHA"', '--deny-self-hosted-runners',
@@ -2097,7 +2124,7 @@ require_desktop(last_scan_index < restore_index && terminal_index == restore_ind
 require_desktop(terminal_step["working-directory"] == "terminal-verifier", "Desktop terminal audit validator must run from the restored exact-SHA checkout")
 terminal = terminal_step.fetch("run")
 [
-  'schema: "personal-desktop-attestation-audit-expectations/v2"',
+  'schema: "personal-desktop-attestation-audit-expectations/v3"',
   'bind_scan_report \\',
   'diff -qr "$CANDIDATE_SCAN_ROOT" "$candidate"',
   'diff -qr "$VOLUME_SCAN_ROOT" "$volume/projection"',
@@ -2118,8 +2145,8 @@ terminal = terminal_step.fetch("run")
 end
 require_desktop(terminal.scan("bind_scan_report \\").length == 3, "Desktop terminal verifier must bind all three Trivy reports")
 [
-  'personal-desktop-attestation-audit-expectations/v2',
-  'personal-desktop-attestation-audit-summary/v2',
+  'personal-desktop-attestation-audit-expectations/v3',
+  'personal-desktop-attestation-audit-summary/v3',
   'require_exact_root_names "$candidate_dir"',
   'cmp -s "$volume_inventory" "$inspection_inventory"',
   'cmp -s "$volume_sidecar_manifest" "$sidecar_manifest"',
@@ -2129,14 +2156,14 @@ require_desktop(terminal.scan("bind_scan_report \\").length == 3, "Desktop termi
 end
 audit_binder = desktop_step(audit, "Bind zero-secret attestation audit").fetch("run")
 [
-  'schema: "personal-desktop-staging-attestation-audit/v3"',
+  'schema: "personal-desktop-staging-attestation-audit/v4"',
   'attestation_artifact:', 'sealed_input_artifacts:',
   'candidate:', 'inspection:', 'mounted_volume:', 'independent_remount:',
   'bundle_sha256:', 'predicate_sha256:',
   'returned_predicate_sha256:', 'verification_sha256:',
   'independent_verification_sha256:', 'independent_remount_receipt_sha256:',
   'cross_binding:', 'expectations_sha256:', 'summary_sha256:',
-  '.cross_binding.summary.schema == "personal-desktop-attestation-audit-summary/v2"',
+  '.cross_binding.summary.schema == "personal-desktop-attestation-audit-summary/v3"',
   'secret_scans:',
   'attestation: {trivy_version: "0.70.0", report_sha256: $attestation_scan_sha}',
   'candidate: {trivy_version: "0.70.0", report_sha256: $candidate_scan_sha}',
@@ -2299,19 +2326,23 @@ attest = jobs.fetch("attest")
 
 capture_controls = gate1_step(validate, "Capture exact run and protected environment evidence").fetch("run")
 [
-  "{name, protected, commit: {sha: .commit.sha}}",
+  "protection/required_pull_request_reviews",
+  "classic_required_pull_request_reviews: false",
   "def canonical:",
   "parameters: (.parameters | canonical)",
   'sort_by(.ruleset_id // 0, .type, (.parameters | tojson)',
   'bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))',
-  "can_admins_bypass_exposed: has(\"can_admins_bypass\")",
-  "prevent_self_review",
+  'protection_rules: [.protection_rules[]] | sort_by(.type)',
+  'select(.type == "required_reviewers")] | length) == 0',
+  '.actor.login == "justinharkelroad"',
+  '.triggering_actor.login == "justinharkelroad"',
   "deployment-branch-policies",
   "validate-main-protection.sh",
 ].each do |token|
   require_gate1(capture_controls.include?(token), "Gate 1 protected-control capture lacks deterministic evidence binding: #{token}")
 end
-require_gate1(workflow_text.scan("| jq -S '{name, protected, commit: {sha: .commit.sha}}'").length == 2, "Gate 1 sealed/live branch evidence must use exactly two stable projections")
+require_gate1(workflow_text.scan('protection/required_pull_request_reviews').length == 2, "Gate 1 sealed/live branch evidence must prove classic review protection is absent twice")
+require_gate1(workflow_text.scan('classic_required_pull_request_reviews: false').length == 2, "Gate 1 sealed/live branch evidence must record classic review absence twice")
 require_gate1(workflow_text.scan("def canonical:").length == 2, "Gate 1 sealed/live effective-rule evidence must recursively canonicalize parameter objects")
 require_gate1(workflow_text.scan('sort_by(.ruleset_id // 0, .type, (.parameters | tojson), .ruleset_source_type, .ruleset_source)').length == 2, "Gate 1 sealed/live effective rules must share one deterministic order")
 require_gate1(!workflow_text.include?(".parameters | tostring"), "Gate 1 must not sort parameter objects by insertion-order-sensitive tostring")
@@ -2527,22 +2558,19 @@ stage = gate1_step(validate, "Seal validation evidence into one dedicated direct
   trusted-gate1-receipt-fixtures.log trusted-release-contract-fixtures.log
   personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json
   personal-relay-release-main-rulesets.json personal-relay-release-environment.json
-  personal-relay-release-branch-policies.json personal-relay-release-approval-history.json
-  personal-relay-release-run-identity.json personal-relay-release-reviewer.json
+  personal-relay-release-branch-policies.json personal-relay-release-run-identity.json
   personal-relay-release-authorization.json
 ].each do |file|
   require_gate1(stage.include?(file), "sealed Gate 1 validation evidence omits #{file}")
 end
 release_download = gate1_step(validate, "Download exact approved release evidence archive").fetch("run")
 %w[
-  personal-relay-release-approval-history.json
   personal-relay-release-authorization.json
   personal-relay-release-branch-policies.json
   personal-relay-release-environment.json
   personal-relay-release-main-branch.json
   personal-relay-release-main-effective-rules.json
   personal-relay-release-main-rulesets.json
-  personal-relay-release-reviewer.json
   personal-relay-release-run-identity.json
 ].each do |file|
   require_gate1(release_download.include?(file), "Gate 1 exact release-authorization inventory omits #{file}")
@@ -2560,7 +2588,8 @@ live = gate1_step(attest, live_name).fetch("run")
   require_gate1(live.include?(token.tr("\\", "")), "live Gate 1 revalidation is missing #{token.tr("\\", "")}")
 end
 [
-  "{name, protected, commit: {sha: .commit.sha}}",
+  "protection/required_pull_request_reviews",
+  "classic_required_pull_request_reviews: false",
   "def canonical:",
   "parameters: (.parameters | canonical)",
   'sort_by(.ruleset_id // 0, .type, (.parameters | tojson)',
@@ -2580,7 +2609,7 @@ require_gate1(live_step.dig("env", "BASH_ENV") == "" && live_step.dig("env", "EN
 %w[
   eligibility_expires_at
   release_evidence.expires_at
-  release_evidence.release_approval.evidence_artifact.expires_at
+  release_evidence.release_authorization.evidence_artifact.expires_at
 ].each do |field|
   require_gate1(live.scan(field).length == 1, "Gate 1 terminal deadline block must check #{field} exactly once")
 end
@@ -2621,7 +2650,7 @@ jobs.each do |job_name, job|
   job.fetch("steps", []).each do |step|
     run = step.fetch("run", "")
     api_calls = run.scan(/\bgh api\b/).length
-    require_gate1(api_calls == run.scan(/\bgh api --hostname github\.com\b/).length, "Gate 1 gh api call is not pinned to github.com: #{job_name}: #{step["name"]}")
+    require_gate1(api_calls == run.scan(/\bgh api\s+(?:\\\s*)?--hostname github\.com\b/).length, "Gate 1 gh api call is not pinned to github.com: #{job_name}: #{step["name"]}")
     attestation_calls = run.scan(/\bgh attestation verify\b/).length
     next if attestation_calls.zero?
     require_gate1(run.scan(/--hostname github\.com/).length >= attestation_calls, "Gate 1 gh attestation call is not pinned to github.com: #{job_name}: #{step["name"]}")
@@ -2949,7 +2978,7 @@ printf '%s\n' '{"array":[3,2,1],"nested":{"alpha":true},"number":1.25,"text":"va
   > "$canonical_fixture_root/valid.json"
 printf '%s\n' '{"decision":"ambiguous","decision":"approved"}' \
   > "$canonical_fixture_root/duplicate-top.json"
-printf '%s\n' '{"reviewer":{"login":"ambiguous","login":"trusted"}}' \
+printf '%s\n' '{"owner":{"login":"ambiguous","login":"trusted"}}' \
   > "$canonical_fixture_root/duplicate-nested.json"
 printf '%s\n%s\n' '{}' '[]' > "$canonical_fixture_root/multiple.json"
 printf '%s\n' '{} trailing' > "$canonical_fixture_root/trailing.json"
@@ -2996,6 +3025,8 @@ grep -Fq 'snapshot_fd = os.open(snapshot_path, snapshot_flags, 0o600)' "$hash_he
 grep -Fq 'canonical=$(jq -ceS . "$snapshot")' "$hash_helper"
 grep -Fq 'digest=$(bash "$canonical_json_helper" "$path")' "$gate1_receipt"
 grep -Fq 'bash "$canonical_json_helper" "$path" >/dev/null' "$gate1_receipt"
+grep -Fq '.release_authorization.authorized_owner == "justinharkelroad"' "$gate1_receipt"
+grep -Fq 'ledger-non-owner' "$gate1_receipt_test"
 
 cleanup_canonical_fixtures
 trap - EXIT
@@ -3435,8 +3466,9 @@ for field in \
   grep -Fq "\"${field}\"" "$receipt"
   grep -Fq "$field" "$desktop_workflow"
 done
-grep -Fq '"admin_bypass_settings_receipt_sha256"' "$receipt"
-grep -Fq 'PERSONAL_STAGING_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256' "$desktop_workflow"
+grep -Fq '"authorized_by"' "$receipt"
+grep -Fq '"authorized_at"' "$receipt"
+grep -Fq 'STAGING_AUTHORIZED_BY' "$desktop_workflow"
 grep -Fq 'download-exact-artifact.sh' "$desktop_workflow"
 grep -Fq 'personal-relay-gate1/v1' "$desktop_workflow"
 grep -Fq 'BUILD_PERSONAL_STAGING_DESKTOP' "$desktop_workflow"
@@ -3490,9 +3522,9 @@ done
 [[ $(grep -Fc 'bash ./deploy/personal-relay/download-exact-artifact.sh' <<<"$desktop_audit_job") -eq 5 ]]
 [[ $(grep -Fc -- '--run-id "$GITHUB_RUN_ID"' <<<"$desktop_audit_job") -eq 5 ]]
 [[ $(grep -Fc -- '- name: Upload sealed pre-candidate authorization evidence' <<<"$desktop_build_job") -eq 1 ]]
-[[ $(grep -Fc -- '- name: Checkout exact approved source for the desktop build' <<<"$desktop_build_job") -eq 1 ]]
+[[ $(grep -Fc -- '- name: Checkout exact owner-authorized source for the desktop build' <<<"$desktop_build_job") -eq 1 ]]
 authorization_upload_line=$(grep -nF -- '- name: Upload sealed pre-candidate authorization evidence' <<<"$desktop_build_job" | cut -d: -f1)
-candidate_checkout_line=$(grep -nF -- '- name: Checkout exact approved source for the desktop build' <<<"$desktop_build_job" | cut -d: -f1)
+candidate_checkout_line=$(grep -nF -- '- name: Checkout exact owner-authorized source for the desktop build' <<<"$desktop_build_job" | cut -d: -f1)
 [[ "$authorization_upload_line" -lt "$candidate_checkout_line" ]] || {
   printf '%s\n' "desktop authorization evidence must be uploaded before candidate checkout" >&2
   exit 1
@@ -3592,8 +3624,9 @@ for desktop_acceptance_contract in \
 done
 for repository_writer_boundary in \
   'Same-repository write access is a trust boundary' \
-  'must not receive repository write access' \
-  'cannot defend against a writer who edits both a workflow'; do
+  'limited to Justin' \
+  'requires no collaborator, code' \
+  'defend against the repository owner intentionally editing both a workflow'; do
   grep -Fq "$repository_writer_boundary" "$release_runbook"
 done
 [[ -f "$relay_env_example" && -r "$relay_env_example" && ! -L "$relay_env_example" ]]
@@ -3612,9 +3645,9 @@ done
 for desktop_release_contract in \
   'exact ten-file candidate' \
   'fresh `macos-15` runner' \
-  '`personal-desktop-attestation-audit-expectations/v2`' \
-  '`personal-desktop-attestation-audit-summary/v2`' \
-  '`personal-desktop-staging-attestation-audit/v3`' \
+  '`personal-desktop-attestation-audit-expectations/v3`' \
+  '`personal-desktop-attestation-audit-summary/v3`' \
+  '`personal-desktop-staging-attestation-audit/v4`' \
   'uploads exactly seven' \
   'requires the entire Desktop workflow'; do
   grep -Fq "$desktop_release_contract" "$release_runbook"
@@ -3696,11 +3729,25 @@ grep -Fq 'personal-relay-final-evidence.sha256' "$relay_workflow"
 grep -Fq 'chmod 0444 "$evidence_root"/*' "$relay_workflow"
 grep -Fq 'chmod 0555 "$evidence_root"' "$relay_workflow"
 grep -Fq 'sha256sum --check --strict personal-relay-final-evidence.sha256' "$relay_workflow"
-grep -Fq '.context == "Gate 1 receipt contract"' "$main_protection_validator"
-grep -Fq '.integration_id == 15368' "$main_protection_validator"
 grep -Fq '.ruleset_source_type == "Repository"' "$main_protection_validator"
 grep -Fq '.ruleset_source == $expected_repository' "$main_protection_validator"
-grep -Fq '$ruleset.bypass_actors == []' "$main_protection_validator"
+grep -Fq 'and .bypass_actors == []' "$main_protection_validator"
+grep -Fq 'keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]' "$main_protection_validator"
+grep -Fq '.classic_required_pull_request_reviews == false' "$main_protection_validator"
+grep -Fq 'classic-review-protection' "$main_protection_validator_test"
+grep -Fq '.parameters.require_code_owner_review == false' "$main_protection_validator"
+grep -Fq 'code-owner-review' "$main_protection_validator_test"
+grep -Fq 'as $applicable_ruleset_ids' "$main_protection_validator"
+grep -Fq 'all($effective_rules[] | select(.type == "pull_request"); zero_review_pull_request)' "$main_protection_validator"
+grep -Fq 'all($effective_rules[] | select(.type == "required_status_checks"); strict_status_checks)' "$main_protection_validator"
+grep -Fq 'conflicting-pull-request-ruleset' "$main_protection_validator_test"
+grep -Fq '.parameters.required_status_checks == [{' "$main_protection_validator"
+grep -Fq 'context: "Gate 1 receipt contract"' "$main_protection_validator"
+grep -Fq 'integration_id: 15368' "$main_protection_validator"
+grep -Fq 'all(.[]; .type != "workflows" and .type != "required_deployments")' "$main_protection_validator"
+for external_gate_fixture in extra-status-context added-status-rule added-workflow added-required-deployment; do
+  grep -Fq "$external_gate_fixture" "$main_protection_validator_test"
+done
 if grep -Fq 'def required_workflows' "$main_protection_validator"; then
   printf '%s\n' "generic required-workflow rules must not replace the exact Gate 1 status contract" >&2
   exit 1

@@ -7,7 +7,7 @@ Usage:
   BUZZ_SMOKE_APPROVED_ORIGIN_RECORD=/approved/personal-staging-origin.json \
   bash ./deploy/personal-relay/smoke-test.sh https://relay.example
 
-The independently reviewed JSON record supplies:
+The owner-authorized JSON record supplies:
   - environment
   - approved_origin
   - expected_relay_pubkey
@@ -74,8 +74,8 @@ jq -e \
   '.forbidden_origins | type == "array" and length >= 2 and all(.[]; type == "string" and length > 0)' \
   "$approval_record" >/dev/null || fail "approval record must contain at least two forbidden origins"
 jq -e \
-  '.approved_by | type == "string" and length > 0' \
-  "$approval_record" >/dev/null || fail "approval record reviewer is missing"
+  '.approved_by == "justinharkelroad"' \
+  "$approval_record" >/dev/null || fail "approval record is not authorized by the repository owner"
 jq -e \
   '.approved_at | type == "string" and length > 0' \
   "$approval_record" >/dev/null || fail "approval record timestamp is missing"
@@ -137,7 +137,7 @@ if jq -e --arg target "$target_origin" '.forbidden_origins | index($target) != n
   fail "target is explicitly forbidden by the approved-origin record"
 fi
 [[ "$target_origin" == "$approved_origin" ]] || \
-  fail "target origin does not exactly match the independently approved record"
+  fail "target origin does not exactly match the owner-authorized record"
 
 case "$target_protocol" in
   https:)

@@ -1,6 +1,5 @@
 {
   "environment": "personal-staging",
-  "admin_bypass_settings_receipt_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
   "https_origin": "https://CHANGE_ME_STAGING_RELAY_HOST",
   "wss_origin": "wss://CHANGE_ME_STAGING_RELAY_HOST",
   "hosted_https_origin": "https://CHANGE_ME_HOSTED_BUZZ_HOST",
@@ -24,11 +23,11 @@
   "smoke_approval_record_sha256": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_SHA256",
   "smoke_passed": true,
   "smoke_completed_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
-  "approved_by": {
-    "login": "CHANGE_ME_GITHUB_LOGIN",
+  "authorized_by": {
+    "login": "justinharkelroad",
     "id": 123456789,
     "node_id": "CHANGE_ME_GITHUB_NODE_ID"
   },
-  "approved_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
-  "evidence_reference": "CHANGE_ME_REVIEW_OR_TICKET_REFERENCE"
+  "authorized_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
+  "evidence_reference": "CHANGE_ME_AUTHORIZATION_OR_TICKET_REFERENCE"
 }

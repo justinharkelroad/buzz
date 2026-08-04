@@ -182,6 +182,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
           [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
           [[ "$GITHUB_REF" == "refs/heads/main" ]]
           [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
           [[ "$REF_PROTECTED" == "true" ]]
@@ -1029,6 +1030,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
           [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
           [[ "$GITHUB_REF" == "refs/heads/main" ]]
           [[ "$GITHUB_WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-gate1.yml@refs/heads/main" ]]
           [[ "$REF_PROTECTED" == "true" ]]
@@ -1317,6 +1319,10 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
           [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]] || {
+            echo "::error::only repository owner justinharkelroad may issue a Gate 1 receipt"
+            exit 1
+          }
           [[ "$GITHUB_REF" == "refs/heads/main" ]]
           [[ "$REF_PROTECTED" == "true" ]]
           [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
@@ -1378,13 +1384,40 @@ jobs:
               and .head_branch == "main"
               and .path == ".github/workflows/personal-relay-gate1.yml@main"
               and .repository.full_name == "justinharkelroad/buzz"
+              and .actor.login == "justinharkelroad"
+              and .triggering_actor.login == "justinharkelroad"
               and (.triggering_actor.id | type == "number" and . >= 1)
               and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}
                 == {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id})
             ' /tmp/personal-relay-gate1-run.json >/dev/null
 
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
           gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
-            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
             > /tmp/personal-relay-main-branch.json
           gh api --hostname github.com --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
@@ -1453,35 +1486,14 @@ jobs:
             id,
             node_id,
             name,
-            can_admins_bypass_exposed: has("can_admins_bypass"),
-            can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
-            protection_rules: [.protection_rules[]
-              | if .type == "required_reviewers" then {
-                  type,
-                  prevent_self_review,
-                  reviewers: [.reviewers[] | {
-                    type,
-                    reviewer: {
-                      login: (.reviewer.login // ""),
-                      id: .reviewer.id,
-                      node_id: .reviewer.node_id
-                    }
-                  }] | sort_by(.type, .reviewer.login, .reviewer.id, .reviewer.node_id)
-                } else {type} end
-            ] | sort_by(.type),
+            protection_rules: [.protection_rules[]] | sort_by(.type),
             deployment_branch_policy
           }' /tmp/personal-relay-gate1-environment.raw.json \
             > /tmp/personal-relay-gate1-environment.json
           jq -e '
             .name == "personal-relay-gate1"
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
-            and any(.protection_rules[]?;
-              .type == "required_reviewers"
-              and .prevent_self_review == true
-              and (.reviewers | type == "array" and length > 0)
-            )
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' /tmp/personal-relay-gate1-environment.json >/dev/null
 
           gh api --hostname github.com --paginate --slurp \
@@ -1501,24 +1513,6 @@ jobs:
             and .branch_policies[0].name == "main"
           ' /tmp/personal-relay-gate1-branch-policies.json >/dev/null
 
-          gh api --hostname github.com \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
-            > /tmp/personal-relay-gate1-environment-approvals.raw.json
-          jq '[.[] | {
-            state,
-            environments: [.environments[]? | {id, name}],
-            user: (.user | {login, id, node_id})
-          }]' /tmp/personal-relay-gate1-environment-approvals.raw.json \
-            > /tmp/personal-relay-gate1-environment-approvals.json
-          triggering_id=$(jq -r .triggering_actor.id /tmp/personal-relay-gate1-run.json)
-          jq -e --argjson triggering_id "$triggering_id" '
-            any(.[];
-              .state == "approved"
-              and (.user.id | type == "number" and . >= 1 and . != $triggering_id)
-              and (.user.node_id | type == "string" and length > 0)
-              and any(.environments[]?; .name == "personal-relay-gate1")
-            )
-          ' /tmp/personal-relay-gate1-environment-approvals.json >/dev/null
 
       - name: Download exact sealed unprivileged proof artifacts
         env:
@@ -1665,10 +1659,10 @@ jobs:
           ' /tmp/personal-relay-release-artifact.json >/dev/null
 
           ledger=/tmp/personal-relay-release-evidence/personal-relay-release.json
-          authorization_artifact_id=$(jq -er '.release_approval.evidence_artifact.id' "$ledger")
-          authorization_artifact_name=$(jq -er '.release_approval.evidence_artifact.name' "$ledger")
-          authorization_artifact_digest=$(jq -er '.release_approval.evidence_artifact.digest' "$ledger")
-          authorization_artifact_expires_at=$(jq -er '.release_approval.evidence_artifact.expires_at' "$ledger")
+          authorization_artifact_id=$(jq -er '.release_authorization.evidence_artifact.id' "$ledger")
+          authorization_artifact_name=$(jq -er '.release_authorization.evidence_artifact.name' "$ledger")
+          authorization_artifact_digest=$(jq -er '.release_authorization.evidence_artifact.digest' "$ledger")
+          authorization_artifact_expires_at=$(jq -er '.release_authorization.evidence_artifact.expires_at' "$ledger")
           bash ./deploy/personal-relay/download-exact-artifact.sh \
             --artifact-id "$authorization_artifact_id" \
             --run-id "$release_run_id" \
@@ -1682,14 +1676,12 @@ jobs:
             .expired == false and .expires_at == $expires_at
           ' /tmp/personal-relay-release-authorization-artifact.json >/dev/null
           expected_authorization_files=(
-            personal-relay-release-approval-history.json
             personal-relay-release-authorization.json
             personal-relay-release-branch-policies.json
             personal-relay-release-environment.json
             personal-relay-release-main-branch.json
             personal-relay-release-main-effective-rules.json
             personal-relay-release-main-rulesets.json
-            personal-relay-release-reviewer.json
             personal-relay-release-run-identity.json
           )
           mapfile -t actual_authorization_files < <(
@@ -1713,7 +1705,6 @@ jobs:
           cp /tmp/personal-relay-gate1-run.json "$scan_dir/"
           cp /tmp/personal-relay-gate1-environment.json "$scan_dir/"
           cp /tmp/personal-relay-gate1-branch-policies.json "$scan_dir/"
-          cp /tmp/personal-relay-gate1-environment-approvals.json "$scan_dir/"
           cp /tmp/personal-relay-main-branch.json "$scan_dir/"
           cp /tmp/personal-relay-main-effective-rules.json "$scan_dir/"
           cp /tmp/personal-relay-gate1-main-rulesets.json "$scan_dir/"
@@ -1807,7 +1798,6 @@ jobs:
             --release-provenance-verification /tmp/personal-relay-gate1-image-proof/release-provenance-verification.json \
             --environment-config /tmp/personal-relay-gate1-environment.json \
             --environment-branch-policies /tmp/personal-relay-gate1-branch-policies.json \
-            --environment-approvals /tmp/personal-relay-gate1-environment-approvals.json \
             --main-branch-metadata /tmp/personal-relay-main-branch.json \
             --main-effective-rules /tmp/personal-relay-main-effective-rules.json \
             --main-rulesets /tmp/personal-relay-gate1-main-rulesets.json \
@@ -1853,7 +1843,6 @@ jobs:
           cp /tmp/personal-relay-gate1-run.json "$stage/"
           cp /tmp/personal-relay-gate1-environment.json "$stage/"
           cp /tmp/personal-relay-gate1-branch-policies.json "$stage/"
-          cp /tmp/personal-relay-gate1-environment-approvals.json "$stage/"
           cp /tmp/personal-relay-main-branch.json "$stage/"
           cp /tmp/personal-relay-main-effective-rules.json "$stage/"
           cp /tmp/personal-relay-gate1-main-rulesets.json "$stage/"
@@ -1862,9 +1851,7 @@ jobs:
           cp /tmp/personal-relay-release-evidence/personal-relay-release-main-rulesets.json "$stage/"
           cp /tmp/personal-relay-release-evidence/personal-relay-release-environment.json "$stage/"
           cp /tmp/personal-relay-release-evidence/personal-relay-release-branch-policies.json "$stage/"
-          cp /tmp/personal-relay-release-evidence/personal-relay-release-approval-history.json "$stage/"
           cp /tmp/personal-relay-release-evidence/personal-relay-release-run-identity.json "$stage/"
-          cp /tmp/personal-relay-release-evidence/personal-relay-release-reviewer.json "$stage/"
           cp /tmp/personal-relay-release-evidence/personal-relay-release-authorization.json "$stage/"
           cp /tmp/personal-relay-gate1-approval-secret-scan-proof.json "$stage/"
           cp /tmp/personal-relay-gate1-approval-secret.json "$stage/"
@@ -2014,6 +2001,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
           [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
           [[ "$GITHUB_REF" == "refs/heads/main" ]]
           [[ "$REF_PROTECTED" == "true" ]]
           [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]
@@ -2040,7 +2028,7 @@ jobs:
             --metadata-output /tmp/personal-relay-gate1-validation-artifact.json \
             --archive-output /tmp/personal-relay-gate1-validation-evidence.zip
 
-      - name: Revalidate exact receipt, expiry, proof identities, and run-level approval evidence
+      - name: Revalidate exact receipt, expiry, proof identities, and owner authorization
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_ARTIFACT_DIGEST: ${{ needs.image-validation.outputs.artifact_digest }}
@@ -2062,15 +2050,12 @@ jobs:
           release_rulesets="$dir/personal-relay-release-main-rulesets.json"
           release_environment="$dir/personal-relay-release-environment.json"
           release_branch_policies="$dir/personal-relay-release-branch-policies.json"
-          release_approval_history="$dir/personal-relay-release-approval-history.json"
           release_run_identity="$dir/personal-relay-release-run-identity.json"
-          release_reviewer="$dir/personal-relay-release-reviewer.json"
           release_authorization="$dir/personal-relay-release-authorization.json"
           for release_proof in \
             "$release_branch" "$release_rules" "$release_rulesets" \
             "$release_environment" "$release_branch_policies" \
-            "$release_approval_history" "$release_run_identity" \
-            "$release_reviewer" "$release_authorization"; do
+            "$release_run_identity" "$release_authorization"; do
             [[ -f "$release_proof" && ! -L "$release_proof" ]]
             jq -e . "$release_proof" >/dev/null
           done
@@ -2085,24 +2070,16 @@ jobs:
           release_rulesets_sha=$(sha256sum "$release_rulesets" | awk '{print $1}')
           release_environment_sha=$(sha256sum "$release_environment" | awk '{print $1}')
           release_branch_policies_sha=$(sha256sum "$release_branch_policies" | awk '{print $1}')
-          release_approval_history_sha=$(sha256sum "$release_approval_history" | awk '{print $1}')
           release_run_identity_sha=$(sha256sum "$release_run_identity" | awk '{print $1}')
-          release_reviewer_sha=$(sha256sum "$release_reviewer" | awk '{print $1}')
           release_authorization_sha=$(sha256sum "$release_authorization" | awk '{print $1}')
           release_run_id=$(jq -er '.release_evidence.workflow_run_id' "$receipt")
           [[ "$release_run_id" =~ ^[1-9][0-9]*$ ]]
           jq -e '
             type == "object"
             and .name == "personal-relay-release"
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy.protected_branches == false
             and .deployment_branch_policy.custom_branch_policies == true
-            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 1
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].prevent_self_review == true)
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers | length) == 1
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[0].type == "User")
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[0].reviewer | keys) == ["id", "login", "node_id"]
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' "$release_environment" >/dev/null
           jq -e '
             .total_count == 1
@@ -2121,30 +2098,10 @@ jobs:
               and .event == "workflow_dispatch"
               and .path == ".github/workflows/personal-relay-image.yml@main"
               and .repository.full_name == $repository
+              and .actor.login == "justinharkelroad"
+              and .triggering_actor.login == "justinharkelroad"
+              and .actor == .triggering_actor
             ' "$release_run_identity" >/dev/null
-          jq -e '
-            type == "object"
-            and keys == ["reviewer", "type"]
-            and .type == "User"
-            and (.reviewer | keys) == ["id", "login", "node_id"]
-          ' "$release_reviewer" >/dev/null
-          jq -e \
-            --slurpfile environment "$release_environment" \
-            --slurpfile run "$release_run_identity" \
-            --slurpfile reviewer "$release_reviewer" '
-              type == "array"
-              and length == 1
-              and .[0].state == "approved"
-              and (.[0].environments | length) == 1
-              and .[0].environments[0].name == "personal-relay-release"
-              and .[0].user == $reviewer[0].reviewer
-              and any($environment[0].protection_rules[] | select(.type == "required_reviewers") | .reviewers[];
-                .type == "User" and .reviewer == $reviewer[0].reviewer)
-              and $reviewer[0].reviewer.id != $run[0].actor.id
-              and $reviewer[0].reviewer.node_id != $run[0].actor.node_id
-              and $reviewer[0].reviewer.id != $run[0].triggering_actor.id
-              and $reviewer[0].reviewer.node_id != $run[0].triggering_actor.node_id
-            ' "$release_approval_history" >/dev/null
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$SOURCE_SHA" \
@@ -2157,12 +2114,10 @@ jobs:
             --arg rulesets_sha "$release_rulesets_sha" \
             --arg environment_sha "$release_environment_sha" \
             --arg branch_policies_sha "$release_branch_policies_sha" \
-            --arg approval_history_sha "$release_approval_history_sha" \
             --arg run_identity_sha "$release_run_identity_sha" \
-            --arg reviewer_sha "$release_reviewer_sha" \
-            --slurpfile environment "$release_environment" '
-              keys == ["admin_bypass_api_state", "admin_bypass_settings_receipt_sha256", "approval_history_sha256", "branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "reviewer_sha256", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
-              and .schema == "personal-relay-release-authorization/v2"
+            '
+              keys == ["branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+              and .schema == "personal-relay-release-authorization/v3"
               and .repository == $repository
               and .source_sha == $source_sha
               and .image_name == $image_name
@@ -2178,16 +2133,7 @@ jobs:
               and .rulesets_sha256 == $rulesets_sha
               and .environment_sha256 == $environment_sha
               and .branch_policies_sha256 == $branch_policies_sha
-              and .approval_history_sha256 == $approval_history_sha
               and .run_identity_sha256 == $run_identity_sha
-              and .reviewer_sha256 == $reviewer_sha
-              and ((.admin_bypass_api_state == "disabled"
-                  and $environment[0].can_admins_bypass_exposed == true
-                  and $environment[0].can_admins_bypass == false)
-                or (.admin_bypass_api_state == "not-exposed"
-                  and $environment[0].can_admins_bypass_exposed == false
-                  and $environment[0].can_admins_bypass == null))
-              and (.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
             ' "$release_authorization" >/dev/null
           bash ./deploy/personal-relay/validate-main-protection.sh \
             --branch-json "$dir/personal-relay-main-branch.json" \
@@ -2215,11 +2161,9 @@ jobs:
             --arg release_rulesets_sha "$release_rulesets_sha" \
             --arg release_environment_sha "$release_environment_sha" \
             --arg release_branch_policies_sha "$release_branch_policies_sha" \
-            --arg release_approval_history_sha "$release_approval_history_sha" \
             --arg release_run_identity_sha "$release_run_identity_sha" \
-            --arg release_reviewer_sha "$release_reviewer_sha" \
             --arg release_authorization_sha "$release_authorization_sha" \
-            --arg release_authorization_artifact_name "personal-relay-release-approval-${SOURCE_SHA}-${release_run_id}-1" \
+            --arg release_authorization_artifact_name "personal-relay-release-authorization-${SOURCE_SHA}-${release_run_id}-1" \
             --arg now "$now" \
             --argjson source_artifact_id "$SOURCE_ARTIFACT_ID" \
             --arg source_artifact_name "$SOURCE_ARTIFACT_NAME" \
@@ -2242,21 +2186,18 @@ jobs:
               and .release_evidence.main_protection.branch_metadata_sha256 == $release_branch_sha
               and .release_evidence.main_protection.effective_rules_sha256 == $release_rules_sha
               and .release_evidence.main_protection.rulesets_sha256 == $release_rulesets_sha
-              and .release_evidence.release_approval.environment == "personal-relay-release"
-              and .release_evidence.release_approval.image_name == $image
-              and .release_evidence.release_approval.candidate_tag == ("sha-" + $source_sha)
-              and .release_evidence.release_approval.environment_sha256 == $release_environment_sha
-              and .release_evidence.release_approval.branch_policies_sha256 == $release_branch_policies_sha
-              and .release_evidence.release_approval.approval_history_sha256 == $release_approval_history_sha
-              and .release_evidence.release_approval.run_identity_sha256 == $release_run_identity_sha
-              and .release_evidence.release_approval.reviewer_sha256 == $release_reviewer_sha
-              and .release_evidence.release_approval.authorization_sha256 == $release_authorization_sha
-              and (.release_evidence.release_approval.admin_bypass_api_state == "disabled" or .release_evidence.release_approval.admin_bypass_api_state == "not-exposed")
-              and (.release_evidence.release_approval.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
-              and (.release_evidence.release_approval.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
-              and .release_evidence.release_approval.evidence_artifact.name == $release_authorization_artifact_name
-              and (.release_evidence.release_approval.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
-              and (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601) > ($now | fromdateiso8601)
+              and .release_evidence.release_authorization.environment == "personal-relay-release"
+              and .release_evidence.release_authorization.authorized_owner == "justinharkelroad"
+              and .release_evidence.release_authorization.image_name == $image
+              and .release_evidence.release_authorization.candidate_tag == ("sha-" + $source_sha)
+              and .release_evidence.release_authorization.environment_sha256 == $release_environment_sha
+              and .release_evidence.release_authorization.branch_policies_sha256 == $release_branch_policies_sha
+              and .release_evidence.release_authorization.run_identity_sha256 == $release_run_identity_sha
+              and .release_evidence.release_authorization.authorization_sha256 == $release_authorization_sha
+              and (.release_evidence.release_authorization.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
+              and .release_evidence.release_authorization.evidence_artifact.name == $release_authorization_artifact_name
+              and (.release_evidence.release_authorization.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
+              and (.release_evidence.release_authorization.evidence_artifact.expires_at | fromdateiso8601) > ($now | fromdateiso8601)
               and .main_protection == {
                 branch: "main",
                 commit_sha: $workflow_sha,
@@ -2276,7 +2217,7 @@ jobs:
               and (.eligibility_expires_at | fromdateiso8601) > ($now | fromdateiso8601)
               and (.release_evidence.expires_at | fromdateiso8601) > ($now | fromdateiso8601)
               and (.eligibility_expires_at | fromdateiso8601) <= (.release_evidence.expires_at | fromdateiso8601)
-              and (.eligibility_expires_at | fromdateiso8601) <= (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601)
+              and (.eligibility_expires_at | fromdateiso8601) <= (.release_evidence.release_authorization.evidence_artifact.expires_at | fromdateiso8601)
               and .non_effects.actions_evidence_artifacts_published == true
               and .non_effects.registry_package_published == false
               and .non_effects.registry_package_mutated == false
@@ -2300,7 +2241,6 @@ jobs:
             triggering_actor: (.triggering_actor | {login, id, node_id})
           }' /tmp/personal-relay-gate1-attest-run.raw.json \
             > /tmp/personal-relay-gate1-attest-run.json
-          triggering_id=$(jq -r .triggering_actor.id /tmp/personal-relay-gate1-attest-run.json)
           jq -e \
             --argjson run_id "$GITHUB_RUN_ID" \
             --arg workflow_sha "$GITHUB_SHA" '
@@ -2309,26 +2249,11 @@ jobs:
               and .head_sha == $workflow_sha
               and .head_branch == "main"
               and .path == ".github/workflows/personal-relay-gate1.yml@main"
+              and .actor.login == "justinharkelroad"
+              and .triggering_actor.login == "justinharkelroad"
               and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}
                 == {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id})
             ' /tmp/personal-relay-gate1-attest-run.json >/dev/null
-          gh api --hostname github.com \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
-            > /tmp/personal-relay-gate1-attest-environment-approvals.raw.json
-          jq '[.[] | {
-            state,
-            environments: [.environments[]? | {id, name}],
-            user: (.user | {login, id, node_id})
-          }]' /tmp/personal-relay-gate1-attest-environment-approvals.raw.json \
-            > /tmp/personal-relay-gate1-attest-environment-approvals.json
-          jq -e --argjson triggering_id "$triggering_id" '
-            any(.[];
-              .state == "approved"
-              and (.user.id | type == "number" and . >= 1 and . != $triggering_id)
-              and (.user.node_id | type == "string" and length > 0)
-              and any(.environments[]?; .name == "personal-relay-gate1")
-            )
-          ' /tmp/personal-relay-gate1-attest-environment-approvals.json >/dev/null
 
       - name: Re-fetch and byte-compare live protections immediately before attestation
         env:
@@ -2344,8 +2269,33 @@ jobs:
           [[ ! -e "$live" && ! -L "$live" ]]
           install -d -m 0700 "$live"
 
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
           gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
-            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
             > "$live/main-branch.json"
           gh api --hostname github.com --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
@@ -2419,34 +2369,13 @@ jobs:
             id,
             node_id,
             name,
-            can_admins_bypass_exposed: has("can_admins_bypass"),
-            can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
-            protection_rules: [.protection_rules[]
-              | if .type == "required_reviewers" then {
-                  type,
-                  prevent_self_review,
-                  reviewers: [.reviewers[] | {
-                    type,
-                    reviewer: {
-                      login: (.reviewer.login // ""),
-                      id: .reviewer.id,
-                      node_id: .reviewer.node_id
-                    }
-                  }] | sort_by(.type, .reviewer.login, .reviewer.id, .reviewer.node_id)
-                } else {type} end
-            ] | sort_by(.type),
+            protection_rules: [.protection_rules[]] | sort_by(.type),
             deployment_branch_policy
           }' "$live/environment.raw.json" > "$live/environment.json"
           jq -e '
             .name == "personal-relay-gate1"
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
-            and any(.protection_rules[]?;
-              .type == "required_reviewers"
-              and .prevent_self_review == true
-              and (.reviewers | type == "array" and length > 0)
-            )
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' "$live/environment.json" >/dev/null
           gh api --hostname github.com --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/environments/personal-relay-gate1/deployment-branch-policies?per_page=100" \
@@ -2480,7 +2409,7 @@ jobs:
           jq -e --argjson minimum_valid_until "$minimum_valid_until" '
             (.eligibility_expires_at | fromdateiso8601) > $minimum_valid_until
             and (.release_evidence.expires_at | fromdateiso8601) > $minimum_valid_until
-            and (.release_evidence.release_approval.evidence_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
+            and (.release_evidence.release_authorization.evidence_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
           ' "$sealed/personal-relay-gate1-receipt.json" >/dev/null
 
       - name: Attest receipt as the exact image custom predicate
@@ -2559,7 +2488,6 @@ jobs:
           cp /tmp/personal-relay-gate1-validation-artifact.json "$stage/"
           cp /tmp/personal-relay-gate1-validation-evidence.zip "$stage/"
           cp /tmp/personal-relay-gate1-attest-run.json "$stage/"
-          cp /tmp/personal-relay-gate1-attest-environment-approvals.json "$stage/"
           cp /tmp/personal-relay-gate1-attestation-bundle.json "$stage/"
           cp /tmp/personal-relay-gate1-attestation-verification.json "$stage/"
           jq -n \

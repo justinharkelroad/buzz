@@ -34,15 +34,16 @@ expect_rejected() {
 }
 
 jq -n --arg sha "$expected_sha" \
-  '{name: "main", commit: {sha: $sha}, protected: true}' \
+  '{name: "main", commit: {sha: $sha}, protected: true, classic_required_pull_request_reviews: false}' \
   > "$tmp_dir/branch.json"
 jq -n '[
   {
     type: "pull_request",
     parameters: {
-      required_approving_review_count: 1,
-      dismiss_stale_reviews_on_push: true,
-      require_last_push_approval: true,
+      required_approving_review_count: 0,
+      dismiss_stale_reviews_on_push: false,
+      require_code_owner_review: false,
+      require_last_push_approval: false,
       required_review_thread_resolution: true
     }
   },
@@ -107,6 +108,10 @@ expect_rejected generic-workflow "$tmp_dir/branch.json" "$tmp_dir/rules-workflow
 
 jq '.protected = false' "$tmp_dir/branch.json" > "$tmp_dir/branch-unprotected.json"
 expect_rejected unprotected "$tmp_dir/branch-unprotected.json" "$tmp_dir/rules-status.json"
+jq '.classic_required_pull_request_reviews = true' \
+  "$tmp_dir/branch.json" > "$tmp_dir/branch-classic-review-protection.json"
+expect_rejected classic-review-protection \
+  "$tmp_dir/branch-classic-review-protection.json" "$tmp_dir/rules-status.json"
 jq '.commit.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$tmp_dir/branch.json" > "$tmp_dir/branch-wrong-sha.json"
 expect_rejected wrong-sha "$tmp_dir/branch-wrong-sha.json" "$tmp_dir/rules-status.json"
 jq '.url = "https://api.github.com/repos/justinharkelroad/buzz/branches/main"' \
@@ -116,14 +121,26 @@ jq '.commit.url = "https://api.github.com/repos/justinharkelroad/buzz/commits/fi
   "$tmp_dir/branch.json" > "$tmp_dir/branch-extra-commit-metadata.json"
 expect_rejected extra-commit-metadata "$tmp_dir/branch-extra-commit-metadata.json" "$tmp_dir/rules-status.json"
 
-for field in dismiss_stale_reviews_on_push require_last_push_approval required_review_thread_resolution; do
-  jq --arg field "$field" '(.[] | select(.type == "pull_request") | .parameters[$field]) = false' \
-    "$tmp_dir/rules-status.json" > "$tmp_dir/rules-${field}.json"
-  expect_rejected "pull-request-${field}" "$tmp_dir/branch.json" "$tmp_dir/rules-${field}.json"
-done
-jq '(.[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = 0' \
-  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-no-approval.json"
-expect_rejected no-approval "$tmp_dir/branch.json" "$tmp_dir/rules-no-approval.json"
+jq '(.[] | select(.type == "pull_request") | .parameters.required_review_thread_resolution) = false' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-no-thread-resolution.json"
+expect_rejected no-thread-resolution "$tmp_dir/branch.json" "$tmp_dir/rules-no-thread-resolution.json"
+jq '(.[] | select(.type == "pull_request") | .parameters.require_last_push_approval) = true' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-last-push-approval.json"
+expect_rejected last-push-approval "$tmp_dir/branch.json" "$tmp_dir/rules-last-push-approval.json"
+jq '(.[] | select(.type == "pull_request") | .parameters.required_approving_review_count) = 1' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-reviewer-required.json"
+expect_rejected reviewer-required "$tmp_dir/branch.json" "$tmp_dir/rules-reviewer-required.json"
+jq '(.[] | select(.type == "pull_request") | .parameters.require_code_owner_review) = true' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-code-owner-review.json"
+expect_rejected code-owner-review "$tmp_dir/branch.json" "$tmp_dir/rules-code-owner-review.json"
+jq '(.[] | select(.type == "pull_request") | .parameters.dismiss_stale_reviews_on_push) = true' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-stale-review-setting.json"
+bash "$validator" \
+  --branch-json "$tmp_dir/branch.json" \
+  --rules-json "$tmp_dir/rules-stale-review-setting.json" \
+  --rulesets-json "$tmp_dir/rulesets.json" \
+  --expected-repository justinharkelroad/buzz \
+  --expected-sha "$expected_sha" >/dev/null
 
 for type in pull_request deletion non_fast_forward required_status_checks; do
   jq --arg type "$type" 'map(select(.type != $type))' "$tmp_dir/rules-status.json" \
@@ -145,6 +162,43 @@ expect_rejected null-integration "$tmp_dir/branch.json" "$tmp_dir/rules-null-int
 jq '(.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[0].integration_id) = 6' \
   "$tmp_dir/rules-status.json" > "$tmp_dir/rules-wrong-integration.json"
 expect_rejected wrong-integration "$tmp_dir/branch.json" "$tmp_dir/rules-wrong-integration.json"
+jq '(.[] | select(.type == "required_status_checks") | .parameters.required_status_checks) += [
+  {context: "Additional external status", integration_id: 15368}
+]' "$tmp_dir/rules-status.json" > "$tmp_dir/rules-extra-status-context.json"
+expect_rejected extra-status-context "$tmp_dir/branch.json" "$tmp_dir/rules-extra-status-context.json"
+
+jq '. + [{
+  type: "required_status_checks",
+  ruleset_id: 42,
+  ruleset_source_type: "Repository",
+  ruleset_source: "justinharkelroad/buzz",
+  parameters: {
+    strict_required_status_checks_policy: true,
+    required_status_checks: [{context: "External status gate", integration_id: 15368}]
+  }
+}]' "$tmp_dir/rules-status.json" > "$tmp_dir/rules-added-status-rule.json"
+expect_rejected added-status-rule "$tmp_dir/branch.json" "$tmp_dir/rules-added-status-rule.json"
+
+jq '. + [{
+  type: "workflows",
+  ruleset_id: 42,
+  ruleset_source_type: "Repository",
+  ruleset_source: "justinharkelroad/buzz",
+  parameters: {
+    workflows: [{path: ".github/workflows/external-gate.yml", repository_id: 123, ref: "refs/heads/main"}]
+  }
+}]' "$tmp_dir/rules-status.json" > "$tmp_dir/rules-added-workflow.json"
+expect_rejected added-workflow "$tmp_dir/branch.json" "$tmp_dir/rules-added-workflow.json"
+
+jq '. + [{
+  type: "required_deployments",
+  ruleset_id: 42,
+  ruleset_source_type: "Repository",
+  ruleset_source: "justinharkelroad/buzz",
+  parameters: {required_deployment_environments: ["external-gate"]}
+}]' "$tmp_dir/rules-status.json" > "$tmp_dir/rules-added-required-deployment.json"
+expect_rejected added-required-deployment \
+  "$tmp_dir/branch.json" "$tmp_dir/rules-added-required-deployment.json"
 
 jq '.[0].bypass_actors = [{actor_id: 1, actor_type: "RepositoryRole", bypass_mode: "always"}]' \
   "$tmp_dir/rulesets.json" > "$tmp_dir/rulesets-bypass.json"
@@ -159,6 +213,16 @@ jq 'map(if .type == "deletion" then .ruleset_id = 43 else . end)' \
 jq '.[0] as $base | [$base, ($base + {id: 43, name: "split-policy"})]' \
   "$tmp_dir/rulesets.json" > "$tmp_dir/rulesets-split.json"
 expect_rejected split-policy "$tmp_dir/branch.json" "$tmp_dir/rules-split.json" "$tmp_dir/rulesets-split.json"
+jq '. + [(.[] | select(.type == "pull_request")
+  | .ruleset_id = 43
+  | .parameters.required_approving_review_count = 1)]' \
+  "$tmp_dir/rules-status.json" > "$tmp_dir/rules-conflicting-pull-request.json"
+jq '.[0] as $base | [$base, ($base + {id: 43, name: "conflicting-pull-request"})]' \
+  "$tmp_dir/rulesets.json" > "$tmp_dir/rulesets-conflicting-pull-request.json"
+expect_rejected conflicting-pull-request-ruleset \
+  "$tmp_dir/branch.json" \
+  "$tmp_dir/rules-conflicting-pull-request.json" \
+  "$tmp_dir/rulesets-conflicting-pull-request.json"
 jq '.[0].source = "another-owner/buzz"' "$tmp_dir/rulesets.json" > "$tmp_dir/rulesets-wrong-source.json"
 expect_rejected wrong-ruleset-source "$tmp_dir/branch.json" "$tmp_dir/rules-status.json" "$tmp_dir/rulesets-wrong-source.json"
 jq '.[0].id = 99' "$tmp_dir/rulesets.json" > "$tmp_dir/rulesets-wrong-id.json"

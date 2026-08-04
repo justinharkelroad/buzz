@@ -6,7 +6,7 @@
     "https://CHANGE_ME_HOSTED_BUZZ_HOST",
     "https://CHANGE_ME_PERSONAL_PRODUCTION_HOST"
   ],
-  "approved_by": "CHANGE_ME_REVIEWER",
+  "approved_by": "justinharkelroad",
   "approved_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
-  "evidence_reference": "CHANGE_ME_REVIEW_OR_TICKET_REFERENCE"
+  "evidence_reference": "CHANGE_ME_AUTHORIZATION_OR_TICKET_REFERENCE"
 }

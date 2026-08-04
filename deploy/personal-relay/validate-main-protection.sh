@@ -54,37 +54,36 @@ done
 
 jq -e --arg expected_sha "$expected_sha" '
   type == "object"
-  and keys == ["commit", "name", "protected"]
+  and keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]
   and .name == "main"
   and .protected == true
+  and .classic_required_pull_request_reviews == false
   and (.commit | type == "object" and keys == ["sha"])
   and .commit.sha == $expected_sha
 ' "$branch_json" >/dev/null || fail "main branch metadata is unprotected or does not match the verifier SHA"
 
 jq -e --arg expected_repository "$expected_repository" --slurpfile rulesets "$rulesets_json" '
-  def required_pull_request:
+  def zero_review_pull_request:
     .type == "pull_request"
     and (.parameters | type == "object")
-    and (.parameters.required_approving_review_count | type == "number" and . >= 1 and floor == .)
-    and .parameters.dismiss_stale_reviews_on_push == true
-    and .parameters.require_last_push_approval == true
+    and .parameters.required_approving_review_count == 0
+    and .parameters.require_code_owner_review == false
+    and .parameters.require_last_push_approval == false;
+  def required_pull_request:
+    zero_review_pull_request
     and .parameters.required_review_thread_resolution == true;
   def strict_status_checks:
     .type == "required_status_checks"
     and (.parameters | type == "object")
     and .parameters.strict_required_status_checks_policy == true
-    and (.parameters.required_status_checks | type == "array" and length > 0)
-    and all(.parameters.required_status_checks[];
-      (.context | type == "string" and length > 0)
-      and (.integration_id | type == "number" and . >= 1 and floor == .)
-    )
-    and any(.parameters.required_status_checks[];
-      .context == "Gate 1 receipt contract"
-      and .integration_id == 15368
-    );
+    and .parameters.required_status_checks == [{
+      context: "Gate 1 receipt contract",
+      integration_id: 15368
+    }];
   type == "array"
   and length > 0
   and all(.[].ruleset_id; type == "number" and . >= 1 and floor == .)
+  and all(.[]; .type != "workflows" and .type != "required_deployments")
   and all(.[];
     type == "object"
     and (.type | type == "string" and length > 0)
@@ -105,25 +104,36 @@ jq -e --arg expected_repository "$expected_repository" --slurpfile rulesets "$ru
     and (.enforcement | type == "string" and length > 0)
     and (.bypass_actors | type == "array")
   ))
-  and (. as $effective_rules | any($rulesets[0][];
-    . as $ruleset
-    | $ruleset.target == "branch"
-    and $ruleset.enforcement == "active"
-    and $ruleset.source_type == "Repository"
-    and $ruleset.source == $expected_repository
-    and $ruleset.bypass_actors == []
-    and ([$effective_rules[] | select(.ruleset_id == $ruleset.id)] as $group
-      | length > 0
-      and all($group[];
-        .ruleset_source_type == "Repository"
-        and .ruleset_source == $expected_repository
+  and (. as $effective_rules
+    | [$rulesets[0][]
+      | select(
+          .target == "branch"
+          and .enforcement == "active"
+          and .source_type == "Repository"
+          and .source == $expected_repository
+          and .bypass_actors == []
+        )
+      | .id
+    ] as $applicable_ruleset_ids
+    | ($applicable_ruleset_ids | length) > 0
+    and all($effective_rules[] | select(.type == "pull_request"); zero_review_pull_request)
+    and all($effective_rules[] | select(.type == "required_status_checks"); strict_status_checks)
+    and any($rulesets[0][];
+      . as $ruleset
+      | ($applicable_ruleset_ids | index($ruleset.id)) != null
+      and ([$effective_rules[] | select(.ruleset_id == $ruleset.id)] as $group
+        | length > 0
+        and all($group[];
+          .ruleset_source_type == "Repository"
+          and .ruleset_source == $expected_repository
+        )
+        and any($group[]; required_pull_request)
+        and any($group[]; .type == "deletion")
+        and any($group[]; .type == "non_fast_forward")
+        and any($group[]; strict_status_checks)
       )
-      and any($group[]; required_pull_request)
-      and any($group[]; .type == "deletion")
-      and any($group[]; .type == "non_fast_forward")
-      and any($group[]; strict_status_checks)
     )
-  ))
+  )
 ' "$rules_json" >/dev/null || fail "effective main rules do not satisfy the minimum protected verifier policy"
 
 printf '%s\n' "protected main evidence passed for $expected_sha"

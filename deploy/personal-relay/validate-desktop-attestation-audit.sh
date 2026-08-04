@@ -87,7 +87,7 @@ jq -e '
     "staging_deployment_receipt_sha256", "target", "version",
     "volume_artifact", "volume_hashes", "workflow"
   ]
-  and .schema == "personal-desktop-attestation-audit-expectations/v2"
+  and .schema == "personal-desktop-attestation-audit-expectations/v3"
   and .repository == "justinharkelroad/buzz"
   and (.source_sha | test("^[0-9a-f]{40}$"))
   and (.target == "aarch64-apple-darwin" or .target == "x86_64-apple-darwin")
@@ -223,7 +223,8 @@ jq -e \
   --slurpfile expected "$expectations" \
   --slurpfile sidecars "$sidecar_manifest" '
     $expected[0] as $e
-    | .repository == $e.repository
+    | .schema == "personal-desktop-staging/v2"
+    and .repository == $e.repository
     and .workflow_sha == $e.workflow.sha
     and .workflow_ref == $e.workflow.ref
     and .workflow_run == ("https://github.com/" + $e.repository + "/actions/runs/" + ($e.workflow.run_id | tostring))
@@ -248,6 +249,20 @@ jq -e \
     and .relay_https == $e.build.relay_https
     and .relay_wss == $e.build.relay_wss
     and .staging_deployment_receipt_sha256 == $e.staging_deployment_receipt_sha256
+    and (.staging_controls | type == "object")
+    and (.staging_controls | keys | sort) == ([
+      "authorized_owner", "deployment_branch", "deployment_branch_policies_sha256",
+      "environment", "environment_configuration_sha256", "run_identity_sha256"
+    ] | sort)
+    and .staging_controls.environment == "personal-staging"
+    and .staging_controls.deployment_branch == "main"
+    and (.staging_controls.environment_configuration_sha256 | test("^[0-9a-f]{64}$"))
+    and (.staging_controls.deployment_branch_policies_sha256 | test("^[0-9a-f]{64}$"))
+    and (.staging_controls.run_identity_sha256 | test("^[0-9a-f]{64}$"))
+    and (.staging_controls.authorized_owner | keys | sort) == ["id", "login", "node_id"]
+    and .staging_controls.authorized_owner.login == "justinharkelroad"
+    and (.staging_controls.authorized_owner.id | type == "number" and . >= 1 and floor == .)
+    and (.staging_controls.authorized_owner.node_id | type == "string" and length > 0)
     and .dmg_sha256 == $dmg_sha
     and .buzz_acp_sha256 == $acp_sha
     and .sidecar_manifest_sha256 == $manifest_sha
@@ -573,7 +588,7 @@ jq -e \
       "desktop", "gate1", "inspection", "ledger", "ledger_sha256", "relay", "remount",
       "repository", "safety", "schema", "source_sha", "staging", "subject", "verifier"
     ]
-    and .schema == "personal-desktop-staging-attestation/v1"
+    and .schema == "personal-desktop-staging-attestation/v2"
     and .repository == $e.repository
     and .source_sha == $e.source_sha
     and .ledger == $l
@@ -594,18 +609,15 @@ jq -e \
     }
     and .staging == {
       deployment_receipt_sha256: $l.staging_deployment_receipt_sha256,
-      admin_bypass_settings_receipt_sha256: $l.admin_bypass_settings_receipt_sha256,
       deployment_evidence_reference: $l.staging_deployment_evidence_reference,
       smoke_approval_record_sha256: $l.smoke_approval_record_sha256,
       controls: {
         environment: $l.staging_controls.environment,
         environment_configuration_sha256: $l.staging_controls.environment_configuration_sha256,
         deployment_branch_policies_sha256: $l.staging_controls.deployment_branch_policies_sha256,
-        approval_history_sha256: $l.staging_controls.approval_history_sha256,
         run_identity_sha256: $l.staging_controls.run_identity_sha256,
-        prevent_self_review: $l.staging_controls.prevent_self_review,
         deployment_branch: $l.staging_controls.deployment_branch,
-        admin_bypass_api_state: $l.staging_controls.admin_bypass_api_state
+        authorized_owner: $l.staging_controls.authorized_owner
       }
     }
     and .safety == {
@@ -664,7 +676,7 @@ jq -nS \
   --slurpfile expected "$expectations" '
     $expected[0] as $e
     | {
-      schema: "personal-desktop-attestation-audit-summary/v2",
+      schema: "personal-desktop-attestation-audit-summary/v3",
       candidate: {
         dmg_name: $dmg_name, dmg_sha256: $dmg_sha,
         ledger_sha256: $ledger_sha, sidecar_manifest_sha256: $manifest_sha

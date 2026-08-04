@@ -20,7 +20,6 @@ Usage:
     --release-provenance-verification JSON \
     --environment-config JSON \
     --environment-branch-policies JSON \
-    --environment-approvals JSON \
     --main-branch-metadata JSON \
     --main-effective-rules JSON \
     --main-rulesets JSON \
@@ -48,7 +47,7 @@ Usage:
     --output RECEIPT.json
 
 "prepare" derives a complete disposition template from the exact release
-evidence. A reviewer fills every disposition and the top-level approval fields.
+evidence. The repository owner fills every disposition and the top-level approval fields.
 "validate" fails closed unless the approval covers every remaining HIGH and
 CRITICAL finding exactly once and all release, image, scanner database, and
 evidence bindings match. It writes a non-deploying Gate 1 receipt.
@@ -145,7 +144,6 @@ expected_approval_sha256=
 release_provenance_verification=
 environment_config=
 environment_branch_policies=
-environment_approvals=
 main_branch_metadata=
 main_effective_rules=
 main_rulesets=
@@ -186,7 +184,6 @@ while (($# > 0)); do
     --release-provenance-verification) release_provenance_verification=$2 ;;
     --environment-config) environment_config=$2 ;;
     --environment-branch-policies) environment_branch_policies=$2 ;;
-    --environment-approvals) environment_approvals=$2 ;;
     --main-branch-metadata) main_branch_metadata=$2 ;;
     --main-effective-rules) main_effective_rules=$2 ;;
     --main-rulesets) main_rulesets=$2 ;;
@@ -241,11 +238,9 @@ release_main_effective_rules="$evidence_dir/personal-relay-release-main-effectiv
 release_main_rulesets="$evidence_dir/personal-relay-release-main-rulesets.json"
 release_environment="$evidence_dir/personal-relay-release-environment.json"
 release_branch_policies="$evidence_dir/personal-relay-release-branch-policies.json"
-release_approval_history="$evidence_dir/personal-relay-release-approval-history.json"
 release_run_identity="$evidence_dir/personal-relay-release-run-identity.json"
-release_reviewer="$evidence_dir/personal-relay-release-reviewer.json"
 release_authorization="$evidence_dir/personal-relay-release-authorization.json"
-for path in "$ledger" "$policies" "$databases" "$merged_index" "$attestation_verification" "$attestation_predicate" "$expected_descriptors" "$release_main_branch" "$release_main_effective_rules" "$release_main_rulesets" "$release_environment" "$release_branch_policies" "$release_approval_history" "$release_run_identity" "$release_reviewer" "$release_authorization"; do
+for path in "$ledger" "$policies" "$databases" "$merged_index" "$attestation_verification" "$attestation_predicate" "$expected_descriptors" "$release_main_branch" "$release_main_effective_rules" "$release_main_rulesets" "$release_environment" "$release_branch_policies" "$release_run_identity" "$release_authorization"; do
   require_regular_json "$path"
 done
 
@@ -289,31 +284,20 @@ release_main_effective_rules_sha256=$(sha256_file "$release_main_effective_rules
 release_main_rulesets_sha256=$(sha256_file "$release_main_rulesets")
 release_environment_sha256=$(sha256_file "$release_environment")
 release_branch_policies_sha256=$(sha256_file "$release_branch_policies")
-release_approval_history_sha256=$(sha256_file "$release_approval_history")
 release_run_identity_sha256=$(sha256_file "$release_run_identity")
-release_reviewer_sha256=$(sha256_file "$release_reviewer")
 release_authorization_sha256=$(sha256_file "$release_authorization")
-release_authorization_artifact_name="personal-relay-release-approval-${source_sha}-${release_workflow_run_id}-1"
+release_authorization_artifact_name="personal-relay-release-authorization-${source_sha}-${release_workflow_run_id}-1"
 jq -e '
   type == "object"
-  and keys == ["can_admins_bypass", "can_admins_bypass_exposed", "deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+  and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
   and .name == "personal-relay-release"
   and (.id | type == "number" and . >= 1 and floor == .)
   and (.node_id | type == "string" and length > 0)
-  and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-    or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
   and .deployment_branch_policy.protected_branches == false
   and .deployment_branch_policy.custom_branch_policies == true
-  and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 1
-  and ([.protection_rules[] | select(.type == "required_reviewers")][0].prevent_self_review == true)
-  and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers | type == "array" and length == 1)
-  and all([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[];
-    .type == "User"
-    and (.reviewer | keys) == ["id", "login", "node_id"]
-    and (.reviewer.login | type == "string" and length > 0)
-    and (.reviewer.id | type == "number" and . >= 1 and floor == .)
-    and (.reviewer.node_id | type == "string" and length > 0))
-' "$release_environment" >/dev/null || fail "release approval environment evidence is malformed or weak"
+  and (.protection_rules | type == "array")
+  and all(.protection_rules[]; .type != "required_reviewers")
+' "$release_environment" >/dev/null || fail "release authorization environment evidence is malformed or requires a reviewer"
 jq -e '
   type == "object"
   and keys == ["branch_policies", "total_count"]
@@ -339,38 +323,11 @@ jq -e \
     and .repository.full_name == $repository
     and all([.actor, .triggering_actor][];
       (keys == ["id", "login", "node_id"])
-      and (.login | type == "string" and length > 0)
+      and .login == "justinharkelroad"
       and (.id | type == "number" and . >= 1 and floor == .)
       and (.node_id | type == "string" and length > 0))
-  ' "$release_run_identity" >/dev/null || fail "release approval run identity is not the exact fresh protected-main dispatch"
-jq -e '
-  type == "object"
-  and keys == ["reviewer", "type"]
-  and .type == "User"
-  and (.reviewer | keys) == ["id", "login", "node_id"]
-  and (.reviewer.login | type == "string" and length > 0)
-  and (.reviewer.id | type == "number" and . >= 1 and floor == .)
-  and (.reviewer.node_id | type == "string" and length > 0)
-' "$release_reviewer" >/dev/null || fail "release approval reviewer evidence is malformed"
-jq -e \
-  --slurpfile environment "$release_environment" \
-  --slurpfile run "$release_run_identity" \
-  --slurpfile reviewer "$release_reviewer" '
-    type == "array"
-    and length == 1
-    and .[0].state == "approved"
-    and (.[0] | keys) == ["environments", "state", "user"]
-    and (.[0].environments | length) == 1
-    and (.[0].environments[0] | keys) == ["id", "name", "node_id"]
-    and .[0].environments[0].name == "personal-relay-release"
-    and .[0].user == $reviewer[0].reviewer
-    and any($environment[0].protection_rules[] | select(.type == "required_reviewers") | .reviewers[];
-      .type == "User" and .reviewer == $reviewer[0].reviewer)
-    and $reviewer[0].reviewer.id != $run[0].actor.id
-    and $reviewer[0].reviewer.node_id != $run[0].actor.node_id
-    and $reviewer[0].reviewer.id != $run[0].triggering_actor.id
-    and $reviewer[0].reviewer.node_id != $run[0].triggering_actor.node_id
-  ' "$release_approval_history" >/dev/null || fail "release approval is not one configured independent User review"
+    and .actor == .triggering_actor
+  ' "$release_run_identity" >/dev/null || fail "release authorization is not an owner-dispatched exact protected-main run"
 jq -e \
   --arg repository "$repository" \
   --arg source_sha "$source_sha" \
@@ -383,12 +340,9 @@ jq -e \
   --arg rulesets_sha "$release_main_rulesets_sha256" \
   --arg environment_sha "$release_environment_sha256" \
   --arg branch_policies_sha "$release_branch_policies_sha256" \
-  --arg approval_history_sha "$release_approval_history_sha256" \
-  --arg run_identity_sha "$release_run_identity_sha256" \
-  --arg reviewer_sha "$release_reviewer_sha256" \
-  --slurpfile environment "$release_environment" '
-    keys == ["admin_bypass_api_state", "admin_bypass_settings_receipt_sha256", "approval_history_sha256", "branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "reviewer_sha256", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
-    and .schema == "personal-relay-release-authorization/v2"
+  --arg run_identity_sha "$release_run_identity_sha256" '
+    keys == ["branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+    and .schema == "personal-relay-release-authorization/v3"
     and .repository == $repository
     and .source_sha == $source_sha
     and .image_name == $image_name
@@ -404,17 +358,8 @@ jq -e \
     and .rulesets_sha256 == $rulesets_sha
     and .environment_sha256 == $environment_sha
     and .branch_policies_sha256 == $branch_policies_sha
-    and .approval_history_sha256 == $approval_history_sha
     and .run_identity_sha256 == $run_identity_sha
-    and .reviewer_sha256 == $reviewer_sha
-    and ((.admin_bypass_api_state == "disabled"
-        and $environment[0].can_admins_bypass_exposed == true
-        and $environment[0].can_admins_bypass == false)
-      or (.admin_bypass_api_state == "not-exposed"
-        and $environment[0].can_admins_bypass_exposed == false
-        and $environment[0].can_admins_bypass == null))
-    and (.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
-  ' "$release_authorization" >/dev/null || fail "release authorization payload is not the exact protected-main record"
+  ' "$release_authorization" >/dev/null || fail "release authorization payload is not the exact owner-authorized protected-main record"
 jq -e \
   --arg source_sha "$source_sha" \
   --arg image_name "$image" \
@@ -424,9 +369,7 @@ jq -e \
   --arg rulesets_sha "$release_main_rulesets_sha256" \
   --arg environment_sha "$release_environment_sha256" \
   --arg branch_policies_sha "$release_branch_policies_sha256" \
-  --arg approval_history_sha "$release_approval_history_sha256" \
   --arg run_identity_sha "$release_run_identity_sha256" \
-  --arg reviewer_sha "$release_reviewer_sha256" \
   --arg authorization_sha "$release_authorization_sha256" \
   --arg artifact_name "$release_authorization_artifact_name" \
   --slurpfile authorization "$release_authorization" '
@@ -438,26 +381,23 @@ jq -e \
     and .main_protection.branch_metadata_sha256 == $branch_sha
     and .main_protection.effective_rules_sha256 == $rules_sha
     and .main_protection.rulesets_sha256 == $rulesets_sha
-    and (.release_approval | type == "object")
-    and (.release_approval | keys) == ["admin_bypass_api_state", "admin_bypass_settings_receipt_sha256", "approval_history_sha256", "authorization_sha256", "branch_policies_sha256", "candidate_tag", "environment", "environment_sha256", "evidence_artifact", "image_name", "reviewer_sha256", "run_identity_sha256"]
-    and .release_approval.environment == "personal-relay-release"
-    and .release_approval.image_name == $image_name
-    and .release_approval.candidate_tag == $candidate_tag
-    and .release_approval.environment_sha256 == $environment_sha
-    and .release_approval.branch_policies_sha256 == $branch_policies_sha
-    and .release_approval.approval_history_sha256 == $approval_history_sha
-    and .release_approval.run_identity_sha256 == $run_identity_sha
-    and .release_approval.reviewer_sha256 == $reviewer_sha
-    and .release_approval.admin_bypass_api_state == $authorization[0].admin_bypass_api_state
-    and .release_approval.admin_bypass_settings_receipt_sha256 == $authorization[0].admin_bypass_settings_receipt_sha256
-    and .release_approval.authorization_sha256 == $authorization_sha
-    and (.release_approval.evidence_artifact | keys) == ["digest", "expires_at", "id", "name"]
-    and (.release_approval.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
-    and .release_approval.evidence_artifact.name == $artifact_name
-    and (.release_approval.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
-    and (.release_approval.evidence_artifact.expires_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-  ' "$ledger" >/dev/null || fail "release ledger protected-main and independent-approval bindings are incomplete or inexact"
-release_authorization_artifact_expires_at=$(jq -er '.release_approval.evidence_artifact.expires_at' "$ledger")
+    and (.release_authorization | type == "object")
+    and (.release_authorization | keys | sort) == (["authorization_sha256", "authorized_owner", "branch_policies_sha256", "candidate_tag", "environment", "environment_sha256", "evidence_artifact", "image_name", "run_identity_sha256"] | sort)
+    and .release_authorization.environment == "personal-relay-release"
+    and .release_authorization.authorized_owner == "justinharkelroad"
+    and .release_authorization.image_name == $image_name
+    and .release_authorization.candidate_tag == $candidate_tag
+    and .release_authorization.environment_sha256 == $environment_sha
+    and .release_authorization.branch_policies_sha256 == $branch_policies_sha
+    and .release_authorization.run_identity_sha256 == $run_identity_sha
+    and .release_authorization.authorization_sha256 == $authorization_sha
+    and (.release_authorization.evidence_artifact | keys) == ["digest", "expires_at", "id", "name"]
+    and (.release_authorization.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
+    and .release_authorization.evidence_artifact.name == $artifact_name
+    and (.release_authorization.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
+    and (.release_authorization.evidence_artifact.expires_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+  ' "$ledger" >/dev/null || fail "release ledger protected-main owner-authorization bindings are incomplete or inexact"
+release_authorization_artifact_expires_at=$(jq -er '.release_authorization.evidence_artifact.expires_at' "$ledger")
 jq -ner --arg value "$release_authorization_artifact_expires_at" '$value | fromdateiso8601' >/dev/null \
   || fail "release authorization artifact expiry is not a real UTC timestamp"
 
@@ -660,7 +600,7 @@ if [[ "$mode" == "prepare" ]]; then
     --arg databases_sha256 "$databases_sha256" \
     --arg inventory_sha256 "$inventory_sha256" '
       {
-        schema_version: 1,
+        schema_version: 2,
         approval_type: "personal-relay-gate1-finding-dispositions",
         repository: $repository,
         source_sha: $source_sha,
@@ -697,7 +637,7 @@ fi
 require_regular_json "$approval"
 [[ -n "$release_provenance_verification" ]] || fail "--release-provenance-verification is required for validation"
 require_regular_json "$release_provenance_verification"
-for path in "$environment_config" "$environment_branch_policies" "$environment_approvals"; do
+for path in "$environment_config" "$environment_branch_policies"; do
   [[ -n "$path" ]] || fail "protected environment evidence is required for validation"
   require_regular_json "$path"
 done
@@ -770,11 +710,12 @@ jq -e \
     and .repository.full_name == "justinharkelroad/buzz"
     and (.triggering_actor | identity)
     and (.actor | identity)
+    and .actor.login == "justinharkelroad"
+    and .triggering_actor.login == "justinharkelroad"
     and ({login: .actor.login, id: .actor.id, node_id: .actor.node_id}
       == {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id})
   ' "$gate1_run_metadata" >/dev/null || fail "Gate 1 run metadata is not an exact fresh protected-main dispatch"
 gate1_triggering_actor=$(jq -c '.triggering_actor | {login, id, node_id}' "$gate1_run_metadata")
-gate1_triggering_actor_id=$(jq -r '.id' <<<"$gate1_triggering_actor")
 [[ "$authorization_artifact_id" =~ ^[1-9][0-9]*$ ]] || fail "authorization proof artifact id is invalid"
 [[ "$authorization_artifact_name" == "personal-relay-gate1-source-tests-${source_sha}-${gate1_run_id}-1" ]] \
   || fail "authorization proof artifact name is not exact"
@@ -806,7 +747,7 @@ jq -e \
   def evidence: type == "string" and length >= 3 and length <= 512 and test("^[A-Za-z0-9._:/@#~-]+$");
   . as $approval
   | (keys | sort) == (["schema_version","approval_type","repository","source_sha","image","image_digest","deployment_ref","release_run_id","release_run_attempt","release_evidence_artifact_id","release_evidence_artifact_name","release_evidence_artifact_digest","release_evidence_expires_at","release_ledger_sha256","scanner_databases_sha256","findings_inventory_sha256","dispositions","approved_by","approved_at","eligibility_expires_at","evidence_reference"] | sort)
-  and .schema_version == 1
+  and .schema_version == 2
   and .approval_type == "personal-relay-gate1-finding-dispositions"
   and .repository == $repository
   and .source_sha == $source_sha
@@ -1250,38 +1191,15 @@ secret_scan_proof_sha256=$(sha256_file "$secret_scan_proof")
 approval_secret_scan_proof_sha256=$(sha256_file "$approval_secret_scan_proof")
 
 jq -e '
-  def login: type == "string" and test("^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$");
-  def identity:
-    type == "object"
-    and (.login | login)
-    and (.id | type == "number" and . >= 1 and floor == .)
-    and (.node_id | type == "string" and length >= 3 and length <= 128 and test("^[A-Za-z0-9_=-]+$"));
   type == "object"
-  and keys == ["can_admins_bypass", "can_admins_bypass_exposed", "deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+  and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
   and .name == "personal-relay-gate1"
   and (.id | type == "number" and . >= 1 and floor == .)
   and (.node_id | type == "string" and length > 0)
-  and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-    or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
   and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
-  and any(.protection_rules[]?;
-    .type == "required_reviewers"
-    and .prevent_self_review == true
-    and (.reviewers | type == "array" and length > 0)
-    and all(.reviewers[];
-      .type == "User"
-      and (.reviewer | identity)
-    )
-  )
-' "$environment_config" >/dev/null || fail "personal-relay-gate1 protection does not fail closed"
-configured_reviewers=$(jq -c '
-  [ .protection_rules[]
-    | select(.type == "required_reviewers" and .prevent_self_review == true)
-    | .reviewers[]
-    | select(.type == "User")
-    | .reviewer | {login, id, node_id}
-  ] | unique_by([.login, .id, .node_id]) | sort_by(.login, .id, .node_id)
-' "$environment_config")
+  and (.protection_rules | type == "array")
+  and all(.protection_rules[]; .type != "required_reviewers")
+' "$environment_config" >/dev/null || fail "personal-relay-gate1 environment is malformed or requires a reviewer"
 gate1_ref_name=${gate1_workflow_ref##*@refs/heads/}
 [[ "$gate1_ref_name" != "$gate1_workflow_ref" && -n "$gate1_ref_name" ]] || fail "Gate 1 workflow must run from a branch ref"
 jq -e --arg ref "$gate1_ref_name" '
@@ -1293,40 +1211,13 @@ jq -e --arg ref "$gate1_ref_name" '
   and (.branch_policies[0].node_id | type == "string" and length > 0)
   and .branch_policies[0].name == $ref
 ' "$environment_branch_policies" >/dev/null || fail "Gate 1 environment does not have one exact branch policy"
-jq -e --argjson actor_id "$gate1_triggering_actor_id" '
-  any(.[];
-    .state == "approved"
-    and (.user.login | type == "string" and length > 0)
-    and (.user.id | type == "number" and . >= 1 and floor == . and . != $actor_id)
-    and (.user.node_id | type == "string" and length > 0)
-    and any(.environments[]?; .name == "personal-relay-gate1")
-  )
-' "$environment_approvals" >/dev/null || fail "GitHub environment approval by a different reviewer was not recorded"
 environment_config_sha256=$(sha256_file "$environment_config")
 environment_branch_policies_sha256=$(sha256_file "$environment_branch_policies")
-environment_approvals_sha256=$(sha256_file "$environment_approvals")
 gate1_run_metadata_sha256=$(sha256_file "$gate1_run_metadata")
-approved_reviewers=$(jq -c --argjson actor_id "$gate1_triggering_actor_id" '
-  [ .[]
-    | select(
-        .state == "approved"
-        and (.user.id | type == "number" and . >= 1 and floor == .)
-        and .user.id != $actor_id
-        and (.user.node_id | type == "string" and length > 0)
-        and any(.environments[]?; .name == "personal-relay-gate1")
-      )
-    | .user | {login, id, node_id}
-  ] | unique_by([.login, .id, .node_id]) | sort_by(.login, .id, .node_id)
-' "$environment_approvals")
-jq -ne --argjson configured "$configured_reviewers" --argjson approved "$approved_reviewers" '
-  ($configured | length) > 0
-  and ($approved | length) > 0
-  and all($approved[]; . as $reviewer | ($configured | index($reviewer)) != null)
-' >/dev/null || fail "run-level environment approvers are not exact configured required reviewers"
-jq -e --argjson reviewers "$approved_reviewers" '
-  (.approved_by as $approver | ($reviewers | index($approver)) != null)
-  and all(.dispositions[]; .reviewed_by as $reviewer | ($reviewers | index($reviewer)) != null)
-' "$approval" >/dev/null || fail "recorded finding reviewers do not match GitHub environment approvers"
+jq -e --argjson owner "$gate1_triggering_actor" '
+  .approved_by == $owner
+  and all(.dispositions[]; .reviewed_by == $owner)
+' "$approval" >/dev/null || fail "finding dispositions are not authorized by the repository owner"
 
 [[ "$evaluated_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || fail "--evaluated-at must be a UTC timestamp"
 evaluated_epoch=$(jq -ner --arg value "$evaluated_at" '$value | fromdateiso8601') || fail "evaluation timestamp is not a real UTC date"
@@ -1409,10 +1300,7 @@ jq -nS \
   --argjson gate1_triggering_actor "$gate1_triggering_actor" \
   --arg environment_config_sha256 "$environment_config_sha256" \
   --arg environment_branch_policies_sha256 "$environment_branch_policies_sha256" \
-  --arg environment_approvals_sha256 "$environment_approvals_sha256" \
   --arg gate1_run_metadata_sha256 "$gate1_run_metadata_sha256" \
-  --argjson approved_reviewers "$approved_reviewers" \
-  --argjson configured_reviewers "$configured_reviewers" \
   --arg main_branch_metadata_sha256 "$main_branch_metadata_sha256" \
   --arg main_effective_rules_sha256 "$main_effective_rules_sha256" \
   --arg main_rulesets_sha256 "$main_rulesets_sha256" \
@@ -1421,7 +1309,7 @@ jq -nS \
   --slurpfile databases "$databases" \
   --slurpfile release_ledger "$ledger" '
   {
-    schema_version: 1,
+    schema_version: 2,
     receipt_type: "personal-relay-gate1",
     repository: $repository,
     source_sha: $source_sha,
@@ -1439,7 +1327,7 @@ jq -nS \
       release_ledger_sha256: $ledger_sha256,
       release_provenance_verification_sha256: $release_provenance_verification_sha256,
       main_protection: $release_ledger[0].main_protection,
-      release_approval: $release_ledger[0].release_approval
+      release_authorization: $release_ledger[0].release_authorization
     },
     scanner: {
       databases_sha256: $databases_sha256,
@@ -1460,7 +1348,7 @@ jq -nS \
       runtime_verification_sha256: $runtime_verification_sha256,
       secret_scan_proof_sha256: $secret_scan_proof_sha256,
       approval_secret_scan_proof_sha256: $approval_secret_scan_proof_sha256,
-      independent_review: "Run-level GitHub personal-relay-gate1 environment approval by a non-triggering reviewer"
+      owner_authorization: "Repository-owner workflow_dispatch from protected main"
     },
     findings: {
       inventory_sha256: $inventory_sha256,
@@ -1483,11 +1371,9 @@ jq -nS \
       sha: $gate1_workflow_sha,
       environment: "personal-relay-gate1",
       triggering_actor: $gate1_triggering_actor,
-      configured_reviewers: $configured_reviewers,
-      approved_reviewers: $approved_reviewers,
+      authorized_owner: $gate1_triggering_actor,
       environment_config_sha256: $environment_config_sha256,
       environment_branch_policies_sha256: $environment_branch_policies_sha256,
-      environment_approvals_sha256: $environment_approvals_sha256,
       run_metadata_sha256: $gate1_run_metadata_sha256
     },
     main_protection: {
@@ -1525,9 +1411,7 @@ jq -e \
   --arg release_rulesets_sha "$release_main_rulesets_sha256" \
   --arg release_environment_sha "$release_environment_sha256" \
   --arg release_branch_policies_sha "$release_branch_policies_sha256" \
-  --arg release_approval_history_sha "$release_approval_history_sha256" \
   --arg release_run_identity_sha "$release_run_identity_sha256" \
-  --arg release_reviewer_sha "$release_reviewer_sha256" \
   --arg release_authorization_sha "$release_authorization_sha256" \
   --arg release_authorization_artifact_name "$release_authorization_artifact_name" '
   .source_sha == $source_sha
@@ -1541,20 +1425,17 @@ jq -e \
   and .release_evidence.main_protection.branch_metadata_sha256 == $release_branch_sha
   and .release_evidence.main_protection.effective_rules_sha256 == $release_rules_sha
   and .release_evidence.main_protection.rulesets_sha256 == $release_rulesets_sha
-  and .release_evidence.release_approval.environment == "personal-relay-release"
-  and .release_evidence.release_approval.image_name == .image
-  and .release_evidence.release_approval.candidate_tag == ("sha-" + .source_sha)
-  and .release_evidence.release_approval.environment_sha256 == $release_environment_sha
-  and .release_evidence.release_approval.branch_policies_sha256 == $release_branch_policies_sha
-  and .release_evidence.release_approval.approval_history_sha256 == $release_approval_history_sha
-  and .release_evidence.release_approval.run_identity_sha256 == $release_run_identity_sha
-  and .release_evidence.release_approval.reviewer_sha256 == $release_reviewer_sha
-  and .release_evidence.release_approval.authorization_sha256 == $release_authorization_sha
-  and (.release_evidence.release_approval.admin_bypass_api_state == "disabled" or .release_evidence.release_approval.admin_bypass_api_state == "not-exposed")
-  and (.release_evidence.release_approval.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
-  and (.release_evidence.release_approval.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
-  and .release_evidence.release_approval.evidence_artifact.name == $release_authorization_artifact_name
-  and (.release_evidence.release_approval.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
+  and .release_evidence.release_authorization.environment == "personal-relay-release"
+  and .release_evidence.release_authorization.authorized_owner == "justinharkelroad"
+  and .release_evidence.release_authorization.image_name == .image
+  and .release_evidence.release_authorization.candidate_tag == ("sha-" + .source_sha)
+  and .release_evidence.release_authorization.environment_sha256 == $release_environment_sha
+  and .release_evidence.release_authorization.branch_policies_sha256 == $release_branch_policies_sha
+  and .release_evidence.release_authorization.run_identity_sha256 == $release_run_identity_sha
+  and .release_evidence.release_authorization.authorization_sha256 == $release_authorization_sha
+  and (.release_evidence.release_authorization.evidence_artifact.id | type == "number" and . >= 1 and floor == .)
+  and .release_evidence.release_authorization.evidence_artifact.name == $release_authorization_artifact_name
+  and (.release_evidence.release_authorization.evidence_artifact.digest | test("^sha256:[0-9a-f]{64}$"))
   and .main_protection == {
     branch: "main",
     commit_sha: .gate1_workflow.sha,

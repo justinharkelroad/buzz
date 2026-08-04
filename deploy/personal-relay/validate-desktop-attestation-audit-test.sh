@@ -180,7 +180,7 @@ jq -nS \
   --argjson gate1_artifact "$gate1_artifact" \
   --slurpfile sidecars "$candidate/personal-desktop-sidecars.json" '
     {
-      schema: "personal-desktop-staging/v1",
+      schema: "personal-desktop-staging/v2",
       repository: $repository,
       workflow_sha: $workflow_sha,
       workflow_ref: $workflow_ref,
@@ -209,18 +209,15 @@ jq -nS \
       relay_wss: "wss://staging.buzz.example",
       relay_pubkey: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       staging_deployment_receipt_sha256: $staging_receipt_sha,
-      admin_bypass_settings_receipt_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       staging_deployment_evidence_reference: "artifact://personal-relay-staging-deployment",
       smoke_approval_record_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
       staging_controls: {
         environment: "personal-staging",
         environment_configuration_sha256: "1111111111111111111111111111111111111111111111111111111111111111",
         deployment_branch_policies_sha256: "2222222222222222222222222222222222222222222222222222222222222222",
-        approval_history_sha256: "3333333333333333333333333333333333333333333333333333333333333333",
         run_identity_sha256: "4444444444444444444444444444444444444444444444444444444444444444",
-        prevent_self_review: true,
         deployment_branch: "main",
-        admin_bypass_api_state: "disabled"
+        authorized_owner: {login: "justinharkelroad", id: 111, node_id: "MDQ6VXNlcjExMQ=="}
       },
       dmg_sha256: $dmg_sha,
       buzz_acp_sha256: $acp_sha,
@@ -527,7 +524,7 @@ jq -nS \
   --argjson remount_artifact "$remount_artifact" \
   --argjson gate1_artifact "$gate1_artifact" '
     {
-      schema: "personal-desktop-attestation-audit-expectations/v2",
+      schema: "personal-desktop-attestation-audit-expectations/v3",
       repository: $repository,
       workflow: {
         sha: $workflow_sha,
@@ -607,7 +604,7 @@ jq -nS \
   --slurpfile ledger "$candidate/personal-desktop-staging.json" \
   --slurpfile sidecars "$candidate/personal-desktop-sidecars.json" '
     {
-      schema: "personal-desktop-staging-attestation/v1",
+      schema: "personal-desktop-staging-attestation/v2",
       repository: $repository,
       source_sha: $source_sha,
       ledger: $ledger[0],
@@ -638,18 +635,15 @@ jq -nS \
       },
       staging: {
         deployment_receipt_sha256: $ledger[0].staging_deployment_receipt_sha256,
-        admin_bypass_settings_receipt_sha256: $ledger[0].admin_bypass_settings_receipt_sha256,
         deployment_evidence_reference: $ledger[0].staging_deployment_evidence_reference,
         smoke_approval_record_sha256: $ledger[0].smoke_approval_record_sha256,
         controls: {
           environment: $ledger[0].staging_controls.environment,
           environment_configuration_sha256: $ledger[0].staging_controls.environment_configuration_sha256,
           deployment_branch_policies_sha256: $ledger[0].staging_controls.deployment_branch_policies_sha256,
-          approval_history_sha256: $ledger[0].staging_controls.approval_history_sha256,
           run_identity_sha256: $ledger[0].staging_controls.run_identity_sha256,
-          prevent_self_review: $ledger[0].staging_controls.prevent_self_review,
           deployment_branch: $ledger[0].staging_controls.deployment_branch,
-          admin_bypass_api_state: $ledger[0].staging_controls.admin_bypass_api_state
+          authorized_owner: $ledger[0].staging_controls.authorized_owner
         }
       },
       safety: {
@@ -718,7 +712,7 @@ grep -F 'desktop attestation audit evidence passed' "$positive_log" >/dev/null \
 jq -e \
   --arg receipt_sha "$remount_receipt_sha" \
   --argjson artifact "$remount_artifact" '
-    .schema == "personal-desktop-attestation-audit-summary/v2"
+    .schema == "personal-desktop-attestation-audit-summary/v3"
     and .independent_remount.artifact == $artifact
     and .independent_remount.receipt_sha256 == $receipt_sha
   ' "$valid/summary.json" >/dev/null || fail "valid summary did not preserve remount binding"
@@ -757,6 +751,24 @@ expect_rejection() {
     fail "hostile fixture failed outside its intended guard: $name"
   }
 }
+
+case_root=$(clone_valid_fixture ledger-schema-downgrade)
+mutate_json "$case_root/candidate/personal-desktop-staging.json" \
+  '.schema = "personal-desktop-staging/v1"'
+expect_rejection ledger-schema-downgrade \
+  'candidate ledger is not bound to exact workflow inputs and build outputs'
+
+case_root=$(clone_valid_fixture ledger-reviewer-controls)
+mutate_json "$case_root/candidate/personal-desktop-staging.json" \
+  '.staging_controls.required_reviewers = [{login: "some-reviewer"}]'
+expect_rejection ledger-reviewer-controls \
+  'candidate ledger is not bound to exact workflow inputs and build outputs'
+
+case_root=$(clone_valid_fixture ledger-non-owner-authorization)
+mutate_json "$case_root/candidate/personal-desktop-staging.json" \
+  '.staging_controls.authorized_owner.login = "some-reviewer"'
+expect_rejection ledger-non-owner-authorization \
+  'candidate ledger is not bound to exact workflow inputs and build outputs'
 
 case_root=$(clone_valid_fixture remount-hash-mismatch)
 mutate_json "$case_root/remount/personal-desktop-independent-remount-receipt.json" \

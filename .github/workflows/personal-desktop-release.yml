@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       source_sha:
-        description: "Exact approved relay/desktop source SHA (an ancestor of the protected verifier commit)"
+        description: "Exact owner-authorized relay/desktop source SHA (an ancestor of the protected verifier commit)"
         required: true
         type: string
       gate1_evidence_run_id:
@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       staging_deployment_receipt_sha256:
-        description: "SHA-256 of the canonical approved staging deployment receipt"
+        description: "SHA-256 of the canonical owner-authorized staging deployment receipt"
         required: true
         type: string
       version:
@@ -104,6 +104,10 @@ jobs:
             echo "::error::confirmation must be exactly BUILD_PERSONAL_STAGING_DESKTOP"
             exit 1
           }
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]] || {
+            echo "::error::only repository owner justinharkelroad may authorize a personal desktop staging build"
+            exit 1
+          }
           [[ "$GITHUB_RUN_ATTEMPT" == 1 ]] || {
             echo "::error::desktop staging candidates require fresh run attempt 1"
             exit 1
@@ -118,12 +122,38 @@ jobs:
           }
           [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
 
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
           gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
-            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
             > /tmp/personal-desktop-main-branch.json
           jq -e --arg sha "$GITHUB_SHA" '
-            keys == ["commit", "name", "protected"]
+            keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]
             and (.commit | keys) == ["sha"]
+            and .classic_required_pull_request_reviews == false
             and .name == "main"
             and .protected == true
             and .commit.sha == $sha
@@ -196,30 +226,11 @@ jobs:
               id,
               node_id,
               name,
-              can_admins_bypass_exposed: has("can_admins_bypass"),
-              can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
               deployment_branch_policy: {
                 protected_branches: .deployment_branch_policy.protected_branches,
                 custom_branch_policies: .deployment_branch_policy.custom_branch_policies
               },
-              protection_rules: [
-                .protection_rules[]
-                | select(.type == "required_reviewers")
-                | {
-                    type,
-                    prevent_self_review,
-                    reviewers: [
-                      .reviewers[] | {
-                        type,
-                        reviewer: {
-                          login: .reviewer.login,
-                          id: .reviewer.id,
-                          node_id: .reviewer.node_id
-                        }
-                      }
-                    ] | sort_by(.type, .reviewer.id, .reviewer.node_id, .reviewer.login)
-                  }
-              ] | sort_by(.type)
+              protection_rules: [.protection_rules[]] | sort_by(.type)
             }' /tmp/personal-staging-environment.raw.json \
             > /tmp/personal-staging-environment.json
           gh api --hostname github.com --paginate \
@@ -229,12 +240,6 @@ jobs:
                 branch_policies: [.[].branch_policies[] | {id, node_id, name}] | sort_by(.id, .node_id, .name)
               }' \
             > /tmp/personal-staging-branch-policies.json
-          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
-            | jq -S '[.[] | {
-                state,
-                environments: [.environments[]? | {id, node_id, name}],
-                user: {login: .user.login, id: .user.id, node_id: .user.node_id}
-              }]' > /tmp/personal-staging-approval-history.json
           gh api --hostname github.com "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
             | jq -S '{
                 id,
@@ -250,25 +255,15 @@ jobs:
 
           jq -e '
             type == "object"
-            and keys == ["can_admins_bypass", "can_admins_bypass_exposed", "deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+            and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
             and .name == "personal-staging"
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy.protected_branches == false
             and .deployment_branch_policy.custom_branch_policies == true
-            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 1
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].prevent_self_review == true)
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers | length >= 1)
-            and any([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers[];
-              .type == "User"
-              and (.reviewer.login | type == "string" and length > 0)
-              and (.reviewer.id | type == "number" and . >= 1 and floor == .)
-              and (.reviewer.node_id | type == "string" and length > 0)
-            )
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' /tmp/personal-staging-environment.json >/dev/null || {
-            echo "::error::personal-staging must require a user reviewer, prevent self-review, and allow only custom deployment branches"
+            echo "::error::personal-staging must be reviewer-free and allow only custom deployment branches"
             exit 1
           }
           jq -e '
@@ -293,22 +288,16 @@ jobs:
               and .event == "workflow_dispatch"
               and .path == ".github/workflows/personal-desktop-release.yml@main"
               and .repository.full_name == $repository
-              and (.actor.login | type == "string" and length > 0)
+              and .actor.login == "justinharkelroad"
               and (.actor.id | type == "number" and . >= 1 and floor == .)
               and (.actor.node_id | type == "string" and length > 0)
-              and (.triggering_actor.login | type == "string" and length > 0)
+              and .triggering_actor.login == "justinharkelroad"
               and (.triggering_actor.id | type == "number" and . >= 1 and floor == .)
               and (.triggering_actor.node_id | type == "string" and length > 0)
             ' /tmp/personal-staging-run-identity.json >/dev/null
 
           evaluated_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-          admin_bypass_api_state=not-exposed
-          if jq -e '.can_admins_bypass_exposed == true' /tmp/personal-staging-environment.json >/dev/null; then
-            admin_bypass_api_state=disabled
-          fi
           {
-            echo "admin_bypass_api_state=$admin_bypass_api_state"
-            echo "approval_history_sha256=$(shasum -a 256 /tmp/personal-staging-approval-history.json | awk '{print $1}')"
             echo "branch_policies_sha256=$(shasum -a 256 /tmp/personal-staging-branch-policies.json | awk '{print $1}')"
             echo "environment_sha256=$(shasum -a 256 /tmp/personal-staging-environment.json | awk '{print $1}')"
             echo "evaluated_at=$evaluated_at"
@@ -318,11 +307,10 @@ jobs:
             echo "run_identity_sha256=$(shasum -a 256 /tmp/personal-staging-run-identity.json | awk '{print $1}')"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Validate independently approved staging deployment receipt
+      - name: Validate owner-authorized staging deployment receipt
         id: deployment
         working-directory: verifier
         env:
-          ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256: ${{ vars.PERSONAL_STAGING_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256 }}
           EVALUATED_AT: ${{ steps.controls.outputs.evaluated_at }}
         run: |
           set -euo pipefail
@@ -341,19 +329,16 @@ jobs:
           computed_sha=$(printf '%s' "$STAGING_DEPLOYMENT_RECEIPT_JSON" \
             | bash ./deploy/personal-relay/canonical-json-sha256.sh)
           [[ "$computed_sha" == "$STAGING_DEPLOYMENT_RECEIPT_SHA256" ]] || {
-            echo "::error::staging deployment receipt does not match the independently approved SHA-256"
+            echo "::error::staging deployment receipt does not match the owner-authorized SHA-256"
             exit 1
           }
           jq -e \
             --arg evaluated_at "$EVALUATED_AT" \
-            --slurpfile approvals /tmp/personal-staging-approval-history.json \
-            --slurpfile environment /tmp/personal-staging-environment.json \
             --slurpfile run_identity /tmp/personal-staging-run-identity.json '
             . as $receipt
             | ($receipt | keys | sort) == [
-                "admin_bypass_settings_receipt_sha256",
-                "approved_at",
-                "approved_by",
+                "authorized_at",
+                "authorized_by",
                 "deployed_relay_image_ref",
                 "environment",
                 "evidence_reference",
@@ -378,7 +363,6 @@ jobs:
                 "wss_origin"
               ]
             and $receipt.environment == "personal-staging"
-            and ($receipt.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
             and ($receipt.https_origin | type == "string" and length > 0)
             and ($receipt.wss_origin | type == "string" and length > 0)
             and ($receipt.hosted_https_origin | type == "string" and length > 0)
@@ -402,38 +386,20 @@ jobs:
             and ($receipt.smoke_approval_record_sha256 | test("^[0-9a-f]{64}$"))
             and $receipt.smoke_passed == true
             and ($receipt.smoke_completed_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-            and ($receipt.approved_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and ($receipt.authorized_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
             and ($evaluated_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
             and (($receipt.smoke_completed_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == $receipt.smoke_completed_at)
-            and (($receipt.approved_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == $receipt.approved_at)
+            and (($receipt.authorized_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == $receipt.authorized_at)
             and (($evaluated_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == $evaluated_at)
-            and (($receipt.smoke_completed_at | fromdateiso8601) <= ($receipt.approved_at | fromdateiso8601))
-            and (($receipt.approved_at | fromdateiso8601) <= ($evaluated_at | fromdateiso8601))
-            and ($receipt.approved_by | type == "object")
-            and (($receipt.approved_by | keys | sort) == ["id", "login", "node_id"])
-            and ($receipt.approved_by.login | type == "string" and length > 0)
-            and ($receipt.approved_by.id | type == "number" and . >= 1 and floor == .)
-            and ($receipt.approved_by.node_id | type == "string" and length > 0)
-            and any($approvals[0][];
-              .state == "approved"
-              and any(.environments[]; .name == "personal-staging")
-              and .user == $receipt.approved_by
-            )
-            and any(
-              $environment[0].protection_rules[]
-              | select(.type == "required_reviewers")
-              | .reviewers[];
-              .type == "User"
-              and {
-                login: .reviewer.login,
-                id: .reviewer.id,
-                node_id: .reviewer.node_id
-              } == $receipt.approved_by
-            )
-            and $receipt.approved_by.id != $run_identity[0].actor.id
-            and $receipt.approved_by.node_id != $run_identity[0].actor.node_id
-            and $receipt.approved_by.id != $run_identity[0].triggering_actor.id
-            and $receipt.approved_by.node_id != $run_identity[0].triggering_actor.node_id
+            and (($receipt.smoke_completed_at | fromdateiso8601) <= ($receipt.authorized_at | fromdateiso8601))
+            and (($receipt.authorized_at | fromdateiso8601) <= ($evaluated_at | fromdateiso8601))
+            and ($receipt.authorized_by | type == "object")
+            and (($receipt.authorized_by | keys | sort) == ["id", "login", "node_id"])
+            and $receipt.authorized_by.login == "justinharkelroad"
+            and ($receipt.authorized_by.id | type == "number" and . >= 1 and floor == .)
+            and ($receipt.authorized_by.node_id | type == "string" and length > 0)
+            and $receipt.authorized_by == $run_identity[0].actor
+            and $receipt.authorized_by == $run_identity[0].triggering_actor
             and ($receipt.evidence_reference | type == "string" and test("^[A-Za-z0-9._:/-]+$"))
           ' <<<"$canonical_receipt" >/dev/null || {
             echo "::error::staging deployment receipt is incomplete or invalid"
@@ -463,22 +429,13 @@ jobs:
             throw new Error("forbidden-origin receipt does not protect staging");
           }
           NODE
-          [[ "$ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "::error::PERSONAL_STAGING_ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256 must be an exact SHA-256"
-            exit 1
-          }
-          [[ "$(jq -r .admin_bypass_settings_receipt_sha256 <<<"$canonical_receipt")" == "$ADMIN_BYPASS_SETTINGS_RECEIPT_SHA256" ]] || {
-            echo "::error::staging receipt does not match the protected admin-bypass settings receipt hash"
-            exit 1
-          }
           printf '%s\n' "$canonical_receipt" \
             > /tmp/personal-staging-deployment-receipt.json
           relay_https=$(jq -r .https_origin <<<"$canonical_receipt")
           relay_wss=$(jq -r .wss_origin <<<"$canonical_receipt")
           {
-            echo "admin_bypass_settings_receipt_sha=$(jq -r .admin_bypass_settings_receipt_sha256 <<<"$canonical_receipt")"
-            echo "approved_at=$(jq -r .approved_at <<<"$canonical_receipt")"
-            echo "approved_by=$(jq -c .approved_by <<<"$canonical_receipt")"
+            echo "authorized_at=$(jq -r .authorized_at <<<"$canonical_receipt")"
+            echo "authorized_by=$(jq -c .authorized_by <<<"$canonical_receipt")"
             echo "evidence_reference=$(jq -r .evidence_reference <<<"$canonical_receipt")"
             echo "image_ref=$(jq -r .deployed_relay_image_ref <<<"$canonical_receipt")"
             echo "receipt_sha=$computed_sha"
@@ -516,7 +473,7 @@ jobs:
           [[ "$GITHUB_REF" == "refs/heads/main" ]]
           [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
           git merge-base --is-ancestor "$SOURCE_SHA" "$GITHUB_SHA" || {
-            echo "::error::approved source is not an ancestor of the protected desktop verifier"
+            echo "::error::owner-authorized source is not an ancestor of the protected desktop verifier"
             exit 1
           }
           [[ "$GATE1_EVIDENCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -629,8 +586,21 @@ jobs:
             --arg gate1_main_rulesets_sha "$gate1_main_rulesets_sha" \
             --arg workflow_sha "$GATE1_WORKFLOW_SHA" \
             --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GATE1_EVIDENCE_RUN_ID" \
-            --arg now "$now" '
-              .repository == "justinharkelroad/buzz"
+            --arg now "$now" \
+            --slurpfile gate1_run /tmp/personal-relay-gate1-workflow-run.json '
+              .gate1_workflow.authorized_owner as $authorized_owner
+              | .schema_version == 2
+              and .receipt_type == "personal-relay-gate1"
+              and ($authorized_owner | type == "object")
+              and (($authorized_owner | keys | sort) == ["id", "login", "node_id"])
+              and $authorized_owner.login == "justinharkelroad"
+              and ($authorized_owner.id | type == "number" and . >= 1 and floor == .)
+              and ($authorized_owner.node_id | type == "string" and length > 0)
+              and ($gate1_run | length) == 1
+              and $authorized_owner == ($gate1_run[0].actor | {login, id, node_id})
+              and $authorized_owner == ($gate1_run[0].triggering_actor | {login, id, node_id})
+              and .release_evidence.release_authorization.authorized_owner == "justinharkelroad"
+              and .repository == "justinharkelroad/buzz"
               and .source_sha == $source_sha
               and .deployment_ref == $deployment_ref
               and .deployment_ref == (.image + "@" + .image_digest)
@@ -793,7 +763,6 @@ jobs:
           cp /tmp/personal-staging-environment.json "$stage/"
           cp /tmp/personal-staging-deployment-receipt.json "$stage/"
           cp /tmp/personal-staging-branch-policies.json "$stage/"
-          cp /tmp/personal-staging-approval-history.json "$stage/"
           cp /tmp/personal-staging-run-identity.json "$stage/"
           cp /tmp/personal-relay-gate1-artifact.json "$stage/"
           cp /tmp/personal-relay-gate1-workflow-run-sanitized.json \
@@ -804,7 +773,7 @@ jobs:
           cp /tmp/personal-relay-gate1-evidence/personal-relay-main-branch.json "$stage/"
           cp /tmp/personal-relay-gate1-evidence/personal-relay-main-effective-rules.json "$stage/"
           cp /tmp/personal-relay-gate1-evidence/personal-relay-gate1-main-rulesets.json "$stage/"
-          [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 17 ]]
+          [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 16 ]]
           [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
 
       - name: Upload sealed pre-candidate authorization evidence
@@ -853,14 +822,14 @@ jobs:
             echo "id=$ARTIFACT_ID"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout exact approved source for the desktop build
+      - name: Checkout exact owner-authorized source for the desktop build
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify exact approved source checkout
+      - name: Verify exact owner-authorized source checkout
         env:
           BASH_ENV: ""
           ENV: ""
@@ -1362,7 +1331,6 @@ jobs:
       - name: Write non-secret staging ledger
         env:
           ACP_SHA: ${{ steps.artifacts.outputs.acp_sha }}
-          ADMIN_BYPASS_SETTINGS_RECEIPT_SHA: ${{ steps.deployment.outputs.admin_bypass_settings_receipt_sha }}
           APPROVED_SOURCE_SHA: ${{ steps.build-contract.outputs.source_sha }}
           AUTHORIZATION_ARTIFACT_DIGEST: ${{ steps.authorization-artifact.outputs.digest }}
           AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ steps.authorization-artifact.outputs.expires_at }}
@@ -1403,16 +1371,11 @@ jobs:
           SMOKE_APPROVAL_RECORD_SHA: ${{ steps.deployment.outputs.smoke_record_sha }}
           STAGING_DEPLOYMENT_EVIDENCE_REFERENCE: ${{ steps.deployment.outputs.evidence_reference }}
           STAGING_DEPLOYMENT_RECEIPT_SHA: ${{ steps.deployment.outputs.receipt_sha }}
-          STAGING_ADMIN_BYPASS_API_STATE: ${{ steps.controls.outputs.admin_bypass_api_state }}
-          STAGING_APPROVAL_HISTORY_SHA: ${{ steps.controls.outputs.approval_history_sha256 }}
-          STAGING_APPROVED_AT: ${{ steps.deployment.outputs.approved_at }}
-          STAGING_APPROVED_BY: ${{ steps.deployment.outputs.approved_by }}
+          STAGING_AUTHORIZED_BY: ${{ steps.deployment.outputs.authorized_by }}
           STAGING_BRANCH_POLICIES_SHA: ${{ steps.controls.outputs.branch_policies_sha256 }}
           STAGING_BUILD_CONFIRMATION: ${{ inputs.confirmation }}
           STAGING_ENVIRONMENT_SHA: ${{ steps.controls.outputs.environment_sha256 }}
-          STAGING_EVALUATED_AT: ${{ steps.controls.outputs.evaluated_at }}
           STAGING_RUN_IDENTITY_SHA: ${{ steps.controls.outputs.run_identity_sha256 }}
-          STAGING_SMOKE_COMPLETED_AT: ${{ steps.deployment.outputs.smoke_completed_at }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
         run: |
@@ -1477,14 +1440,8 @@ jobs:
             --arg smoke_approval_record_sha256 "$SMOKE_APPROVAL_RECORD_SHA" \
             --arg staging_environment_sha256 "$STAGING_ENVIRONMENT_SHA" \
             --arg staging_branch_policies_sha256 "$STAGING_BRANCH_POLICIES_SHA" \
-            --arg staging_approval_history_sha256 "$STAGING_APPROVAL_HISTORY_SHA" \
             --arg staging_run_identity_sha256 "$STAGING_RUN_IDENTITY_SHA" \
-            --argjson staging_approved_by "$STAGING_APPROVED_BY" \
-            --arg staging_smoke_completed_at "$STAGING_SMOKE_COMPLETED_AT" \
-            --arg staging_approved_at "$STAGING_APPROVED_AT" \
-            --arg staging_evaluated_at "$STAGING_EVALUATED_AT" \
-            --arg staging_admin_bypass_api_state "$STAGING_ADMIN_BYPASS_API_STATE" \
-            --arg admin_bypass_settings_receipt_sha256 "$ADMIN_BYPASS_SETTINGS_RECEIPT_SHA" \
+            --argjson staging_authorized_owner "$STAGING_AUTHORIZED_BY" \
             --arg desktop_main_branch_sha256 "$DESKTOP_MAIN_BRANCH_SHA" \
             --arg desktop_main_rules_sha256 "$DESKTOP_MAIN_RULES_SHA" \
             --arg desktop_main_rulesets_sha256 "$DESKTOP_MAIN_RULESETS_SHA" \
@@ -1493,6 +1450,7 @@ jobs:
             --arg sidecar_manifest_sha "$SIDECAR_MANIFEST_SHA" \
             --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '{
+              schema: "personal-desktop-staging/v2",
               repository: $repository,
               source_sha: $source_sha,
               workflow_ref: $workflow_ref,
@@ -1543,22 +1501,15 @@ jobs:
               relay_image_ref: $relay_image_ref,
               relay_pubkey: $relay_pubkey,
               staging_deployment_receipt_sha256: $staging_deployment_receipt_sha256,
-              admin_bypass_settings_receipt_sha256: $admin_bypass_settings_receipt_sha256,
               staging_deployment_evidence_reference: $staging_deployment_evidence_reference,
               smoke_approval_record_sha256: $smoke_approval_record_sha256,
               staging_controls: {
                 environment: "personal-staging",
                 environment_configuration_sha256: $staging_environment_sha256,
                 deployment_branch_policies_sha256: $staging_branch_policies_sha256,
-                approval_history_sha256: $staging_approval_history_sha256,
                 run_identity_sha256: $staging_run_identity_sha256,
-                approved_by: $staging_approved_by,
-                smoke_completed_at: $staging_smoke_completed_at,
-                approved_at: $staging_approved_at,
-                evaluated_at: $staging_evaluated_at,
-                prevent_self_review: true,
                 deployment_branch: "main",
-                admin_bypass_api_state: $staging_admin_bypass_api_state
+                authorized_owner: $staging_authorized_owner
               },
               dmg_sha256: $dmg_sha,
               buzz_acp_sha256: $acp_sha,
@@ -1577,7 +1528,8 @@ jobs:
             --arg acp_sha "$ACP_SHA" \
             --arg manifest_sha "$SIDECAR_MANIFEST_SHA" \
             --slurpfile sidecars "$SIDECAR_MANIFEST_PATH" '
-              .sidecar_manifest_sha256 == $manifest_sha
+              .schema == "personal-desktop-staging/v2"
+              and .sidecar_manifest_sha256 == $manifest_sha
               and .sidecars == $sidecars[0]
               and .buzz_acp_sha256 == $acp_sha
               and ([.sidecars.entries[] | select(.name == "buzz-acp") | .source_sha256]
@@ -1776,7 +1728,7 @@ jobs:
           authorization=/tmp/personal-desktop-inspect-authorization
           [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 10 ]]
           [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
-          [[ "$(find "$authorization" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 17 ]]
+          [[ "$(find "$authorization" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 16 ]]
           [[ -z "$(find "$authorization" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
 
           ledger="$stage/personal-desktop-staging.json"
@@ -1858,7 +1810,8 @@ jobs:
             --arg source_sha "$EXPECTED_SOURCE_SHA" \
             --arg target "$EXPECTED_TARGET" \
             --arg version "$EXPECTED_VERSION" '
-              .repository == "justinharkelroad/buzz"
+              .schema == "personal-desktop-staging/v2"
+              and .repository == "justinharkelroad/buzz"
               and .workflow_sha == env.GITHUB_SHA
               and .workflow_ref == env.GITHUB_WORKFLOW_REF
               and .workflow_run_attempt == 1
@@ -1914,6 +1867,7 @@ jobs:
           STAGED_SIDECAR_MANIFEST: ${{ steps.inspection-inputs.outputs.sidecar_manifest }}
         run: |
           set -euo pipefail
+          [[ "$(jq -r .schema "$LEDGER_PATH")" == "personal-desktop-staging/v2" ]]
           mount_root=$(/usr/bin/mktemp -d /tmp/personal-desktop-inspection-mount.XXXXXX)
           projection=$(/usr/bin/mktemp -d /tmp/personal-desktop-volume-projection.XXXXXX)
           /bin/chmod 0700 "$mount_root" "$projection"
@@ -2913,6 +2867,7 @@ jobs:
           inventory_sha=$(shasum -a 256 "$inventory" | awk '{print $1}')
           projection_manifest_sha=$(shasum -a 256 "$projection_manifest" | awk '{print $1}')
           mounted_sidecar_manifest_sha=$(shasum -a 256 "$mounted_sidecars" | awk '{print $1}')
+          [[ "$(jq -r .schema "$ledger")" == "personal-desktop-staging/v2" ]]
           [[ "$dmg_sha" == "$(jq -r .dmg_sha256 "$ledger")" ]]
           [[ "$sidecar_manifest_sha" == "$(jq -r .sidecar_manifest_sha256 "$ledger")" ]]
           [[ "$record_sha" == "$VOLUME_RECORD_SHA256" ]]
@@ -3242,7 +3197,7 @@ jobs:
           test -s "$ledger"
           [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 10 ]]
           [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
-          [[ "$(find "$authorization" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 17 ]]
+          [[ "$(find "$authorization" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 16 ]]
           [[ -z "$(find "$authorization" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
 
           bash ./deploy/personal-relay/validate-main-protection.sh \
@@ -3352,7 +3307,7 @@ jobs:
             ' "$build_contract" >/dev/null
           jq -e '
             (keys | sort) == [
-              "admin_bypass_settings_receipt_sha256", "approved_at", "approved_by",
+              "authorized_at", "authorized_by",
               "deployed_relay_image_ref", "environment", "evidence_reference",
               "forbidden_origins", "gate1_attestation_bundle_sha256",
               "gate1_evidence_artifact_digest", "gate1_evidence_artifact_id",
@@ -3363,7 +3318,7 @@ jobs:
               "relay_source_sha", "smoke_approval_record_sha256", "smoke_completed_at",
               "smoke_passed", "wss_origin"
             ]
-            and (.admin_bypass_settings_receipt_sha256 | test("^[0-9a-f]{64}$"))
+            and .authorized_by.login == "justinharkelroad"
           ' "$staging_receipt" >/dev/null
 
           desktop_main_branch_sha=$(shasum -a 256 "$authorization/personal-desktop-main-branch.json" | awk '{print $1}')
@@ -3374,7 +3329,6 @@ jobs:
           gate1_main_rulesets_sha=$(shasum -a 256 "$authorization/personal-relay-gate1-main-rulesets.json" | awk '{print $1}')
           staging_environment_sha=$(shasum -a 256 "$authorization/personal-staging-environment.json" | awk '{print $1}')
           staging_branch_policies_sha=$(shasum -a 256 "$authorization/personal-staging-branch-policies.json" | awk '{print $1}')
-          staging_approval_history_sha=$(shasum -a 256 "$authorization/personal-staging-approval-history.json" | awk '{print $1}')
           staging_run_identity_sha=$(shasum -a 256 "$authorization/personal-staging-run-identity.json" | awk '{print $1}')
           gate1_receipt="$authorization/personal-relay-gate1-receipt.json"
           gate1_bundle="$authorization/personal-relay-gate1-attestation-bundle.json"
@@ -3384,7 +3338,6 @@ jobs:
           [[ "$(shasum -a 256 "$gate1_bundle" | awk '{print $1}')" == "$EXPECTED_GATE1_ATTESTATION_BUNDLE_SHA256" ]]
           gate1_eligibility_expires_at=$(jq -r .eligibility_expires_at "$gate1_receipt")
           gate1_release_evidence_expires_at=$(jq -r .release_evidence.expires_at "$gate1_receipt")
-          admin_bypass_settings_receipt_sha=$(jq -r .admin_bypass_settings_receipt_sha256 "$staging_receipt")
 
           now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
           jq -e \
@@ -3396,7 +3349,16 @@ jobs:
             --arg gate1_main_rules_sha "$gate1_main_rules_sha" \
             --arg gate1_main_rulesets_sha "$gate1_main_rulesets_sha" \
             --arg now "$now" '
-              .repository == "justinharkelroad/buzz"
+              .gate1_workflow.authorized_owner as $authorized_owner
+              | .schema_version == 2
+              and .receipt_type == "personal-relay-gate1"
+              and ($authorized_owner | type == "object")
+              and (($authorized_owner | keys | sort) == ["id", "login", "node_id"])
+              and $authorized_owner.login == "justinharkelroad"
+              and ($authorized_owner.id | type == "number" and . >= 1 and floor == .)
+              and ($authorized_owner.node_id | type == "string" and length > 0)
+              and .release_evidence.release_authorization.authorized_owner == "justinharkelroad"
+              and .repository == "justinharkelroad/buzz"
               and .source_sha == $source_sha
               and .deployment_ref == $deployment_ref
               and .deployment_ref == (.image + "@" + .image_digest)
@@ -3489,17 +3451,13 @@ jobs:
 
           jq -e '
             type == "object"
-            and keys == ["can_admins_bypass", "can_admins_bypass_exposed", "deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+            and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
             and .name == "personal-staging"
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy.protected_branches == false
             and .deployment_branch_policy.custom_branch_policies == true
-            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 1
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].prevent_self_review == true)
-            and ([.protection_rules[] | select(.type == "required_reviewers")][0].reviewers | length >= 1)
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' "$authorization/personal-staging-environment.json" >/dev/null
           jq -e '
             .total_count == 1
@@ -3525,7 +3483,6 @@ jobs:
             --arg product_name "$EXPECTED_PRODUCT_NAME" \
             --arg relay_https "$EXPECTED_RELAY_HTTPS" \
             --arg relay_wss "$EXPECTED_RELAY_WSS" \
-            --arg admin_bypass_settings_receipt_sha "$admin_bypass_settings_receipt_sha" \
             --argjson authorization_artifact_id "$EXPECTED_AUTHORIZATION_ARTIFACT_ID" \
             --arg authorization_artifact_name "$EXPECTED_AUTHORIZATION_ARTIFACT_NAME" \
             --arg authorization_artifact_digest "$EXPECTED_AUTHORIZATION_ARTIFACT_DIGEST" \
@@ -3552,7 +3509,6 @@ jobs:
             --arg gate1_main_rulesets_sha "$gate1_main_rulesets_sha" \
             --arg staging_environment_sha "$staging_environment_sha" \
             --arg staging_branch_policies_sha "$staging_branch_policies_sha" \
-            --arg staging_approval_history_sha "$staging_approval_history_sha" \
             --arg staging_run_identity_sha "$staging_run_identity_sha" \
             --arg dmg_sha "$dmg_sha" \
             --arg acp_sha "$acp_sha" \
@@ -3560,7 +3516,6 @@ jobs:
             --arg now "$now" '
             (keys | sort) == [
               "actions_evidence_artifacts_published",
-              "admin_bypass_settings_receipt_sha256",
               "authorization_artifact", "build_contract_sha256", "bundle_id",
               "buzz_acp_sha256", "channel", "dispatch_confirmation", "dmg_sha256",
               "gate1_artifact", "gate1_attestation_bundle_sha256",
@@ -3570,7 +3525,7 @@ jobs:
               "main_protection", "product_name", "production_eligible",
               "registry_package_published", "relay_digest", "relay_https", "relay_image",
               "relay_image_ref", "relay_pubkey", "relay_wss", "repository",
-              "sidecar_manifest_sha256", "sidecars",
+              "schema", "sidecar_manifest_sha256", "sidecars",
               "smoke_approval_record_sha256", "source_sha", "staging_controls",
               "staging_deployment_evidence_reference", "staging_deployment_receipt_sha256",
               "target", "unsigned", "updater_enabled", "updater_feed_published", "version",
@@ -3587,11 +3542,10 @@ jobs:
               "ref_protected", "rulesets_sha256"
             ]
             and (.staging_controls | keys | sort) == [
-              "admin_bypass_api_state", "approval_history_sha256", "approved_at",
-              "approved_by", "deployment_branch", "deployment_branch_policies_sha256",
-              "environment", "environment_configuration_sha256", "evaluated_at",
-              "prevent_self_review", "run_identity_sha256", "smoke_completed_at"
+              "authorized_owner", "deployment_branch", "deployment_branch_policies_sha256",
+              "environment", "environment_configuration_sha256", "run_identity_sha256"
             ]
+            and .schema == "personal-desktop-staging/v2"
             and .repository == $repository
             and .source_sha == $source_sha
             and .workflow_ref == $workflow_ref
@@ -3616,7 +3570,6 @@ jobs:
             and .product_name == $product_name
             and .relay_https == $relay_https
             and .relay_wss == $relay_wss
-            and .admin_bypass_settings_receipt_sha256 == $admin_bypass_settings_receipt_sha
             and .authorization_artifact == {
               id: $authorization_artifact_id,
               name: $authorization_artifact_name,
@@ -3652,20 +3605,9 @@ jobs:
             and .staging_controls.environment == "personal-staging"
             and .staging_controls.environment_configuration_sha256 == $staging_environment_sha
             and .staging_controls.deployment_branch_policies_sha256 == $staging_branch_policies_sha
-            and .staging_controls.approval_history_sha256 == $staging_approval_history_sha
             and .staging_controls.run_identity_sha256 == $staging_run_identity_sha
-            and .staging_controls.prevent_self_review == true
             and .staging_controls.deployment_branch == "main"
-            and (.staging_controls.admin_bypass_api_state == "disabled" or .staging_controls.admin_bypass_api_state == "not-exposed")
-            and (.staging_controls.smoke_completed_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-            and (.staging_controls.approved_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-            and (.staging_controls.evaluated_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-            and ((.staging_controls.smoke_completed_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == .staging_controls.smoke_completed_at)
-            and ((.staging_controls.approved_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == .staging_controls.approved_at)
-            and ((.staging_controls.evaluated_at | fromdateiso8601 | strftime("%Y-%m-%dT%H:%M:%SZ")) == .staging_controls.evaluated_at)
-            and ((.staging_controls.smoke_completed_at | fromdateiso8601) <= (.staging_controls.approved_at | fromdateiso8601))
-            and ((.staging_controls.approved_at | fromdateiso8601) <= (.staging_controls.evaluated_at | fromdateiso8601))
-            and ((.staging_controls.evaluated_at | fromdateiso8601) <= ($now | fromdateiso8601))
+            and .staging_controls.authorized_owner.login == "justinharkelroad"
             and .dmg_sha256 == $dmg_sha
             and .buzz_acp_sha256 == $acp_sha
             and .sidecar_manifest_sha256 == $sidecar_manifest_sha
@@ -3691,30 +3633,16 @@ jobs:
           jq -e \
             --arg build_contract_sha "$EXPECTED_BUILD_CONTRACT_SHA256" \
             --slurpfile build_contract "$build_contract" \
-            --slurpfile environment "$authorization/personal-staging-environment.json" \
-            --slurpfile approvals "$authorization/personal-staging-approval-history.json" \
             --slurpfile receipt "$staging_receipt" \
             --slurpfile run_identity "$authorization/personal-staging-run-identity.json" '
-              .staging_controls.approved_by as $approved_by
-              | ($approved_by | type == "object")
-              and (($approved_by | keys | sort) == ["id", "login", "node_id"])
-              and any($approvals[0][];
-                .state == "approved"
-                and any(.environments[]; .name == "personal-staging")
-                and .user == $approved_by
-              )
-              and any(
-                $environment[0].protection_rules[]
-                | select(.type == "required_reviewers")
-                | .reviewers[];
-                .type == "User"
-                and ({login: .reviewer.login, id: .reviewer.id, node_id: .reviewer.node_id} == $approved_by)
-              )
-              and $approved_by.id != $run_identity[0].actor.id
-              and $approved_by.node_id != $run_identity[0].actor.node_id
-              and $approved_by.id != $run_identity[0].triggering_actor.id
-              and $approved_by.node_id != $run_identity[0].triggering_actor.node_id
-              and $approved_by == $receipt[0].approved_by
+              .staging_controls.authorized_owner as $owner
+              | .schema == "personal-desktop-staging/v2"
+              and ($owner | type == "object")
+              and (($owner | keys | sort) == ["id", "login", "node_id"])
+              and $owner.login == "justinharkelroad"
+              and $owner == $run_identity[0].actor
+              and $owner == $run_identity[0].triggering_actor
+              and $owner == $receipt[0].authorized_by
               and .source_sha == $receipt[0].relay_source_sha
               and .gate1_workflow_sha == $receipt[0].gate1_workflow_sha
               and .gate1_evidence_run_id == $receipt[0].gate1_evidence_run_id
@@ -3729,8 +3657,6 @@ jobs:
               and .relay_pubkey == $receipt[0].relay_pubkey
               and .smoke_approval_record_sha256 == $receipt[0].smoke_approval_record_sha256
               and .staging_deployment_evidence_reference == $receipt[0].evidence_reference
-              and .staging_controls.smoke_completed_at == $receipt[0].smoke_completed_at
-              and .staging_controls.approved_at == $receipt[0].approved_at
               and .build_contract_sha256 == $build_contract_sha
               and .bundle_id == $build_contract[0].bundle_id
               and .product_name == $build_contract[0].product_name
@@ -3739,9 +3665,8 @@ jobs:
               and .relay_https == $receipt[0].https_origin
               and .relay_wss == $receipt[0].wss_origin
               and .staging_deployment_receipt_sha256 == $build_contract[0].receipt_sha256
-              and .admin_bypass_settings_receipt_sha256 == $receipt[0].admin_bypass_settings_receipt_sha256
             ' "$ledger" >/dev/null || {
-              echo "::error::staging approval is not bound to a distinct configured immutable reviewer"
+              echo "::error::staging authorization is not bound to repository owner justinharkelroad"
               exit 1
             }
           jq -e \
@@ -3755,13 +3680,10 @@ jobs:
               and .event == "workflow_dispatch"
               and .path == ".github/workflows/personal-desktop-release.yml@main"
               and .repository.full_name == $repository
+              and .actor.login == "justinharkelroad"
+              and .triggering_actor.login == "justinharkelroad"
+              and .actor == .triggering_actor
             ' "$authorization/personal-staging-run-identity.json" >/dev/null
-
-          observed_admin_state=not-exposed
-          if jq -e '.can_admins_bypass_exposed == true' "$authorization/personal-staging-environment.json" >/dev/null; then
-            observed_admin_state=disabled
-          fi
-          [[ "$(jq -r .staging_controls.admin_bypass_api_state "$ledger")" == "$observed_admin_state" ]]
           echo "acp_path=$acp" >> "$GITHUB_OUTPUT"
           echo "ledger_path=$ledger" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$dmg")" >> "$GITHUB_OUTPUT"
@@ -3818,6 +3740,7 @@ jobs:
           projection_manifest_sha=$(shasum -a 256 "$projection_manifest" | awk '{print $1}')
           sidecar_manifest_sha=$(shasum -a 256 "$sidecar_manifest" | awk '{print $1}')
           ledger_sha=$(shasum -a 256 "$LEDGER_PATH" | awk '{print $1}')
+          [[ "$(jq -r .schema "$LEDGER_PATH")" == "personal-desktop-staging/v2" ]]
           [[ "$record_sha" == "$EXPECTED_VOLUME_RECORD_SHA256" ]]
           [[ "$sidecar_manifest_sha" == "$(jq -r .sidecar_manifest_sha256 "$LEDGER_PATH")" ]]
           cmp -s "$sidecar_manifest" /tmp/personal-desktop-staging/personal-desktop-sidecars.json
@@ -3963,6 +3886,7 @@ jobs:
           dmg_sha=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
           ledger_sha=$(shasum -a 256 "$LEDGER_PATH" | awk '{print $1}')
           acp_sha=$(shasum -a 256 "$STAGED_ACP_PATH" | awk '{print $1}')
+          [[ "$(jq -r .schema "$LEDGER_PATH")" == "personal-desktop-staging/v2" ]]
           sidecar_manifest_sha=$(jq -r .sidecar_manifest_sha256 "$LEDGER_PATH")
           minimum_valid_until=$(( $(date -u '+%s') + 2100 ))
           jq -e \
@@ -4181,6 +4105,7 @@ jobs:
           ledger="${{ steps.dmg.outputs.ledger_path }}"
           sidecars=/tmp/personal-desktop-staging/personal-desktop-sidecars.json
           record=/tmp/personal-desktop-mounted-volume/personal-desktop-mounted-volume-record.json
+          [[ "$(jq -r .schema "$ledger")" == "personal-desktop-staging/v2" ]]
           ledger_sha=$(shasum -a 256 "$ledger" | awk '{print $1}')
           sidecar_manifest_sha=$(shasum -a 256 "$sidecars" | awk '{print $1}')
           record_sha=$(shasum -a 256 "$record" | awk '{print $1}')
@@ -4322,6 +4247,7 @@ jobs:
           esac
           [[ "$DMG_NAME" == "${PRODUCT_NAME}_${VERSION}_${dmg_arch}.dmg" ]]
           [[ "$DMG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(jq -r .schema "$LEDGER_PATH")" == "personal-desktop-staging/v2" ]]
           ledger_sha256=$(shasum -a 256 "$LEDGER_PATH" | awk '{print $1}')
           umask 077
           jq -nS \
@@ -4356,7 +4282,7 @@ jobs:
             --slurpfile ledger "$LEDGER_PATH" '
               $ledger[0] as $sealed
               | {
-                  schema: "personal-desktop-staging-attestation/v1",
+                  schema: "personal-desktop-staging-attestation/v2",
                   repository: $sealed.repository,
                   source_sha: $sealed.source_sha,
                   ledger_sha256: $ledger_sha256,
@@ -4398,18 +4324,15 @@ jobs:
                   },
                   staging: {
                     deployment_receipt_sha256: $sealed.staging_deployment_receipt_sha256,
-                    admin_bypass_settings_receipt_sha256: $sealed.admin_bypass_settings_receipt_sha256,
                     deployment_evidence_reference: $sealed.staging_deployment_evidence_reference,
                     smoke_approval_record_sha256: $sealed.smoke_approval_record_sha256,
                     controls: {
                       environment: $sealed.staging_controls.environment,
                       environment_configuration_sha256: $sealed.staging_controls.environment_configuration_sha256,
                       deployment_branch_policies_sha256: $sealed.staging_controls.deployment_branch_policies_sha256,
-                      approval_history_sha256: $sealed.staging_controls.approval_history_sha256,
                       run_identity_sha256: $sealed.staging_controls.run_identity_sha256,
-                      prevent_self_review: $sealed.staging_controls.prevent_self_review,
                       deployment_branch: $sealed.staging_controls.deployment_branch,
-                      admin_bypass_api_state: $sealed.staging_controls.admin_bypass_api_state
+                      authorized_owner: $sealed.staging_controls.authorized_owner
                     }
                   },
                   safety: {
@@ -4503,13 +4426,14 @@ jobs:
             --arg verifier_workflow_ref "$GITHUB_WORKFLOW_REF" \
             --slurpfile ledger "$LEDGER_PATH" '
               ($ledger | length) == 1
+              and $ledger[0].schema == "personal-desktop-staging/v2"
               and (keys | sort) == [
                 "authorization_artifact", "build_contract_sha256", "candidate_artifact",
                 "desktop", "gate1", "inspection", "ledger", "ledger_sha256", "relay", "remount",
                 "repository", "safety", "schema", "source_sha",
                 "staging", "subject", "verifier"
               ]
-              and .schema == "personal-desktop-staging-attestation/v1"
+              and .schema == "personal-desktop-staging-attestation/v2"
               and .repository == $ledger[0].repository
               and .repository == "justinharkelroad/buzz"
               and (.source_sha | test("^[0-9a-f]{40}$"))
@@ -4564,34 +4488,27 @@ jobs:
               and (.relay.wss | startswith("wss://"))
               and .staging == {
                 deployment_receipt_sha256: $ledger[0].staging_deployment_receipt_sha256,
-                admin_bypass_settings_receipt_sha256: $ledger[0].admin_bypass_settings_receipt_sha256,
                 deployment_evidence_reference: $ledger[0].staging_deployment_evidence_reference,
                 smoke_approval_record_sha256: $ledger[0].smoke_approval_record_sha256,
                 controls: {
                   environment: $ledger[0].staging_controls.environment,
                   environment_configuration_sha256: $ledger[0].staging_controls.environment_configuration_sha256,
                   deployment_branch_policies_sha256: $ledger[0].staging_controls.deployment_branch_policies_sha256,
-                  approval_history_sha256: $ledger[0].staging_controls.approval_history_sha256,
                   run_identity_sha256: $ledger[0].staging_controls.run_identity_sha256,
-                  prevent_self_review: $ledger[0].staging_controls.prevent_self_review,
                   deployment_branch: $ledger[0].staging_controls.deployment_branch,
-                  admin_bypass_api_state: $ledger[0].staging_controls.admin_bypass_api_state
+                  authorized_owner: $ledger[0].staging_controls.authorized_owner
                 }
               }
               and all([
                 .staging.deployment_receipt_sha256,
-                .staging.admin_bypass_settings_receipt_sha256,
                 .staging.smoke_approval_record_sha256,
                 .staging.controls.environment_configuration_sha256,
                 .staging.controls.deployment_branch_policies_sha256,
-                .staging.controls.approval_history_sha256,
                 .staging.controls.run_identity_sha256
               ][]; test("^[0-9a-f]{64}$"))
               and .staging.controls.environment == "personal-staging"
-              and .staging.controls.prevent_self_review == true
               and .staging.controls.deployment_branch == "main"
-              and (.staging.controls.admin_bypass_api_state == "disabled"
-                or .staging.controls.admin_bypass_api_state == "not-exposed")
+              and .staging.controls.authorized_owner.login == "justinharkelroad"
               and .safety == {
                 channel: "staging-only",
                 unsigned: true,
@@ -4700,12 +4617,38 @@ jobs:
         run: |
           set -euo pipefail
           [[ -f "$LEDGER_PATH" && ! -L "$LEDGER_PATH" ]]
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
           gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
-            | jq -S '{name, protected, commit: {sha: .commit.sha}}' \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
             > /tmp/personal-desktop-live-main-branch.json
           jq -e --arg sha "$GITHUB_SHA" '
-            keys == ["commit", "name", "protected"]
+            keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]
             and (.commit | keys) == ["sha"]
+            and .classic_required_pull_request_reviews == false
             and .name == "main"
             and .protected == true
             and .commit.sha == $sha
@@ -4795,46 +4738,21 @@ jobs:
               id,
               node_id,
               name,
-              can_admins_bypass_exposed: has("can_admins_bypass"),
-              can_admins_bypass: (if has("can_admins_bypass") then .can_admins_bypass else null end),
               deployment_branch_policy: {
                 protected_branches: .deployment_branch_policy.protected_branches,
                 custom_branch_policies: .deployment_branch_policy.custom_branch_policies
               },
-              protection_rules: [
-                .protection_rules[]
-                | select(.type == "required_reviewers")
-                | {
-                    type,
-                    prevent_self_review,
-                    reviewers: [
-                      .reviewers[] | {
-                        type,
-                        reviewer: {
-                          login: .reviewer.login,
-                          id: .reviewer.id,
-                          node_id: .reviewer.node_id
-                        }
-                      }
-                    ] | sort_by(.type, .reviewer.id, .reviewer.node_id, .reviewer.login)
-                  }
-              ] | sort_by(.type)
+              protection_rules: [.protection_rules[]] | sort_by(.type)
             }' /tmp/personal-desktop-live-staging-environment.raw.json \
             > /tmp/personal-desktop-live-staging-environment.json
           jq -e '
             type == "object"
-            and keys == ["can_admins_bypass", "can_admins_bypass_exposed", "deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+            and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
             and .name == "personal-staging"
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
-            and ((.can_admins_bypass_exposed == false and .can_admins_bypass == null)
-              or (.can_admins_bypass_exposed == true and .can_admins_bypass == false))
             and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
-            and any(.protection_rules[]?;
-              .type == "required_reviewers"
-              and .prevent_self_review == true
-              and (.reviewers | type == "array" and length > 0)
-            )
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
           ' /tmp/personal-desktop-live-staging-environment.json >/dev/null
           gh api --hostname github.com --paginate \
             "repos/$GITHUB_REPOSITORY/environments/personal-staging/deployment-branch-policies?per_page=100" \
@@ -4867,7 +4785,8 @@ jobs:
             /tmp/personal-desktop-sealed-staging-branch-policies.canonical.json
           minimum_valid_until=$(( $(date -u '+%s') + 2100 ))
           jq -e --argjson minimum_valid_until "$minimum_valid_until" '
-            (.authorization_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
+            .schema == "personal-desktop-staging/v2"
+            and (.authorization_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
             and (.gate1_artifact.expires_at | fromdateiso8601) > $minimum_valid_until
             and (.gate1_eligibility_expires_at | fromdateiso8601) > $minimum_valid_until
             and (.gate1_release_evidence_expires_at | fromdateiso8601) > $minimum_valid_until
@@ -4944,7 +4863,9 @@ jobs:
             --arg remount_artifact_expires_at "$REMOUNT_ARTIFACT_EXPIRES_AT" \
             --arg remount_receipt_sha "$remount_receipt_sha" \
             --slurpfile ledger "$LEDGER_PATH" '
-              .subject.digest.sha256 == $dmg_sha
+              $ledger[0].schema == "personal-desktop-staging/v2"
+              and .ledger.schema == "personal-desktop-staging/v2"
+              and .subject.digest.sha256 == $dmg_sha
               and .ledger == $ledger[0]
               and .ledger_sha256 == $ledger_sha
               and .desktop.buzz_acp_sha256 == $acp_sha
@@ -4978,7 +4899,7 @@ jobs:
         with:
           subject-name: ${{ steps.dmg.outputs.name }}
           subject-digest: sha256:${{ steps.dmg.outputs.sha256 }}
-          predicate-type: https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1
+          predicate-type: https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2
           predicate-path: /tmp/personal-desktop-staging-attestation-predicate.json
           push-to-registry: false
           show-summary: false
@@ -5001,7 +4922,7 @@ jobs:
             --hostname github.com \
             --bundle personal-desktop-attestation-bundle.json \
             -R "$GITHUB_REPOSITORY" \
-            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1 \
+            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2 \
             --source-digest "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF" \
             --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-desktop-release.yml \
@@ -5014,7 +4935,7 @@ jobs:
             --slurpfile predicate /tmp/personal-desktop-staging-attestation-predicate.json '
               length == 1
               and all(.[].verificationResult.statement;
-                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"
                 and any(.subject[]?; .name == $name and .digest.sha256 == $digest)
                 and .predicate == $predicate[0]
               )
@@ -5233,11 +5154,18 @@ jobs:
           candidate=/tmp/personal-desktop-attestation-audit-candidate
           [[ "$(find "$candidate" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 10 ]]
           [[ -z "$(find "$candidate" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+          ledger="$candidate/personal-desktop-staging.json"
+          [[ -s "$ledger" && ! -L "$ledger" ]]
+          jq -e '.schema == "personal-desktop-staging/v2"' "$ledger" >/dev/null
+          jq -e '
+            .schema == "personal-desktop-staging-attestation/v2"
+            and .ledger.schema == "personal-desktop-staging/v2"
+          ' "$input/personal-desktop-attestation-predicate.json" >/dev/null
           dmg_count=$(find "$candidate" -maxdepth 1 -name '*.dmg' -type f | wc -l | tr -d '[:space:]')
           dmg=$(find "$candidate" -maxdepth 1 -name '*.dmg' -type f -print -quit)
           [[ "$dmg_count" == 1 && -n "$dmg" && ! -L "$dmg" ]]
           dmg_sha=$(sha256sum "$dmg" | awk '{print $1}')
-          [[ "$dmg_sha" == "$(jq -r .dmg_sha256 "$candidate/personal-desktop-staging.json")" ]]
+          [[ "$dmg_sha" == "$(jq -r .dmg_sha256 "$ledger")" ]]
           remount=/tmp/personal-desktop-attestation-audit-remount
           remount_receipt="$remount/personal-desktop-independent-remount-receipt.json"
           [[ "$(find "$remount" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == 1 ]]
@@ -5265,7 +5193,7 @@ jobs:
             --hostname github.com \
             --bundle "$input/personal-desktop-attestation-bundle.json" \
             -R "$GITHUB_REPOSITORY" \
-            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1 \
+            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2 \
             --source-digest "$GITHUB_SHA" \
             --source-ref refs/heads/main \
             --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-desktop-release.yml \
@@ -5278,7 +5206,7 @@ jobs:
             --slurpfile predicate "$input/personal-desktop-attestation-predicate.json" '
               length == 1
               and all(.[].verificationResult.statement;
-                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"
                 and (.subject | type == "array" and length == 1)
                 and .subject[0] == {name: $name, digest: {sha256: $digest}}
                 and .predicate == $predicate[0]
@@ -5294,7 +5222,7 @@ jobs:
             --slurpfile predicate "$input/personal-desktop-attestation-predicate.json" '
               length == 1
               and all(.[].verificationResult.statement;
-                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"
                 and (.subject | type == "array" and length == 1)
                 and .subject[0] == {name: $name, digest: {sha256: $digest}}
                 and .predicate == $predicate[0]
@@ -5536,7 +5464,7 @@ jobs:
             --arg relay_https "$RELAY_HTTPS" \
             --arg relay_wss "$RELAY_WSS" '
               {
-                schema: "personal-desktop-attestation-audit-expectations/v2",
+                schema: "personal-desktop-attestation-audit-expectations/v3",
                 repository: $repository,
                 workflow: {
                   sha: $workflow_sha, ref: $workflow_ref,
@@ -5650,6 +5578,11 @@ jobs:
           dmg="$candidate/${PRODUCT_NAME}_${VERSION}_${dmg_arch}.dmg"
           ledger="$candidate/personal-desktop-staging.json"
           sidecars="$candidate/personal-desktop-sidecars.json"
+          jq -e '.schema == "personal-desktop-staging/v2"' "$ledger" >/dev/null
+          jq -e '
+            .schema == "personal-desktop-staging-attestation/v2"
+            and .ledger.schema == "personal-desktop-staging/v2"
+          ' /tmp/personal-desktop-attestation-audit-input/personal-desktop-attestation-predicate.json >/dev/null
           bash ./deploy/personal-relay/validate-desktop-attestation-audit.sh \
             --candidate-dir "$candidate" \
             --inspection-dir /tmp/personal-desktop-attestation-audit-inspection \
@@ -5664,7 +5597,7 @@ jobs:
             --hostname github.com \
             --bundle /tmp/personal-desktop-attestation-audit-input/personal-desktop-attestation-bundle.json \
             -R "$GITHUB_REPOSITORY" \
-            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1 \
+            --predicate-type https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2 \
             --source-digest "$GITHUB_SHA" \
             --source-ref refs/heads/main \
             --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-desktop-release.yml \
@@ -5679,7 +5612,7 @@ jobs:
             --slurpfile predicate "$predicate" '
               length == 1
               and all(.[].verificationResult.statement;
-                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"
                 and (.subject | type == "array" and length == 1)
                 and .subject[0] == {name: $name, digest: {sha256: $digest}}
                 and .predicate == $predicate[0]
@@ -5694,7 +5627,7 @@ jobs:
             --slurpfile predicate "$predicate" '
               length == 1
               and all(.[].verificationResult.statement;
-                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v1"
+                .predicateType == "https://github.com/justinharkelroad/buzz/attestations/personal-desktop-staging/v2"
                 and (.subject | type == "array" and length == 1)
                 and .subject[0] == {name: $name, digest: {sha256: $digest}}
                 and .predicate == $predicate[0]
@@ -5807,7 +5740,7 @@ jobs:
             --slurpfile summary "$summary" \
             --argjson run_id "$GITHUB_RUN_ID" '
               {
-                schema: "personal-desktop-staging-attestation-audit/v3",
+                schema: "personal-desktop-staging-attestation-audit/v4",
                 repository: "justinharkelroad/buzz",
                 workflow_sha: env.GITHUB_SHA,
                 workflow_ref: env.GITHUB_WORKFLOW_REF,
@@ -5862,10 +5795,10 @@ jobs:
               "repository", "schema", "sealed_input_artifacts", "secret_scans",
               "workflow_ref", "workflow_run_attempt", "workflow_run_id", "workflow_sha"
             ]
-            and .schema == "personal-desktop-staging-attestation-audit/v3"
+            and .schema == "personal-desktop-staging-attestation-audit/v4"
             and .repository == "justinharkelroad/buzz"
             and .workflow_run_attempt == 1
-            and .cross_binding.summary.schema == "personal-desktop-attestation-audit-summary/v2"
+            and .cross_binding.summary.schema == "personal-desktop-attestation-audit-summary/v3"
             and all([
               .evidence[], .cross_binding.expectations_sha256,
               .cross_binding.summary_sha256,
