@@ -272,4 +272,17 @@ if grep -q 'gh workflow run' "$auto_tag"; then
   exit 1
 fi
 
+sprig_workflow="$repo_root/.github/workflows/sprig.yml"
+sprig_publish_if=$(ruby -ryaml -e '
+  workflow = YAML.safe_load(File.read(ARGV.fetch(0)))
+  condition = workflow.dig("jobs", "publish", "if")
+  abort "Sprig rolling publish condition is missing" unless condition.is_a?(String)
+  print condition.split.join(" ")
+' "$sprig_workflow")
+expected_sprig_publish_if="( github.repository == 'block/buzz' && ( (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.publish) ) ) || ( github.repository == 'justinharkelroad/buzz' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.actor == 'justinharkelroad' && github.triggering_actor == 'justinharkelroad' && inputs.publish )"
+if [[ "$sprig_publish_if" != "$expected_sprig_publish_if" ]]; then
+  echo "Sprig rolling release write guard drifted from the reviewed repository/event/owner contract" >&2
+  exit 1
+fi
+
 echo "release ref contract passed"
