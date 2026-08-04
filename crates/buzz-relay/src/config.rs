@@ -274,6 +274,9 @@ pub struct Config {
     /// When set, the relay serves the invite landing page and its static assets.
     /// When unset, no static file serving happens (relay behaves as before).
     pub web_dir: Option<std::path::PathBuf>,
+    /// URL scheme emitted by relay-served web pages when opening the desktop app.
+    /// Defaults to `buzz`; personal staging may select `buzz-personal-staging`.
+    pub web_desktop_scheme: &'static str,
     /// Whether the configured web bundle serves Git browser routes in addition
     /// to the public invite landing page. Defaults to false.
     pub serve_git_web_gui: bool,
@@ -395,6 +398,29 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, ConfigError> {
 
 fn parse_optional_bool(name: &str) -> Result<bool, ConfigError> {
     parse_bool(name, false)
+}
+
+const DEFAULT_WEB_DESKTOP_SCHEME: &str = "buzz";
+const PERSONAL_STAGING_WEB_DESKTOP_SCHEME: &str = "buzz-personal-staging";
+
+pub(crate) fn parse_web_desktop_scheme(raw: &str) -> Result<&'static str, ConfigError> {
+    match raw {
+        DEFAULT_WEB_DESKTOP_SCHEME => Ok(DEFAULT_WEB_DESKTOP_SCHEME),
+        PERSONAL_STAGING_WEB_DESKTOP_SCHEME => Ok(PERSONAL_STAGING_WEB_DESKTOP_SCHEME),
+        _ => Err(ConfigError::InvalidValue(
+            "BUZZ_WEB_DESKTOP_SCHEME must be exactly 'buzz' or 'buzz-personal-staging'".to_string(),
+        )),
+    }
+}
+
+fn web_desktop_scheme_from_env() -> Result<&'static str, ConfigError> {
+    match std::env::var("BUZZ_WEB_DESKTOP_SCHEME") {
+        Ok(raw) => parse_web_desktop_scheme(&raw),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_WEB_DESKTOP_SCHEME),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(
+            "BUZZ_WEB_DESKTOP_SCHEME must be valid Unicode".to_string(),
+        )),
+    }
 }
 
 fn ensure_git_repo_path(
@@ -905,6 +931,7 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
+        let web_desktop_scheme = web_desktop_scheme_from_env()?;
         let serve_git_web_gui = std::env::var("BUZZ_SERVE_GIT_WEB_GUI")
             .map(|value| value == "true" || value == "1")
             .unwrap_or(false);
@@ -983,6 +1010,7 @@ impl Config {
             join_policy,
             admin,
             web_dir,
+            web_desktop_scheme,
             serve_git_web_gui,
         })
     }
@@ -1034,6 +1062,7 @@ mod tests {
             !config.serve_git_web_gui,
             "serve_git_web_gui should default to false"
         );
+        assert_eq!(config.web_desktop_scheme, DEFAULT_WEB_DESKTOP_SCHEME);
         assert!(
             !config.require_media_get_auth,
             "require_media_get_auth should default to false for staged client rollout"
@@ -1051,6 +1080,25 @@ mod tests {
             config.huddle_audio_available,
             "huddle_audio_available should default to true so single-pod (N=1) keeps today's huddle behavior"
         );
+    }
+
+    #[test]
+    fn web_desktop_scheme_is_strictly_allowlisted() {
+        assert_eq!(
+            parse_web_desktop_scheme(DEFAULT_WEB_DESKTOP_SCHEME).expect("production scheme"),
+            DEFAULT_WEB_DESKTOP_SCHEME
+        );
+        assert_eq!(
+            parse_web_desktop_scheme(PERSONAL_STAGING_WEB_DESKTOP_SCHEME)
+                .expect("personal staging scheme"),
+            PERSONAL_STAGING_WEB_DESKTOP_SCHEME
+        );
+        for invalid in ["", " buzz", "buzz-staging", "javascript", "BUZZ"] {
+            assert!(
+                parse_web_desktop_scheme(invalid).is_err(),
+                "unsupported scheme must fail closed: {invalid:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,13 @@
 use super::*;
 
+#[test]
+fn model_cache_follows_the_build_scoped_nest() {
+    assert_eq!(
+        models_dir_for_nest(Path::new("/Users/example/.buzz-personal-staging")),
+        PathBuf::from("/Users/example/.buzz-personal-staging/models")
+    );
+}
+
 fn create_ready_model_dir(root: &Path) -> PathBuf {
     let model_dir = root.join(TTS_MODEL_DIR_NAME);
     std::fs::create_dir_all(&model_dir).expect("create model dir");

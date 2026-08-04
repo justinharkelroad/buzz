@@ -90,6 +90,28 @@ test("parseInviteInput_buzz_join_with_encoded_relay_param", () => {
   });
 });
 
+test("parseInviteInput accepts configured staging and legacy join links", () => {
+  const stagingScheme = "buzz-personal-staging";
+  const expected = {
+    relayWsUrl: "wss://relay.example.com",
+    code: "abc123",
+  };
+  assert.deepEqual(
+    parseInviteInput(
+      `${stagingScheme}://join?relay=wss://relay.example.com&code=abc123`,
+      stagingScheme,
+    ),
+    expected,
+  );
+  assert.deepEqual(
+    parseInviteInput(
+      "buzz://join?relay=wss://relay.example.com&code=abc123",
+      stagingScheme,
+    ),
+    expected,
+  );
+});
+
 test("parseInviteInput_buzz_join_rejects_non_ws_relay", () => {
   const result = parseInviteInput(
     "buzz://join?relay=https://relay.example.com&code=abc123",

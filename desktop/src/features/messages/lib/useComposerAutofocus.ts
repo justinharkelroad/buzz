@@ -20,9 +20,33 @@ import * as React from "react";
  * Guards:
  *  - Skip if the composer is currently disabled (archived channel, no
  *    channel, or in-flight send at the moment of mount).
- *  - Skip if focus already lives in another text-entry surface (open
- *    dialog input, search box, etc.) so we don't yank focus from the user.
+ *  - Skip if focus already lives in another text-entry surface or an active
+ *    overlay interaction. Ordinary navigation buttons remain eligible so a
+ *    channel click can still hand focus to its newly mounted composer.
  */
+export function shouldAutofocusComposer(
+  activeElement: Element | null,
+  body: HTMLElement | null,
+): boolean {
+  if (activeElement === null || activeElement === body) return true;
+
+  const active = activeElement as HTMLElement;
+  if (
+    active.tagName === "INPUT" ||
+    active.tagName === "TEXTAREA" ||
+    active.tagName === "SELECT" ||
+    active.isContentEditable
+  ) {
+    return false;
+  }
+
+  if (active.getAttribute("aria-haspopup") !== null) return false;
+
+  return !active.closest(
+    '[data-radix-popper-content-wrapper], [role="dialog"], [role="menu"]',
+  );
+}
+
 export function useComposerAutofocus(
   focus: () => void,
   draftKey: string | null | undefined,
@@ -37,18 +61,7 @@ export function useComposerAutofocus(
   React.useEffect(() => {
     if (disabledRef.current) return;
     if (typeof document === "undefined") return;
-    const active = document.activeElement as HTMLElement | null;
-    if (active && active !== document.body) {
-      const tag = active.tagName;
-      if (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        tag === "SELECT" ||
-        active.isContentEditable
-      ) {
-        return;
-      }
-    }
+    if (!shouldAutofocusComposer(document.activeElement, document.body)) return;
     focus();
   }, [draftKey, focus]);
 }

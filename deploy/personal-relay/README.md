@@ -288,13 +288,17 @@ screenshots or exported deployment detail without secrets:
 6. Attach exactly one volume at `/data/git`. Do not define
    `RAILWAY_VOLUME_MOUNT_PATH`; Railway must inject it from the attachment.
 7. Configure only private references for Postgres, Redis, and bucket access.
-8. Route the public hostname to port 3000. Do not expose database, Redis,
+8. Set `BUZZ_WEB_DESKTOP_SCHEME=buzz-personal-staging` exactly. The relay
+   rejects every other non-production value at startup.
+9. Route the public hostname to port 3000. Do not expose database, Redis,
    bucket, health, or metrics listeners.
 
 `railway-settings.reference.json` contains the exact reviewed deploy values for
 steps 4 and 5. It is a comparison record, not active Railway config. A service
 connected to source would rebuild and lose digest parity with the scanned and
-attested GHCR artifact.
+attested GHCR artifact. The desktop scheme is runtime configuration so
+same-digest promotion remains possible: personal production uses default `buzz`,
+while personal staging must use `buzz-personal-staging`.
 
 ## Scoped Git volume initialization
 
@@ -333,6 +337,8 @@ Before importing any synthetic structure:
   behavior.
 - Confirm NIP-11 `self` equals the public key derived offline from the configured
   relay private key.
+- Confirm the served invite page reports `buzz-personal-staging` as its desktop
+  deep-link scheme; the read-only smoke script performs this check.
 
 The reference intentionally omits a provider health path until staging proves
 which public port and host Railway checks for an image-source service. This is a
@@ -355,9 +361,10 @@ bash ./deploy/personal-relay/smoke-test.sh https://staging-relay.example
 ```
 
 The script defaults to `personal-staging`, hashes the owner-authorization record
-into its output, and rejects every forbidden origin. Production smoke is not authorized
-before Gate 9 and requires a separately authorized production record plus an
-explicit expected-environment override.
+into its output, rejects every forbidden origin, and requires the served invite
+page to emit `buzz-personal-staging`. Production smoke is not authorized before
+Gate 9 and requires a separately authorized production record plus an explicit
+expected-environment override; that lane requires the production `buzz` scheme.
 
 After the staging deploy and smoke pass, create a separate deployment receipt
 from `staging-deployment-receipt.example.json`. Its digest-qualified image must

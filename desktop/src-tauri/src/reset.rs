@@ -98,12 +98,13 @@ pub(crate) struct ResetContext<'a> {
     /// present and non-empty, wiped alongside `app_data_dir` to prevent
     /// `migrate_legacy_app_data_dir` from restoring the old identity.
     pub legacy_app_data_dir: Option<PathBuf>,
-    /// Nest dir (`~/.buzz` or `~/.buzz-dev`) scoped to this build's variant,
-    /// injected so unit tests can override without touching the global OnceLock.
+    /// Nest dir scoped to this build's profile, injected so unit tests can
+    /// override without touching the global OnceLock.
     pub nest_dir: Option<PathBuf>,
     pub keychain: &'a dyn ResetKeychain,
     pub home_dir: Option<PathBuf>,
     pub is_dev: bool,
+    pub is_personal_staging: bool,
 }
 
 /// Entry point called from `lib.rs` setup (before migrations).
@@ -121,9 +122,14 @@ pub(crate) fn run_boot_reset(app_data_dir: &Path) -> ResetOutcome {
         .map(crate::migration::is_dev_data_dir_name)
         .unwrap_or(false);
 
+    let is_personal_staging = crate::desktop_profile::is_personal_staging_build();
     let store = crate::secret_store::SecretStore::keyring(crate::app_state::keyring_service());
     let home_dir = dirs::home_dir();
-    let legacy_dir = crate::migration::legacy_app_data_dir(app_data_dir);
+    let legacy_dir = if is_personal_staging {
+        None
+    } else {
+        crate::migration::legacy_app_data_dir(app_data_dir)
+    };
     let nest_dir = crate::managed_agents::nest_dir();
 
     let ctx = ResetContext {
@@ -133,6 +139,7 @@ pub(crate) fn run_boot_reset(app_data_dir: &Path) -> ResetOutcome {
         keychain: &store,
         home_dir,
         is_dev,
+        is_personal_staging,
     };
 
     run_boot_reset_with_keychain(ctx)
@@ -211,14 +218,20 @@ pub(crate) fn run_boot_reset_with_keychain(ctx: ResetContext<'_>) -> ResetOutcom
         None
     };
 
-    // ── Step 3: remove nest, ~/.sprout, ~/.config/buzz-agent, CLI symlink ────
+    // ── Step 3: remove profile-owned nest and CLI link ───────────────────────
     if let Some(ref nest) = ctx.nest_dir {
         let _ = std::fs::remove_dir_all(nest);
     }
     if let Some(ref home) = ctx.home_dir {
-        let _ = std::fs::remove_dir_all(home.join(".sprout"));
-        let _ = std::fs::remove_dir_all(home.join(".config").join("buzz-agent"));
-        let link_name = crate::managed_agents::cli_link_name(ctx.is_dev);
+        // Hosted builds retain the historical cleanup of unscoped legacy
+        // paths. Personal staging must not mutate any path shared with hosted
+        // Buzz or external agents.
+        if !ctx.is_personal_staging {
+            let _ = std::fs::remove_dir_all(home.join(".sprout"));
+            let _ = std::fs::remove_dir_all(home.join(".config").join("buzz-agent"));
+        }
+        let link_name =
+            crate::managed_agents::cli_link_name_for(ctx.is_dev, ctx.is_personal_staging);
         let _ = std::fs::remove_file(home.join(".local").join("bin").join(link_name));
     }
 
@@ -408,6 +421,7 @@ mod tests {
             keychain,
             home_dir: None, // skip nest/sprout/CLI ops in unit tests
             is_dev,
+            is_personal_staging: false,
         }
     }
 
@@ -451,6 +465,7 @@ mod tests {
             keychain: &kc,
             home_dir: None,
             is_dev: false,
+            is_personal_staging: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -584,6 +599,7 @@ mod tests {
             keychain: &kc,
             home_dir: None,
             is_dev: true,
+            is_personal_staging: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -620,6 +636,7 @@ mod tests {
             keychain: &kc,
             home_dir: None,
             is_dev: false,
+            is_personal_staging: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -627,6 +644,87 @@ mod tests {
         assert!(outcome.completed, "wipe must complete");
         assert!(!prod_nest.exists(), "prod nest must be wiped");
         assert!(dev_nest.exists(), "dev nest must survive");
+    }
+
+    #[test]
+    fn test_personal_staging_reset_only_wipes_staging_profile() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let app_support = home.join("Library").join("Application Support");
+        let staging_app = app_support.join("xyz.block.buzz.app.staging");
+        let prod_app = app_support.join("xyz.block.buzz.app");
+        let legacy_app = app_support.join("xyz.block.sprout.app");
+        let staging_nest = home.join(".buzz-personal-staging");
+        let prod_nest = home.join(".buzz");
+        let dev_nest = home.join(".buzz-dev");
+        let legacy_nest = home.join(".sprout");
+        let agent_config = home.join(".config").join("buzz-agent");
+        let local_bin = home.join(".local").join("bin");
+        let staging_webkit = home
+            .join("Library")
+            .join("WebKit")
+            .join("xyz.block.buzz.app.staging");
+        let prod_webkit = home
+            .join("Library")
+            .join("WebKit")
+            .join("xyz.block.buzz.app");
+
+        for dir in [
+            &staging_app,
+            &prod_app,
+            &legacy_app,
+            &staging_nest,
+            &prod_nest,
+            &dev_nest,
+            &legacy_nest,
+            &agent_config,
+            &local_bin,
+            &staging_webkit,
+            &prod_webkit,
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for link in ["buzz", "buzz-dev", "buzz-personal-staging"] {
+            std::fs::write(local_bin.join(link), link).unwrap();
+        }
+        write_sentinel(&staging_app).unwrap();
+
+        let kc = FakeKeychain::ok();
+        let outcome = run_boot_reset_with_keychain(ResetContext {
+            app_data_dir: &staging_app,
+            legacy_app_data_dir: None,
+            nest_dir: Some(staging_nest.clone()),
+            keychain: &kc,
+            home_dir: Some(home.clone()),
+            is_dev: false,
+            is_personal_staging: true,
+        });
+
+        assert!(outcome.completed, "staging reset must complete");
+        assert!(!staging_app.exists(), "staging app data must be wiped");
+        assert!(!staging_nest.exists(), "staging nest must be wiped");
+        assert!(
+            !staging_webkit.exists(),
+            "staging WebKit data must be wiped"
+        );
+        assert!(
+            !local_bin.join("buzz-personal-staging").exists(),
+            "staging CLI link must be wiped"
+        );
+
+        for preserved in [
+            &prod_app,
+            &legacy_app,
+            &prod_nest,
+            &dev_nest,
+            &legacy_nest,
+            &agent_config,
+            &prod_webkit,
+        ] {
+            assert!(preserved.exists(), "{} must survive", preserved.display());
+        }
+        assert!(local_bin.join("buzz").exists(), "prod CLI must survive");
+        assert!(local_bin.join("buzz-dev").exists(), "dev CLI must survive");
     }
 
     // ── Test 8: legacy app-data removed on reset ──────────────────────────────
@@ -653,6 +751,7 @@ mod tests {
             keychain: &kc,
             home_dir: None,
             is_dev: false,
+            is_personal_staging: false,
         };
 
         let outcome = run_boot_reset_with_keychain(ctx);
@@ -736,6 +835,7 @@ mod tests {
             keychain: &kc,
             home_dir: None,
             is_dev: true,
+            is_personal_staging: false,
         };
         let outcome = run_boot_reset_with_keychain(ctx);
         assert!(outcome.completed, "reset must complete");
@@ -830,6 +930,7 @@ mod tests {
             keychain: &kc1,
             home_dir: Some(tmp.path().to_path_buf()),
             is_dev: false,
+            is_personal_staging: false,
         };
         let first = run_boot_reset_with_keychain(ctx1);
         assert!(first.failed, "first attempt must fail");
@@ -853,6 +954,7 @@ mod tests {
             keychain: &kc2,
             home_dir: Some(tmp.path().to_path_buf()),
             is_dev: false,
+            is_personal_staging: false,
         };
         let second = run_boot_reset_with_keychain(ctx2);
         assert!(second.completed, "second attempt must complete");

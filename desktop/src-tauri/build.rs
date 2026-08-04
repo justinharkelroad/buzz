@@ -16,7 +16,44 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_OBSERVER_ARCHIVE_DEFAULT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AGENT_METRIC_ARCHIVE_DEFAULT");
     println!("cargo:rerun-if-env-changed=BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_DEEP_LINK_SCHEME");
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_CHANNEL");
     println!("cargo:rustc-check-cfg=cfg(buzz_updater_enabled)");
+
+    let build_channel =
+        std::env::var("BUZZ_BUILD_CHANNEL").unwrap_or_else(|_| "production".to_owned());
+    if !matches!(build_channel.as_str(), "production" | "personal-staging") {
+        panic!(
+            "BUZZ_BUILD_CHANNEL must be either \"production\" or \"personal-staging\", got {build_channel:?}"
+        );
+    }
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_CHANNEL={build_channel}");
+
+    let deep_link_scheme =
+        std::env::var("BUZZ_BUILD_DEEP_LINK_SCHEME").unwrap_or_else(|_| "buzz".to_owned());
+    let mut scheme_chars = deep_link_scheme.chars();
+    let has_valid_prefix = scheme_chars
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase());
+    let has_valid_suffix = scheme_chars.all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '+' | '-' | '.')
+    });
+    if !has_valid_prefix || !has_valid_suffix {
+        panic!(
+            "BUZZ_BUILD_DEEP_LINK_SCHEME must be a lowercase RFC 3986 URI scheme, got {deep_link_scheme:?}"
+        );
+    }
+    match (build_channel.as_str(), deep_link_scheme.as_str()) {
+        ("production", "buzz") | ("personal-staging", "buzz-personal-staging") => {}
+        _ => panic!(
+            "desktop build channel and deep-link scheme must match exactly: \
+             production=buzz, personal-staging=buzz-personal-staging; got \
+             channel={build_channel:?}, scheme={deep_link_scheme:?}"
+        ),
+    }
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_DEEP_LINK_SCHEME={deep_link_scheme}");
 
     if let Ok(relay_url) = std::env::var("BUZZ_RELAY_URL") {
         println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_RELAY_URL={relay_url}");

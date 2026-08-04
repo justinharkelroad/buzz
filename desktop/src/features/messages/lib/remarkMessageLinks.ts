@@ -19,9 +19,21 @@
 // `markdown.tsx` and by `markdown.test.mjs` running under `node --test
 // --experimental-strip-types`. `tsconfig.json` enables `allowImportingTsExtensions`.
 import { createRemarkPrefixPlugin } from "../../../shared/lib/createRemarkPrefixPlugin.ts";
+import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  supportedDesktopDeepLinkSchemes,
+} from "../../../shared/lib/desktopDeepLinkScheme.ts";
 
-const MESSAGE_URL_PATTERN = /(?:buzz|buzz):\/\/message\?[^\s<>"')\]]+/g;
 const TRAILING_PUNCTUATION_PATTERN = /[.,;:!?]+$/;
+
+export function createMessageUrlPattern(
+  configuredScheme = DESKTOP_DEEP_LINK_SCHEME,
+): RegExp {
+  const schemes = supportedDesktopDeepLinkSchemes(configuredScheme)
+    .map((scheme) => scheme.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  return new RegExp(`(?:${schemes})://message\\?[^\\s<>"')\\]]+`, "g");
+}
 
 function trimMessageLinkMatch(matchText: string) {
   let value = matchText.replace(TRAILING_PUNCTUATION_PATTERN, "");
@@ -38,7 +50,7 @@ function isUnmatchedClosing(value: string): boolean {
 }
 
 export default function remarkMessageLinks() {
-  return createRemarkPrefixPlugin(MESSAGE_URL_PATTERN, (matchText) => {
+  return createRemarkPrefixPlugin(createMessageUrlPattern(), (matchText) => {
     const { value, trailing } = trimMessageLinkMatch(matchText);
 
     return {

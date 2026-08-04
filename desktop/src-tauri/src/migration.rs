@@ -1,19 +1,10 @@
-//! Worktree data sync and on-launch reconciliation for the Buzz desktop app.
+//! Worktree data sync and on-launch reconciliation for Buzz desktop.
 //!
-//! **Worktree sync** (`sync_shared_agent_data`): Per-launch symlink creation
-//! from the current worktree data directory to the canonical dev data
-//! directory (`xyz.block.buzz.app.dev`). Only runs when
-//! `BUZZ_SHARE_IDENTITY=1` and `BUZZ_PRIVATE_KEY` is set. All dev
-//! instances share the same physical files — edits in any worktree are
-//! immediately visible to all others.
-//!
-//! **Command reconciliation** (`reconcile_legacy_command_names`): Per-launch
-//! fix-up of persisted built-in command names from the Sprout→Buzz rename.
-//!
-//! **Provider reconciliation** (`reconcile_provider_mcp_commands`): Per-launch
-//! fix-up of `mcp_command` values in `managed-agents.json` against the
-//! discovery table. Ensures known providers always have their canonical
-//! `mcp_command`; unknown/custom agents are left untouched.
+//! Worktree sync creates per-launch symlinks from a worktree data directory to
+//! `xyz.block.buzz.app.dev` when identity sharing is explicitly enabled, so all
+//! dev instances see the same agent data. Command and provider reconciliation
+//! update legacy names and known provider commands while leaving custom agents
+//! untouched.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -129,15 +120,17 @@ pub fn run_boot_migrations_after_reset(app: &tauri::AppHandle) {
 }
 
 fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
+    let is_personal_staging = crate::desktop_profile::is_personal_staging_build();
     // Initialize the process-lifetime nest directory before any filesystem
     // operation that calls nest_dir(). The discriminator matches the existing
     // pattern used by reconcile_target_dir: dev instances have an app-data-dir
     // name starting with CANONICAL_DEV_IDENTIFIER.
     let is_dev = if let Ok(data_dir) = app.path().app_data_dir() {
-        let dev = data_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(is_dev_data_dir_name);
+        let dev = !is_personal_staging
+            && data_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_dev_data_dir_name);
         crate::managed_agents::init_nest_dir(dev);
         dev
     } else {
@@ -155,8 +148,10 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
         maybe_migrate_dev_repos_dir(is_dev, reset_completed, &home, &dev_nest);
     }
 
-    migrate_legacy_app_data_dir(app);
-    sync_shared_agent_data(app);
+    if crate::desktop_profile::allows_legacy_profile_import() {
+        migrate_legacy_app_data_dir(app);
+        sync_shared_agent_data(app);
+    }
     // Dev-build-only: copy any agent keys that exist in the production
     // keyring ("buzz-desktop") into the dev service ("buzz-desktop-dev")
     // so existing agents don't lose their keys after the service-name split.
@@ -269,6 +264,9 @@ const LEGACY_NEST_KNOWLEDGE: &[&str] = &[
 /// so the caller can emit a one-time hint inviting the user to delete it. The
 /// frontend dedupes the hint, so re-firing while `~/.sprout` lingers is benign.
 pub fn migrate_legacy_nest() -> bool {
+    if !crate::desktop_profile::allows_legacy_profile_import() {
+        return false;
+    }
     let Some(home) = dirs::home_dir() else {
         eprintln!("buzz-desktop: nest-migration: cannot resolve home directory");
         return false;

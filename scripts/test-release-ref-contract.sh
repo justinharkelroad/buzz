@@ -169,6 +169,8 @@ expect_cache_guard_rejection split-expression \
   "      format('type=registry,ref=split') || '' }}"
 
 "$repo_root/scripts/test-signed-canary-contract.sh"
+"$repo_root/scripts/test-desktop-release-cache-key.sh"
+"$repo_root/scripts/test-desktop-release-cache-workflow.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
 grep -q 'actions/create-github-app-token@' "$auto_tag"
 grep -q 'client-id:.*vars\.BUZZ_RELEASE_TAGGER_CLIENT_ID' "$auto_tag"

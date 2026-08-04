@@ -177,7 +177,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                         return files.oneshot(req).await.map(IntoResponse::into_response);
                     }
                     if should_serve_spa(path, serve_git_web_gui) {
-                        return Ok(read_spa_index(&index).await);
+                        return Ok(
+                            read_web_spa_index(&index, state.config.web_desktop_scheme).await
+                        );
                     }
                 }
                 Ok(StatusCode::NOT_FOUND.into_response())
@@ -229,6 +231,52 @@ fn is_git_web_gui_path(path: &str) -> bool {
 async fn read_spa_index(index: &std::path::Path) -> axum::response::Response {
     match tokio::fs::read(index).await {
         Ok(body) => axum::response::Html(body).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+const WEB_DESKTOP_SCHEME_META_NAME: &str = r#"name="buzz-desktop-scheme""#;
+const WEB_DESKTOP_SCHEME_RUNTIME_MARKER: &str = r#"data-buzz-runtime-config="desktop-scheme""#;
+const WEB_DESKTOP_SCHEME_DEFAULT_CONTENT: &str = r#"content="buzz""#;
+
+fn render_web_spa_index(template: &str, scheme: &str) -> Option<String> {
+    let scheme = crate::config::parse_web_desktop_scheme(scheme).ok()?;
+    if template.matches(WEB_DESKTOP_SCHEME_META_NAME).count() != 1
+        || template.matches(WEB_DESKTOP_SCHEME_RUNTIME_MARKER).count() != 1
+    {
+        return None;
+    }
+    let marker_index = template.find(WEB_DESKTOP_SCHEME_RUNTIME_MARKER)?;
+    let tag_start = template[..marker_index].rfind("<meta")?;
+    let tag_end = marker_index + template[marker_index..].find('>')? + 1;
+    let tag = &template[tag_start..tag_end];
+    if tag.matches(WEB_DESKTOP_SCHEME_META_NAME).count() != 1
+        || tag.matches(WEB_DESKTOP_SCHEME_DEFAULT_CONTENT).count() != 1
+    {
+        return None;
+    }
+
+    let rendered_tag = tag.replacen(
+        WEB_DESKTOP_SCHEME_DEFAULT_CONTENT,
+        &format!(r#"content="{scheme}""#),
+        1,
+    );
+    let mut rendered = String::with_capacity(template.len() + rendered_tag.len() - tag.len());
+    rendered.push_str(&template[..tag_start]);
+    rendered.push_str(&rendered_tag);
+    rendered.push_str(&template[tag_end..]);
+    Some(rendered)
+}
+
+async fn read_web_spa_index(index: &std::path::Path, scheme: &str) -> axum::response::Response {
+    match tokio::fs::read_to_string(index).await {
+        Ok(template) => match render_web_spa_index(&template, scheme) {
+            Some(body) => axum::response::Html(body).into_response(),
+            None => {
+                tracing::error!("web index is missing its unique desktop-scheme runtime marker");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -333,9 +381,7 @@ async fn nip11_or_ws_handler(
                 if let Some(ref dir) = state.config.web_dir {
                     if accept.contains("text/html") {
                         let index = dir.join("index.html");
-                        if let Ok(body) = tokio::fs::read(&index).await {
-                            return axum::response::Html(body).into_response();
-                        }
+                        return read_web_spa_index(&index, state.config.web_desktop_scheme).await;
                     }
                 }
             }
@@ -488,6 +534,39 @@ mod tests {
         assert!(should_serve_spa("/", true));
         assert!(should_serve_spa("/repos/example", true));
         assert!(!should_serve_spa("/arbitrary", true));
+    }
+
+    #[test]
+    fn web_spa_index_injects_only_an_allowlisted_runtime_scheme() {
+        let template = concat!(
+            "<html><head><meta name=\"buzz-desktop-scheme\" content=\"buzz\" ",
+            "data-buzz-runtime-config=\"desktop-scheme\"></head></html>"
+        );
+        let rendered = render_web_spa_index(template, "buzz-personal-staging")
+            .expect("valid staging runtime config");
+
+        assert!(rendered.contains(r#"content="buzz-personal-staging""#));
+        assert!(!rendered.contains(r#"content="buzz""#));
+        assert!(render_web_spa_index(template, "javascript").is_none());
+    }
+
+    #[test]
+    fn web_spa_index_rejects_missing_or_ambiguous_runtime_markers() {
+        let missing = r#"<meta name="buzz-desktop-scheme" content="buzz">"#;
+        let duplicated = concat!(
+            "<meta name=\"buzz-desktop-scheme\" content=\"buzz\" ",
+            "data-buzz-runtime-config=\"desktop-scheme\"><meta ",
+            "data-buzz-runtime-config=\"desktop-scheme\">"
+        );
+        let shadowing_name = concat!(
+            "<meta name=\"buzz-desktop-scheme\" content=\"buzz\" ",
+            "data-buzz-runtime-config=\"desktop-scheme\"><meta ",
+            "name=\"buzz-desktop-scheme\" content=\"buzz\">"
+        );
+
+        assert!(render_web_spa_index(missing, "buzz").is_none());
+        assert!(render_web_spa_index(duplicated, "buzz").is_none());
+        assert!(render_web_spa_index(shadowing_name, "buzz").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

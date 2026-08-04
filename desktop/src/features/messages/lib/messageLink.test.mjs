@@ -7,6 +7,7 @@ import {
   parseMessageLink,
   resolveMessageLinkRenderTarget,
 } from "./messageLink.ts";
+import { createMessageUrlPattern } from "./remarkMessageLinks.ts";
 
 const CHANNEL = "f570339f-8f8a-4e08-a779-8d954aa44109";
 const MESSAGE =
@@ -55,6 +56,37 @@ test("buildMessageLink treats null/empty thread as absent", () => {
   });
   assert.equal(a, `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
   assert.equal(b, `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`);
+});
+
+test("staging builds its configured scheme and still parses legacy links", () => {
+  const stagingScheme = "buzz-personal-staging";
+  const stagingUrl = buildMessageLink(
+    { channelId: CHANNEL, messageId: MESSAGE },
+    stagingScheme,
+  );
+  assert.equal(
+    stagingUrl,
+    `${stagingScheme}://message?channel=${CHANNEL}&id=${MESSAGE}`,
+  );
+  assert.equal(parseMessageLink(stagingUrl, stagingScheme).ok, true);
+  assert.equal(
+    parseMessageLink(
+      `buzz://message?channel=${CHANNEL}&id=${MESSAGE}`,
+      stagingScheme,
+    ).ok,
+    true,
+  );
+  assert.equal(isMessageLink(stagingUrl, stagingScheme), true);
+});
+
+test("bare-link recognition includes configured staging and legacy schemes", () => {
+  const pattern = createMessageUrlPattern("buzz-personal-staging");
+  const content =
+    "buzz-personal-staging://message?channel=one&id=two buzz://message?channel=three&id=four";
+  assert.deepEqual(content.match(pattern), [
+    "buzz-personal-staging://message?channel=one&id=two",
+    "buzz://message?channel=three&id=four",
+  ]);
 });
 
 test("buildMessageLink rejects missing required params", () => {

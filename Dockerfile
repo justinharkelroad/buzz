@@ -147,9 +147,11 @@ COPY --from=web-builder /build/admin-web/dist           /srv/buzz/admin-web
 
 # The invite landing page is always served from the bundled web UI. Repository
 # browser routes require the separate BUZZ_SERVE_GIT_WEB_GUI=true opt-in. The
-# admin bundle is inert until BUZZ_ADMIN_HOST is configured.
+# admin bundle is inert until BUZZ_ADMIN_HOST is configured. Deployments may
+# override the desktop scheme at runtime; the generic image remains production-safe.
 ENV BUZZ_WEB_DIR=/srv/buzz/web \
-    BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web
+    BUZZ_ADMIN_WEB_DIR=/srv/buzz/admin-web \
+    BUZZ_WEB_DESKTOP_SCHEME=buzz
 
 # 3000: app (WS + REST)  ·  8080: /_liveness, /_readiness  ·  9102: /metrics
 EXPOSE 3000 8080 9102

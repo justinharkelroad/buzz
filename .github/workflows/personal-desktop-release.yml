@@ -52,11 +52,15 @@ jobs:
     env:
       GATE1_EVIDENCE_RUN_ID: ${{ inputs.gate1_evidence_run_id }}
       SOURCE_SHA: ${{ inputs.source_sha }}
+      STAGING_AUTO_CONNECT_DEFAULT_RELAY: "true"
+      STAGING_BUILD_CHANNEL: personal-staging
       STAGING_DEPLOYMENT_RECEIPT_JSON: ${{ vars.PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON }}
       STAGING_DEPLOYMENT_RECEIPT_SHA256: ${{ inputs.staging_deployment_receipt_sha256 }}
+      STAGING_URI_SCHEME: buzz-personal-staging
       TARGET: ${{ inputs.target }}
       VERSION: ${{ inputs.version }}
     outputs:
+      auto_connect_default_relay: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
       artifact_digest: ${{ steps.uploaded-artifact.outputs.digest }}
       artifact_expires_at: ${{ steps.uploaded-artifact.outputs.expires_at }}
       artifact_id: ${{ steps.uploaded-artifact.outputs.id }}
@@ -65,8 +69,10 @@ jobs:
       authorization_artifact_expires_at: ${{ steps.authorization-artifact.outputs.expires_at }}
       authorization_artifact_id: ${{ steps.authorization-artifact.outputs.id }}
       authorization_artifact_name: ${{ steps.authorization-name.outputs.name }}
+      build_channel: ${{ steps.build-contract.outputs.build_channel }}
       build_contract_sha256: ${{ steps.build-contract.outputs.sha256 }}
       bundle_id: ${{ steps.build-contract.outputs.bundle_id }}
+      deep_link_scheme: ${{ steps.build-contract.outputs.deep_link_scheme }}
       gate1_artifact_digest: ${{ steps.deployment.outputs.gate1_artifact_digest }}
       gate1_artifact_expires_at: ${{ steps.deployment.outputs.gate1_artifact_expires_at }}
       gate1_artifact_id: ${{ steps.deployment.outputs.gate1_artifact_id }}
@@ -689,10 +695,16 @@ jobs:
             echo "::error::PERSONAL_DESKTOP_BUNDLE_ID must be a safe reverse-DNS identifier"
             exit 1
           }
+          [[ "$STAGING_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
+          [[ "$STAGING_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$STAGING_URI_SCHEME" =~ ^[a-z][a-z0-9+.-]*$ && "$STAGING_URI_SCHEME" != buzz ]]
           product_name="$BASE_PRODUCT_NAME Staging"
           bundle_id="$BASE_BUNDLE_ID.staging"
           jq -nS \
+            --argjson auto_connect_default_relay "$STAGING_AUTO_CONNECT_DEFAULT_RELAY" \
+            --arg build_channel "$STAGING_BUILD_CHANNEL" \
             --arg bundle_id "$bundle_id" \
+            --arg deep_link_scheme "$STAGING_URI_SCHEME" \
             --arg product_name "$product_name" \
             --arg receipt_sha256 "$RECEIPT_SHA256" \
             --arg relay_https "$RELAY_HTTPS" \
@@ -701,7 +713,10 @@ jobs:
             --arg target "$TARGET" \
             --arg version "$VERSION" \
             '{
+              auto_connect_default_relay: $auto_connect_default_relay,
+              build_channel: $build_channel,
               bundle_id: $bundle_id,
+              deep_link_scheme: $deep_link_scheme,
               product_name: $product_name,
               receipt_sha256: $receipt_sha256,
               relay_https: $relay_https,
@@ -711,7 +726,10 @@ jobs:
               version: $version
             }' > /tmp/personal-desktop-build-contract.json
           jq -e \
+            --argjson auto_connect_default_relay "$STAGING_AUTO_CONNECT_DEFAULT_RELAY" \
+            --arg build_channel "$STAGING_BUILD_CHANNEL" \
             --arg bundle_id "$bundle_id" \
+            --arg deep_link_scheme "$STAGING_URI_SCHEME" \
             --arg product_name "$product_name" \
             --arg receipt_sha256 "$RECEIPT_SHA256" \
             --arg relay_https "$RELAY_HTTPS" \
@@ -720,10 +738,14 @@ jobs:
             --arg target "$TARGET" \
             --arg version "$VERSION" '
               (keys | sort) == [
-                "bundle_id", "product_name", "receipt_sha256", "relay_https",
-                "relay_wss", "source_sha", "target", "version"
+                "auto_connect_default_relay", "build_channel", "bundle_id",
+                "deep_link_scheme", "product_name", "receipt_sha256",
+                "relay_https", "relay_wss", "source_sha", "target", "version"
               ]
+              and .auto_connect_default_relay == $auto_connect_default_relay
+              and .build_channel == $build_channel
               and .bundle_id == $bundle_id
+              and .deep_link_scheme == $deep_link_scheme
               and .product_name == $product_name
               and .receipt_sha256 == $receipt_sha256
               and .relay_https == $relay_https
@@ -734,7 +756,10 @@ jobs:
             ' /tmp/personal-desktop-build-contract.json >/dev/null
           contract_sha=$(shasum -a 256 /tmp/personal-desktop-build-contract.json | awk '{print $1}')
           {
+            echo "auto_connect_default_relay=$STAGING_AUTO_CONNECT_DEFAULT_RELAY"
+            echo "build_channel=$STAGING_BUILD_CHANNEL"
             echo "bundle_id=$bundle_id"
+            echo "deep_link_scheme=$STAGING_URI_SCHEME"
             echo "product_name=$product_name"
             echo "receipt_sha256=$RECEIPT_SHA256"
             echo "relay_https=$RELAY_HTTPS"
@@ -873,8 +898,10 @@ jobs:
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
           ENV: ""
+          EXPECTED_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           EXPECTED_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           EXPECTED_PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
+          EXPECTED_URI_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
           /bin/cp desktop/src-tauri/Info.plist \
             desktop/src-tauri/Info.personal-staging.plist
@@ -884,6 +911,18 @@ jobs:
             desktop/src-tauri/Info.personal-staging.plist
           node --input-type=module <<'NODE'
           import { writeFileSync } from "node:fs";
+
+          const stagingUriScheme = process.env.EXPECTED_URI_SCHEME;
+          if (
+            !stagingUriScheme ||
+            !/^[a-z][a-z0-9+.-]*$/.test(stagingUriScheme) ||
+            stagingUriScheme === "buzz"
+          ) {
+            throw new Error("staging URI scheme must be valid and distinct from buzz");
+          }
+          if (process.env.EXPECTED_BUILD_CHANNEL !== "personal-staging") {
+            throw new Error("staging build channel marker is missing");
+          }
 
           const config = {
             productName: process.env.EXPECTED_PRODUCT_NAME,
@@ -895,7 +934,12 @@ jobs:
                 minimumSystemVersion: "10.15",
               },
             },
-            plugins: { updater: { endpoints: [] } },
+            plugins: {
+              updater: { endpoints: [] },
+              "deep-link": {
+                desktop: { schemes: [stagingUriScheme] },
+              },
+            },
           };
           writeFileSync(
             "desktop/src-tauri/tauri.personal-staging.conf.json",
@@ -1083,6 +1127,9 @@ jobs:
       - name: Build unsigned staging binary and unpacked app
         env:
           BASH_ENV: ""
+          BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
@@ -1093,8 +1140,15 @@ jobs:
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
           SKIPPY_LLAMA_AUTO_BUILD: "0"
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          VITE_BUZZ_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
           set -euo pipefail
+          [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri build --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1138,6 +1192,9 @@ jobs:
       - name: Create DMG from the exact snapshotted unpacked app
         env:
           BASH_ENV: ""
+          BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
           CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
@@ -1149,8 +1206,15 @@ jobs:
           ENV: ""
           SKIPPY_LLAMA_AUTO_BUILD: "0"
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          VITE_BUZZ_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
           set -euo pipefail
+          [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri bundle --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1174,8 +1238,11 @@ jobs:
           BASH_ENV: ""
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
+          EXPECTED_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1
           EXPECTED_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           EXPECTED_PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
+          EXPECTED_URI_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
+          FORBIDDEN_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1
           HOSTED_HTTPS: ${{ steps.deployment.outputs.hosted_https }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           PERSONAL_PRODUCTION_HTTPS: ${{ steps.deployment.outputs.personal_production_https }}
@@ -1201,9 +1268,38 @@ jobs:
           [[ "$plist_bundle_id" == "$EXPECTED_BUNDLE_ID" ]]
           [[ "$plist_name" == "$EXPECTED_PRODUCT_NAME" ]]
           [[ "$plist_display_name" == "$EXPECTED_PRODUCT_NAME" ]]
+          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" <<'PY'
+          import plistlib
+          import sys
+
+          info_plist, expected_scheme = sys.argv[1:]
+          if expected_scheme.casefold() == "buzz":
+              raise SystemExit("staging URI scheme must not be buzz")
+          with open(info_plist, "rb") as plist_file:
+              plist = plistlib.load(plist_file)
+          schemes = [
+              scheme
+              for url_type in plist.get("CFBundleURLTypes", [])
+              for scheme in url_type.get("CFBundleURLSchemes", [])
+          ]
+          if any(scheme.casefold() == "buzz" for scheme in schemes):
+              raise SystemExit("staging app registers the hosted buzz URI scheme")
+          if schemes != [expected_scheme]:
+              raise SystemExit(
+                  f"staging URI schemes must be exactly [{expected_scheme!r}], got {schemes!r}"
+              )
+          PY
           [[ "$plist_executable" =~ ^[A-Za-z0-9._-]+$ ]]
           main_executable="$app/Contents/MacOS/$plist_executable"
           [[ -f "$main_executable" && -x "$main_executable" && ! -L "$main_executable" ]]
+          /usr/bin/grep -aFq -- "$EXPECTED_BANNER_ARTIFACT" "$main_executable" || {
+            echo "::error::packaged staging app does not contain the rendered banner evidence"
+            exit 1
+          }
+          if /usr/bin/grep -aFq -- "$FORBIDDEN_BANNER_ARTIFACT" "$main_executable"; then
+            echo "::error::packaged staging app contains the production banner-absent evidence"
+            exit 1
+          fi
           case "$DESKTOP_TARGET" in
             aarch64-apple-darwin) expected_arch=arm64 ;;
             x86_64-apple-darwin) expected_arch=x86_64 ;;
@@ -1861,6 +1957,7 @@ jobs:
           EXPECTED_RELAY_HTTPS: ${{ needs.build.outputs.relay_https }}
           EXPECTED_RELAY_WSS: ${{ needs.build.outputs.relay_wss }}
           EXPECTED_TARGET: ${{ needs.build.outputs.target }}
+          EXPECTED_URI_SCHEME: ${{ needs.build.outputs.deep_link_scheme }}
           LEDGER_PATH: ${{ steps.inspection-inputs.outputs.ledger }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           STAGED_SIDECAR_DIR: /tmp/personal-desktop-inspect-staging
@@ -2026,6 +2123,27 @@ jobs:
           plist_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")
           [[ "$plist_bundle_id" == "$EXPECTED_BUNDLE_ID" ]]
           [[ "$plist_name" == "$EXPECTED_PRODUCT_NAME" && "$plist_display_name" == "$EXPECTED_PRODUCT_NAME" ]]
+          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" <<'PY'
+          import plistlib
+          import sys
+
+          info_plist, expected_scheme = sys.argv[1:]
+          if expected_scheme.casefold() == "buzz":
+              raise SystemExit("staging URI scheme must not be buzz")
+          with open(info_plist, "rb") as plist_file:
+              plist = plistlib.load(plist_file)
+          schemes = [
+              scheme
+              for url_type in plist.get("CFBundleURLTypes", [])
+              for scheme in url_type.get("CFBundleURLSchemes", [])
+          ]
+          if any(scheme.casefold() == "buzz" for scheme in schemes):
+              raise SystemExit("staging app registers the hosted buzz URI scheme")
+          if schemes != [expected_scheme]:
+              raise SystemExit(
+                  f"staging URI schemes must be exactly [{expected_scheme!r}], got {schemes!r}"
+              )
+          PY
           [[ "$plist_executable" =~ ^[A-Za-z0-9._-]+$ ]]
           main_executable="$app/Contents/MacOS/$plist_executable"
           [[ -f "$main_executable" && -x "$main_executable" && ! -L "$main_executable" ]]
@@ -3166,8 +3284,11 @@ jobs:
           EXPECTED_AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.build.outputs.authorization_artifact_expires_at }}
           EXPECTED_AUTHORIZATION_ARTIFACT_ID: ${{ needs.build.outputs.authorization_artifact_id }}
           EXPECTED_AUTHORIZATION_ARTIFACT_NAME: ${{ needs.build.outputs.authorization_artifact_name }}
+          EXPECTED_AUTO_CONNECT_DEFAULT_RELAY: ${{ needs.build.outputs.auto_connect_default_relay }}
+          EXPECTED_BUILD_CHANNEL: ${{ needs.build.outputs.build_channel }}
           EXPECTED_BUILD_CONTRACT_SHA256: ${{ needs.build.outputs.build_contract_sha256 }}
           EXPECTED_BUNDLE_ID: ${{ needs.build.outputs.bundle_id }}
+          EXPECTED_DEEP_LINK_SCHEME: ${{ needs.build.outputs.deep_link_scheme }}
           EXPECTED_GATE1_ARTIFACT_DIGEST: ${{ needs.build.outputs.gate1_artifact_digest }}
           EXPECTED_GATE1_ARTIFACT_EXPIRES_AT: ${{ needs.build.outputs.gate1_artifact_expires_at }}
           EXPECTED_GATE1_ARTIFACT_ID: ${{ needs.build.outputs.gate1_artifact_id }}
@@ -3281,7 +3402,10 @@ jobs:
             exit 1
           }
           jq -e \
+            --argjson auto_connect_default_relay "$EXPECTED_AUTO_CONNECT_DEFAULT_RELAY" \
+            --arg build_channel "$EXPECTED_BUILD_CHANNEL" \
             --arg bundle_id "$EXPECTED_BUNDLE_ID" \
+            --arg deep_link_scheme "$EXPECTED_DEEP_LINK_SCHEME" \
             --arg product_name "$EXPECTED_PRODUCT_NAME" \
             --arg receipt_sha256 "$EXPECTED_STAGING_RECEIPT_SHA256" \
             --arg relay_https "$EXPECTED_RELAY_HTTPS" \
@@ -3291,10 +3415,14 @@ jobs:
             --arg version "$EXPECTED_VERSION" \
             --slurpfile receipt "$staging_receipt" '
               (keys | sort) == [
-                "bundle_id", "product_name", "receipt_sha256", "relay_https",
-                "relay_wss", "source_sha", "target", "version"
+                "auto_connect_default_relay", "build_channel", "bundle_id",
+                "deep_link_scheme", "product_name", "receipt_sha256",
+                "relay_https", "relay_wss", "source_sha", "target", "version"
               ]
+              and .auto_connect_default_relay == $auto_connect_default_relay
+              and .build_channel == $build_channel
               and .bundle_id == $bundle_id
+              and .deep_link_scheme == $deep_link_scheme
               and .product_name == $product_name
               and .receipt_sha256 == $receipt_sha256
               and .relay_https == $relay_https
@@ -3632,6 +3760,8 @@ jobs:
 
           jq -e \
             --arg build_contract_sha "$EXPECTED_BUILD_CONTRACT_SHA256" \
+            --arg build_channel "$EXPECTED_BUILD_CHANNEL" \
+            --arg deep_link_scheme "$EXPECTED_DEEP_LINK_SCHEME" \
             --slurpfile build_contract "$build_contract" \
             --slurpfile receipt "$staging_receipt" \
             --slurpfile run_identity "$authorization/personal-staging-run-identity.json" '
@@ -3662,6 +3792,9 @@ jobs:
               and .product_name == $build_contract[0].product_name
               and .relay_https == $build_contract[0].relay_https
               and .relay_wss == $build_contract[0].relay_wss
+              and $build_contract[0].auto_connect_default_relay == true
+              and $build_contract[0].build_channel == $build_channel
+              and $build_contract[0].deep_link_scheme == $deep_link_scheme
               and .relay_https == $receipt[0].https_origin
               and .relay_wss == $receipt[0].wss_origin
               and .staging_deployment_receipt_sha256 == $build_contract[0].receipt_sha256

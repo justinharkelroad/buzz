@@ -12,6 +12,10 @@ const SPROUT_WORKSPACES_KEY: &str = "sprout-workspaces";
 const SPROUT_ACTIVE_WORKSPACE_KEY: &str = "sprout-active-workspace-id";
 const SPROUT_ONBOARDING_COMPLETE_PREFIX: &str = "sprout-onboarding-complete.v1:";
 
+fn should_read_legacy_workspace_storage(is_personal_staging: bool) -> bool {
+    !is_personal_staging
+}
+
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegacyWorkspaceStorage {
@@ -174,6 +178,9 @@ fn merge_legacy_workspace_storage(
 pub async fn get_legacy_workspace_storage(
     app: tauri::AppHandle,
 ) -> Result<LegacyWorkspaceStorage, String> {
+    if !should_read_legacy_workspace_storage(crate::desktop_profile::is_personal_staging_build()) {
+        return Ok(LegacyWorkspaceStorage::default());
+    }
     let identifier = app.config().identifier.clone();
     tokio::task::spawn_blocking(move || {
         let Some(identifier) = legacy_identifier(&identifier) else {
@@ -224,6 +231,12 @@ mod tests {
             legacy_identifier("xyz.block.buzz.app.dev.my-branch"),
             Some("xyz.block.sprout.app.dev.my-branch".to_string())
         );
+    }
+
+    #[test]
+    fn personal_staging_never_reads_legacy_webkit_storage() {
+        assert!(should_read_legacy_workspace_storage(false));
+        assert!(!should_read_legacy_workspace_storage(true));
     }
 
     #[test]

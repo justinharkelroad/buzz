@@ -1,3 +1,8 @@
+import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  isSupportedDesktopDeepLinkProtocol,
+} from "@/shared/lib/desktopDeepLinkScheme";
+
 export const INVITE_EXPIRED_ERROR = "invite_expired";
 export const INVITE_EXHAUSTED_ERROR = "invite_exhausted";
 
@@ -23,7 +28,10 @@ export type ParsedInvite =
  *
  * Returns `null` for empty input or inputs that don't match any form.
  */
-export function parseInviteInput(input: string): ParsedInvite | null {
+export function parseInviteInput(
+  input: string,
+  configuredScheme = DESKTOP_DEEP_LINK_SCHEME,
+): ParsedInvite | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
@@ -33,7 +41,7 @@ export function parseInviteInput(input: string): ParsedInvite | null {
 
     // buzz://join?relay=...&code=...
     // Non-special schemes put the authority in `host`, not `pathname`.
-    if (url.protocol === "buzz:") {
+    if (isSupportedDesktopDeepLinkProtocol(url.protocol, configuredScheme)) {
       if (url.host !== "join") return null;
       const relay = url.searchParams.get("relay");
       const code = url.searchParams.get("code");

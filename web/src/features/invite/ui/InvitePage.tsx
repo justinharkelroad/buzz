@@ -6,6 +6,10 @@ import {
   detectBuzzDownloadPlatform,
   resolveBuzzDownloadUrlForPlatform,
 } from "@/shared/lib/buzz-download";
+import {
+  desktopDeepLink,
+  usesPersonalStagingDesktopScheme,
+} from "@/shared/lib/desktop-deep-link";
 import { hasNip07Provider } from "@/shared/lib/nostr-signer";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { Button } from "@/shared/ui/button";
@@ -42,6 +46,7 @@ function inviteClaimErrorMessage(message: string): string {
 export function InvitePage({ code }: { code: string }) {
   const relay = relayWsUrl();
   const host = relay.replace(/^wss?:\/\//, "");
+  const usesPersonalStagingApp = usesPersonalStagingDesktopScheme();
   const [policy, setPolicy] = React.useState<JoinPolicy | null | undefined>(
     undefined,
   );
@@ -61,6 +66,7 @@ export function InvitePage({ code }: { code: string }) {
   const downloadTriggerRef = React.useRef<HTMLAnchorElement>(null);
 
   React.useEffect(() => {
+    if (usesPersonalStagingApp) return;
     let active = true;
     detectBuzzDownloadPlatform(navigator).then(async (platform) => {
       if (!active) return;
@@ -77,7 +83,7 @@ export function InvitePage({ code }: { code: string }) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [usesPersonalStagingApp]);
 
   React.useEffect(() => {
     fetch("/api/join-policy")
@@ -110,7 +116,7 @@ export function InvitePage({ code }: { code: string }) {
       const receipt = await acceptPolicy();
       const query = new URLSearchParams({ relay, code });
       if (receipt) query.set("policy_receipt", receipt);
-      window.location.href = `buzz://join?${query.toString()}`;
+      window.location.href = desktopDeepLink("join", query);
     } finally {
       setOpening(false);
     }
@@ -245,7 +251,10 @@ export function InvitePage({ code }: { code: string }) {
                 }`}
               >
                 <a
-                  href={`buzz://join?relay=${encodeURIComponent(relay)}&code=${encodeURIComponent(code)}`}
+                  href={desktopDeepLink(
+                    "join",
+                    new URLSearchParams({ relay, code }),
+                  )}
                 >
                   Accept invite in Buzz
                 </a>
@@ -270,28 +279,35 @@ export function InvitePage({ code }: { code: string }) {
             ) : null}
           </div>
         </div>
-        <p className="flex h-[3.125rem] items-center justify-center rounded-2xl bg-white text-sm text-black/60">
-          Don&apos;t have the app?{" "}
-          <a
-            aria-expanded={needsMacChoice ? showMacChoice : undefined}
-            aria-haspopup={needsMacChoice ? "dialog" : undefined}
-            className="ml-1 font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
-            href={downloadUrl}
-            ref={downloadTriggerRef}
-            rel="noreferrer"
-            target="_blank"
-            onClick={(event) => {
-              if (!needsMacChoice) return;
-              event.preventDefault();
-              setShowMacChoice(true);
-            }}
-          >
-            Download it now
-          </a>
-        </p>
+        {usesPersonalStagingApp ? (
+          <p className="flex min-h-[3.125rem] items-center justify-center rounded-2xl bg-white px-4 py-3 text-sm text-black/60">
+            This personal staging app is admin-provided. Ask your Buzz
+            administrator for the approved staging installer.
+          </p>
+        ) : (
+          <p className="flex h-[3.125rem] items-center justify-center rounded-2xl bg-white text-sm text-black/60">
+            Don&apos;t have the app?{" "}
+            <a
+              aria-expanded={needsMacChoice ? showMacChoice : undefined}
+              aria-haspopup={needsMacChoice ? "dialog" : undefined}
+              className="ml-1 font-medium text-black underline-offset-4 hover:text-black/70 hover:underline focus-visible:underline"
+              href={downloadUrl}
+              ref={downloadTriggerRef}
+              rel="noreferrer"
+              target="_blank"
+              onClick={(event) => {
+                if (!needsMacChoice) return;
+                event.preventDefault();
+                setShowMacChoice(true);
+              }}
+            >
+              Download it now
+            </a>
+          </p>
+        )}
       </div>
 
-      {showMacChoice && (
+      {!usesPersonalStagingApp && showMacChoice && (
         <div
           aria-label="Which Mac do you have?"
           aria-modal="true"

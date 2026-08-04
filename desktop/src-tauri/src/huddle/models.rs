@@ -1,8 +1,8 @@
 //! Model download manager for STT (Parakeet TDT-CTC 110M) and TTS (Pocket TTS) models.
 //!
 //! Mental model:
-//!   app launch → start_stt_download (background) → ~/.buzz/models/parakeet-tdt-ctc-110m-en/
-//!   app launch → start_tts_download (background) → ~/.buzz/models/pocket-tts/
+//!   app launch → start_stt_download (background) → <profile nest>/models/parakeet-tdt-ctc-110m-en/
+//!   app launch → start_tts_download (background) → <profile nest>/models/pocket-tts/
 //!   STT pipeline → is_stt_ready() → stt_model_dir() → run inference
 //!   TTS pipeline → is_tts_ready() → tts_model_dir() → run synthesis
 //!
@@ -11,7 +11,7 @@
 //! compiled-in version, the model is re-downloaded.
 //!
 //! Upgrade note: an older Moonshine STT model directory at
-//! `~/.buzz/models/moonshine-tiny/` is removed best-effort once the new STT
+//! `<profile nest>/models/moonshine-tiny/` is removed best-effort once the new STT
 //! model finishes installing successfully. Cleanup is gated on the new model
 //! being Ready, so a failed download never removes the previous on-disk model
 //! during migration. If removal fails (permissions, etc.) the leftover is
@@ -123,7 +123,7 @@ const STT_DOWNLOAD_URL: &str =
 /// Subdirectory name produced by `tar xjf` on the archive.
 const STT_ARCHIVE_SUBDIR: &str = "sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8";
 
-/// Final directory name under `~/.buzz/models/`.
+/// Final directory name under the build-scoped model cache.
 const STT_MODEL_DIR_NAME: &str = "parakeet-tdt-ctc-110m-en";
 
 /// All files that must be present for the model to be considered ready.
@@ -158,7 +158,7 @@ license text for full warranty disclaimer.
 
 // ── Pocket TTS model ──────────────────────────────────────────────────────────
 
-/// Final directory name under `~/.buzz/models/`.
+/// Final directory name under the build-scoped model cache.
 const TTS_MODEL_DIR_NAME: &str = "pocket-tts";
 
 /// Attribution sidecar written next to the Pocket TTS model files.
@@ -376,9 +376,9 @@ where
 /// Per-model state + config. `ModelManager` owns two of these (stt, tts).
 #[derive(Clone)]
 struct ModelSlot {
-    dir_name: &'static str,                  // subdir under ~/.buzz/models/
+    dir_name: &'static str, // subdir under the profile model cache
     expected_files: &'static [&'static str], // files required for "ready"
-    version: &'static str,                   // manifest version; increment to force re-download
+    version: &'static str,  // manifest version; increment to force re-download
     expected_size: fn(&str) -> Option<u64>,
     status: Arc<Mutex<ModelStatus>>,
     just_ready: Arc<AtomicBool>, // fires once when download completes
@@ -594,18 +594,18 @@ fn tts_model_slot() -> ModelSlot {
 /// Cheap to clone — all inner state is behind `Arc`.
 #[derive(Clone)]
 pub struct ModelManager {
-    /// `~/.buzz/models/`
+    /// `<build-scoped Buzz nest>/models/`
     models_dir: PathBuf,
     stt: ModelSlot,
     tts: ModelSlot,
 }
 
 impl ModelManager {
-    /// Create a new `ModelManager` rooted at `~/.buzz/models/`.
+    /// Create a new `ModelManager` rooted in the build-scoped Buzz nest.
     ///
     /// Returns `None` if the home directory cannot be resolved.
     pub fn new() -> Option<Self> {
-        let models_dir = dirs::home_dir()?.join(".buzz").join("models");
+        let models_dir = models_dir_for_nest(&crate::managed_agents::nest_dir()?);
         let manager = Self {
             models_dir,
             stt: ModelSlot::new(STT_MODEL_DIR_NAME, STT_EXPECTED_FILES, STT_MODEL_VERSION),
@@ -803,7 +803,7 @@ impl ModelManager {
 
     /// Download and verify the Pocket TTS model files from HuggingFace.
     ///
-    /// Downloads files into `~/.buzz/models/pocket-tts/`:
+    /// Downloads files into `<profile nest>/models/pocket-tts/`:
     ///   - five ONNX sessions selected by the April INT8 bundle
     ///   - bundle metadata, SentencePiece tokenizer, and learned voice BOS
     ///   - upstream `LICENSE` plus Buzz's `MODEL_LICENSE.txt` attribution sidecar
@@ -925,6 +925,10 @@ impl ModelManager {
     }
 }
 
+fn models_dir_for_nest(nest: &Path) -> PathBuf {
+    nest.join("models")
+}
+
 // ── Process-global singleton ──────────────────────────────────────────────────
 
 static GLOBAL_MODEL_MANAGER: OnceLock<Option<ModelManager>> = OnceLock::new();
@@ -950,7 +954,7 @@ pub fn is_stt_ready() -> bool {
 
 /// Best-effort cleanup of the legacy Moonshine STT model directory.
 ///
-/// Removes `~/.buzz/models/moonshine-tiny/` if present (~70 MB on disk).
+/// Removes `<profile nest>/models/moonshine-tiny/` if present (~70 MB on disk).
 /// Idempotent — no-op if the directory is absent. Errors are logged and
 /// swallowed; the leftover is harmless and the user can remove it manually.
 ///
