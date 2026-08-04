@@ -345,7 +345,7 @@ jobs:
               and .head_branch == "main"
               and .head_sha == $sha
               and .event == "workflow_dispatch"
-              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .path == ".github/workflows/personal-relay-image.yml"
               and .repository.full_name == $repository
               and .actor.login == "justinharkelroad"
               and (.actor.id | type == "number" and . >= 1 and floor == .)
@@ -353,7 +353,10 @@ jobs:
               and .triggering_actor.login == "justinharkelroad"
               and (.triggering_actor.id | type == "number" and . >= 1 and floor == .)
               and (.triggering_actor.node_id | type == "string" and length > 0)
-            ' "$run_identity_json" >/dev/null
+            ' "$run_identity_json" >/dev/null || {
+              echo "::error::run identity evidence did not match the dispatch contract"
+              exit 1
+            }
           branch_metadata_sha256=$(sha256sum "$branch_json" | awk '{print $1}')
           effective_rules_sha256=$(sha256sum "$rules_json" | awk '{print $1}')
           rulesets_sha256=$(sha256sum "$rulesets_json" | awk '{print $1}')
@@ -785,7 +788,10 @@ jobs:
             .actor.login == "justinharkelroad"
             and .triggering_actor.login == "justinharkelroad"
             and .actor == .triggering_actor
-          ' "$run_identity_json" >/dev/null
+          ' "$run_identity_json" >/dev/null || {
+            echo "::error::run identity evidence did not match the dispatch contract"
+            exit 1
+          }
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
@@ -981,7 +987,10 @@ jobs:
             .actor.login == "justinharkelroad"
             and .triggering_actor.login == "justinharkelroad"
             and .actor == .triggering_actor
-          ' "$run_identity_json" >/dev/null
+          ' "$run_identity_json" >/dev/null || {
+            echo "::error::run identity evidence did not match the dispatch contract"
+            exit 1
+          }
 
           [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
           set +e
@@ -1929,7 +1938,10 @@ jobs:
             .actor.login == "justinharkelroad"
             and .triggering_actor.login == "justinharkelroad"
             and .actor == .triggering_actor
-          ' "$run_identity_json" >/dev/null
+          ' "$run_identity_json" >/dev/null || {
+            echo "::error::run identity evidence did not match the dispatch contract"
+            exit 1
+          }
 
           [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
           set +e
