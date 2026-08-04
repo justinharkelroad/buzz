@@ -466,10 +466,15 @@ Compare the dashboard to
 - Drain: at least 60 seconds.
 - Custom Start Command: empty, preserving the image entrypoint.
 - Image auto-update and repository auto-deploy: disabled.
+- Staging environment: `BUZZ_WEB_DESKTOP_SCHEME=buzz-personal-staging` exactly.
 
 The reference file is not active config-as-code. Railway config-as-code belongs
 to a source deployment, which would rebuild and break digest parity. Record the
 actual deployed digest and dashboard settings in every promotion receipt.
+The scheme is injected by the relay at runtime rather than baked into the OCI
+artifact. This preserves same-digest promotion: personal production uses the
+default `buzz`, while personal staging must explicitly use
+`buzz-personal-staging`.
 
 Staging must prove:
 
@@ -480,6 +485,8 @@ Staging must prove:
 - Predeploy succeeds as UID/GID 1000 without a mounted volume.
 - SIGTERM and live WebSocket draining finish inside 60 seconds.
 - Git, Postgres, Redis, S3, media, identity, and restart persistence pass.
+- The served invite page reports `buzz-personal-staging` as its desktop
+  deep-link scheme.
 - A provider readiness gate and continuous monitor are added after staging
   proves the correct public health target. Until then production is blocked.
 
@@ -504,9 +511,11 @@ BUZZ_SMOKE_APPROVED_ORIGIN_RECORD=/approved/evidence/personal-staging-origin.jso
 bash ./deploy/personal-relay/smoke-test.sh https://staging-relay.example
 ```
 
-Record the approval file SHA-256 printed by the script. Use synthetic fixtures
-for authenticated Git, media, and workflow tests. The read-only smoke test does
-not claim those behaviors.
+Record the approval file SHA-256 printed by the script. It also fails unless the
+served invite page exposes the environment-specific desktop scheme
+(`buzz-personal-staging` here; `buzz` for a separately authorized production
+smoke). Use synthetic fixtures for authenticated Git, media, and workflow tests.
+The read-only smoke test does not claim those behaviors.
 
 ## Desktop staging workflow
 

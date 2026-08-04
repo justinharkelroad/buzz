@@ -6,6 +6,22 @@ use url::Url;
 
 use crate::nostr_bind;
 
+const LEGACY_DEEP_LINK_SCHEME: &str = "buzz";
+
+pub(crate) fn configured_deep_link_scheme() -> &'static str {
+    env!("BUZZ_DESKTOP_BUILD_DEEP_LINK_SCHEME")
+}
+
+fn is_supported_deep_link_scheme(scheme: &str) -> bool {
+    scheme == configured_deep_link_scheme() || scheme == LEGACY_DEEP_LINK_SCHEME
+}
+
+pub(crate) fn is_supported_deep_link_url(url_str: &str) -> bool {
+    Url::parse(url_str)
+        .ok()
+        .is_some_and(|url| is_supported_deep_link_scheme(url.scheme()))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PendingCommunityDeepLink {
@@ -291,7 +307,7 @@ fn parse_nostr_bind_deep_link(url: &Url) -> Result<NostrBindDeepLinkPayload, Str
     })
 }
 
-/// Handle an incoming `buzz://` deep link URL.
+/// Handle an incoming configured or legacy `buzz://` deep link URL.
 ///
 /// Currently supports:
 /// - `buzz://connect?relay=<ws(s)://...>` — emits `deep-link-connect` to the frontend
@@ -304,7 +320,7 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
         }
     };
 
-    if url.scheme() != "buzz" {
+    if !is_supported_deep_link_scheme(url.scheme()) {
         eprintln!("buzz-desktop: ignoring unsupported deep link scheme: {url_str}");
         return;
     }
@@ -389,9 +405,34 @@ mod tests {
     use url::Url;
 
     use super::{
+        configured_deep_link_scheme, is_supported_deep_link_scheme, is_supported_deep_link_url,
         parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
         parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
     };
+
+    #[test]
+    fn configured_and_legacy_deep_link_schemes_are_supported() {
+        let configured = configured_deep_link_scheme();
+        assert!(is_supported_deep_link_scheme(configured));
+        assert!(is_supported_deep_link_scheme("buzz"));
+        assert!(is_supported_deep_link_url(&format!(
+            "{configured}://message?channel=abc&id=xyz"
+        )));
+        assert!(is_supported_deep_link_url(
+            "buzz://message?channel=abc&id=xyz"
+        ));
+    }
+
+    #[test]
+    fn unrelated_or_prefix_spoofed_deep_link_schemes_are_rejected() {
+        assert!(!is_supported_deep_link_url(
+            "https://message?channel=abc&id=xyz"
+        ));
+        assert!(!is_supported_deep_link_url(
+            "buzz-evil://message?channel=abc&id=xyz"
+        ));
+        assert!(!is_supported_deep_link_url("not a url"));
+    }
 
     fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
         PendingCommunityDeepLink {

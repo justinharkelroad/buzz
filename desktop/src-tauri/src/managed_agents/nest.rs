@@ -67,13 +67,18 @@ const NEST_DIR_PROD: &str = ".buzz";
 /// `.repos-dir` dotfile and `REPOS` symlink.
 const NEST_DIR_DEV: &str = ".buzz-dev";
 
+/// Nest directory name for the personal staging release. It must not read or
+/// write either the hosted production nest or a developer's local dev nest.
+const NEST_DIR_PERSONAL_STAGING: &str = ".buzz-personal-staging";
+
 /// Process-lifetime nest directory. Initialized once at startup via
 /// [`init_nest_dir`] before any call to [`nest_dir`].
 ///
 /// `None` inside the `OnceLock` means "home dir was unresolvable at init time".
 /// The outer `None` from `OnceLock::get` means "not initialized yet" —
-/// [`nest_dir`] falls back to the prod path in that case, ensuring test code
-/// that never calls [`init_nest_dir`] still works.
+/// [`nest_dir`] falls back to the compile-time profile path in that case,
+/// ensuring test code that never calls [`init_nest_dir`] still works without
+/// weakening staging isolation.
 static NEST_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 /// Initialize the process-lifetime nest directory.
@@ -84,25 +89,50 @@ static NEST_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new
 ///
 /// `is_dev` should be `true` when the running binary is a dev build — i.e.
 /// when the Tauri app-data directory name starts with `"xyz.block.buzz.app.dev"`.
-/// Pass `false` for production (signed DMG) builds.
+/// Pass `false` for release builds. The compile-time build profile further
+/// separates personal staging from hosted production.
 pub fn init_nest_dir(is_dev: bool) {
-    let suffix = if is_dev { NEST_DIR_DEV } else { NEST_DIR_PROD };
+    let suffix = nest_dir_name_for(is_dev, crate::desktop_profile::is_personal_staging_build());
     let path = dirs::home_dir().map(|h| h.join(suffix));
     // set() is a no-op when already initialized, which is correct: only the
     // first call (at boot, before any filesystem work) should win.
     let _ = NEST_DIR.set(path);
 }
 
-/// Returns the nest root path (`~/.buzz` for prod, `~/.buzz-dev` for dev),
-/// or `None` if the home directory cannot be resolved.
+/// Pure profile-to-directory mapping used by startup and unit tests.
+fn nest_dir_name_for(is_dev: bool, is_personal_staging: bool) -> &'static str {
+    if is_personal_staging {
+        NEST_DIR_PERSONAL_STAGING
+    } else if is_dev {
+        NEST_DIR_DEV
+    } else {
+        NEST_DIR_PROD
+    }
+}
+
+/// Profile-safe fallback used before startup initializes the process-lifetime
+/// nest. A staging binary must fail closed to its staging directory rather than
+/// briefly exposing the hosted production nest.
+fn fallback_nest_dir_name_for(is_personal_staging: bool) -> &'static str {
+    nest_dir_name_for(false, is_personal_staging)
+}
+
+/// Returns the build-scoped nest root path, or `None` if the home directory
+/// cannot be resolved.
 ///
 /// If [`init_nest_dir`] has not been called yet (e.g. in unit tests), falls
-/// back to the production path `~/.buzz`.
+/// back to the compiled profile's path. In particular, personal staging never
+/// falls back to hosted production's `~/.buzz`.
 pub fn nest_dir() -> Option<PathBuf> {
     match NEST_DIR.get() {
         Some(path) => path.clone(),
-        // Not yet initialized — fall back to prod path. Covers test code.
-        None => dirs::home_dir().map(|h| h.join(NEST_DIR_PROD)),
+        // Not yet initialized — use the compile-time profile. Covers test code
+        // without weakening personal-staging isolation.
+        None => dirs::home_dir().map(|h| {
+            h.join(fallback_nest_dir_name_for(
+                crate::desktop_profile::is_personal_staging_build(),
+            ))
+        }),
     }
 }
 
@@ -335,11 +365,18 @@ fn ensure_skill_symlinks(_root: &Path) -> Result<(), String> {
 
 /// Returns the `~/.local/bin` link name for the bundled CLI.
 ///
-/// Dev builds (`is_dev = true`) use `"buzz-dev"` so that a running DMG and a
-/// concurrent dev build each own a separate link and never clobber each other —
-/// the same isolation that separates `~/.buzz` (prod) from `~/.buzz-dev` (dev).
+/// Personal staging uses `"buzz-personal-staging"`; other dev builds use
+/// `"buzz-dev"`. Each profile owns a separate link and cannot replace another
+/// profile's CLI target.
 pub fn cli_link_name(is_dev: bool) -> &'static str {
-    if is_dev {
+    cli_link_name_for(is_dev, crate::desktop_profile::is_personal_staging_build())
+}
+
+/// Pure profile-to-link mapping used by reset logic and unit tests.
+pub(crate) fn cli_link_name_for(is_dev: bool, is_personal_staging: bool) -> &'static str {
+    if is_personal_staging {
+        "buzz-personal-staging"
+    } else if is_dev {
         "buzz-dev"
     } else {
         "buzz"

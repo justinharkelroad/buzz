@@ -45,12 +45,11 @@ const BLOB_KEY: &str = "secrets";
 
 // ── Interprocess advisory lock ─────────────────────────────────────────────
 //
-// Two concurrent Buzz processes (e.g. the signed DMG build and an unsigned dev
-// build via `just staging`) share the same OS keychain blob because the
-// service name `"buzz-desktop"` is a constant — it does not key off the bundle
-// identifier. Each process holds its own in-memory cache, so without an
-// interprocess lock a warm-cache write in process A drops keys added by process
-// B between A's last cache-warming read and A's write.
+// Two concurrent Buzz processes using the same profile can share an OS keychain
+// blob. Each process holds its own in-memory cache, so without an interprocess
+// lock a warm-cache write in process A drops keys added by process B between
+// A's last cache-warming read and A's write. Build profiles with different
+// trust boundaries (hosted, dev, personal staging) use distinct service names.
 //
 // The fix: `mutate_blob` acquires an exclusive advisory file lock, then always
 // performs a fresh `read_blob_raw()` inside the lock, applies the mutation,
@@ -237,8 +236,8 @@ impl SecretStore {
     /// cache and one mutex — so concurrent blob read-modify-write operations
     /// see each other's writes and the last-writer-wins race is closed.
     ///
-    /// Only one service name (`"buzz-desktop"`) is used in practice. If a
-    /// second service name is ever needed, this can be extended to a registry.
+    /// A process selects exactly one profile service name. If one process ever
+    /// needs to access multiple profile services, this must become a registry.
     pub fn shared(service: &'static str) -> &'static SecretStore {
         use std::sync::OnceLock;
         static INSTANCE: OnceLock<SecretStore> = OnceLock::new();

@@ -26,11 +26,21 @@ test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image_ref"
   = '["/usr/local/bin/personal-relay-entrypoint"]'
 test "$(docker image inspect --format '{{json .Config.Cmd}}' "$image_ref")" \
   = '["/usr/local/bin/buzz-relay"]'
+test "$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$image_ref" | \
+  grep -Fxc 'BUZZ_WEB_DESKTOP_SCHEME=buzz')" = 1
 
 docker run --rm --entrypoint /bin/sh "$image_ref" -ec '
   test -x /usr/bin/setpriv
   ! command -v gosu >/dev/null 2>&1
   test -x /usr/local/bin/personal-relay-migrate
+  web_index=/srv/buzz/web/index.html
+  test -f "$web_index"
+  test "$(grep -Fo "data-buzz-runtime-config=\"desktop-scheme\"" "$web_index" | wc -l)" -eq 1
+  grep -Fq "name=\"buzz-desktop-scheme\"" "$web_index"
+  grep -Fq "content=\"buzz\"" "$web_index"
+  grep -R -Fq "buzz-personal-staging" /srv/buzz/web/assets
+  ! grep -R -Fq "buzz://join?" /srv/buzz/web/assets
+  ! grep -R -Fq "buzz://connect?" /srv/buzz/web/assets
 '
 
 if docker run --rm "$image_ref" >"$no_volume_out" 2>&1; then

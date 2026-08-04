@@ -31,6 +31,13 @@ relay_dockerfile="$repo_root/Dockerfile"
 relay_entrypoint="$repo_root/deploy/personal-relay/git-volume-entrypoint.sh"
 relay_migrate="$repo_root/deploy/personal-relay/migrate.sh"
 relay_runtime_contract="$repo_root/deploy/personal-relay/runtime-contract-test.sh"
+relay_smoke_test="$repo_root/deploy/personal-relay/smoke-test.sh"
+relay_config="$repo_root/crates/buzz-relay/src/config.rs"
+relay_router="$repo_root/crates/buzz-relay/src/router.rs"
+web_index="$repo_root/web/index.html"
+web_invite_page="$repo_root/web/src/features/invite/ui/InvitePage.tsx"
+web_connect_button="$repo_root/web/src/features/repos/ui/ConnectButton.tsx"
+web_desktop_deep_link="$repo_root/web/src/shared/lib/desktop-deep-link.ts"
 trivy_policy_test="$repo_root/deploy/personal-relay/trivy-report-policy-test.sh"
 provider_src="$repo_root/crates/buzz-backend-kubernetes/src"
 provider_config="$provider_src/config.rs"
@@ -850,6 +857,14 @@ require_flow(
 }.each do |line, count|
   require_flow(dockerfile_text.lines.count { |candidate| candidate.chomp == line } == count, "Dockerfile base selector drifted: #{line}")
 end
+require_flow(
+  dockerfile_text.lines.count { |line| line.chomp == "    BUZZ_WEB_DESKTOP_SCHEME=buzz" } == 1,
+  "generic relay image must default the runtime web desktop scheme exactly once",
+)
+require_flow(
+  !dockerfile_text.include?("buzz-personal-staging"),
+  "generic relay image must not bake the personal staging desktop scheme",
+)
 expected_from = [
   "FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS chef",
   "FROM chef AS planner",
@@ -1359,7 +1374,10 @@ require_desktop(
 )
 require_desktop(build_contract.dig("env", "BASE_PRODUCT_NAME") == "${{ vars.PERSONAL_DESKTOP_PRODUCT_NAME }}", "desktop build contract lost protected base product input")
 require_desktop(build_contract.dig("env", "BASE_BUNDLE_ID") == "${{ vars.PERSONAL_DESKTOP_BUNDLE_ID }}", "desktop build contract lost protected base bundle input")
-%w[source_sha target version product_name bundle_id relay_wss relay_https receipt_sha256].each do |token|
+%w[
+  auto_connect_default_relay build_channel bundle_id deep_link_scheme product_name
+  receipt_sha256 relay_https relay_wss source_sha target version
+].each do |token|
   require_desktop(build_contract.fetch("run").include?(token), "desktop build contract omits #{token}")
 end
 authorization_stage = desktop_step(build, "Seal pre-candidate authorization and control evidence").fetch("run")
@@ -1367,26 +1385,47 @@ require_desktop(authorization_stage.include?("personal-desktop-build-contract.js
 require_desktop(authorization_stage.include?('== 16'), "desktop authorization artifact file count is not exact")
 
 generate = desktop_step(build, "Generate staging-only Tauri configuration")
-%w[BUZZ_RELAY_HTTP BUZZ_RELAY_URL EXPECTED_BUNDLE_ID EXPECTED_PRODUCT_NAME].each do |key|
+%w[
+  BUZZ_RELAY_HTTP BUZZ_RELAY_URL EXPECTED_BUILD_CHANNEL EXPECTED_BUNDLE_ID
+  EXPECTED_PRODUCT_NAME EXPECTED_URI_SCHEME
+].each do |key|
   require_desktop(generate.fetch("env").key?(key), "Tauri configuration lacks immutable #{key}")
 end
 require_desktop(generate.fetch("run").include?("Info.personal-staging.plist"), "staging Tauri config must use a staging identity plist")
 candidate_build = desktop_step(build, "Build unsigned staging binary and unpacked app")
-%w[BUZZ_RELAY_HTTP BUZZ_RELAY_URL DESKTOP_TARGET].each do |key|
+%w[
+  BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY BUZZ_BUILD_CHANNEL BUZZ_BUILD_DEEP_LINK_SCHEME
+  BUZZ_RELAY_HTTP BUZZ_RELAY_URL DESKTOP_TARGET VITE_BUZZ_BUILD_CHANNEL
+  VITE_BUZZ_DEEP_LINK_SCHEME
+].each do |key|
   require_desktop(candidate_build.fetch("env").key?(key), "desktop build lacks immutable #{key}")
 end
 candidate_build_run = candidate_build.fetch("run")
-dmg_build_run = desktop_step(build, "Create DMG from the exact snapshotted unpacked app").fetch("run")
+dmg_build = desktop_step(build, "Create DMG from the exact snapshotted unpacked app")
+%w[
+  BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY BUZZ_BUILD_CHANNEL BUZZ_BUILD_DEEP_LINK_SCHEME
+  BUZZ_RELAY_HTTP BUZZ_RELAY_URL DESKTOP_TARGET VITE_BUZZ_BUILD_CHANNEL
+  VITE_BUZZ_DEEP_LINK_SCHEME
+].each do |key|
+  require_desktop(dmg_build.fetch("env").key?(key), "desktop DMG build lacks immutable #{key}")
+end
+dmg_build_run = dmg_build.fetch("run")
 require_desktop(!workflow_text.match?(/\bfeatures=\(\)/), "desktop workflow must not use a nounset-unsafe empty features array")
 require_desktop(!workflow_text.match?(/\$\{features\[@\]\}/), "desktop workflow must not expand a nounset-unsafe features array")
 [candidate_build_run, dmg_build_run].each do |run|
+  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]'), "native and visible desktop build channels must match")
+  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]'), "native desktop build channel must fail closed to personal staging")
   require_desktop(run.include?('if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then'), "desktop target branch lost explicit arm64 selection")
   require_desktop(run.include?('elif [[ "$DESKTOP_TARGET" == "x86_64-apple-darwin" ]]; then'), "desktop target branch lost explicit x86_64 selection")
   require_desktop(run.include?('--features mesh-llm'), "arm64 Desktop build lost the reviewed mesh-llm feature")
   require_desktop(run.include?('echo "::error::unsupported desktop target"'), "desktop target selection must fail closed")
 end
 package_verify = desktop_step(build, "Verify package and exact sidecar parity")
-%w[EXPECTED_BUNDLE_ID EXPECTED_PRODUCT_NAME RELAY_HTTPS RELAY_WSS HOSTED_HTTPS PERSONAL_PRODUCTION_HTTPS].each do |key|
+%w[
+  EXPECTED_BANNER_ARTIFACT EXPECTED_BUNDLE_ID EXPECTED_PRODUCT_NAME
+  FORBIDDEN_BANNER_ARTIFACT RELAY_HTTPS RELAY_WSS HOSTED_HTTPS
+  PERSONAL_PRODUCTION_HTTPS
+].each do |key|
   require_desktop(package_verify.fetch("env").key?(key), "package verification lacks immutable #{key}")
 end
 %w[CFBundleIdentifier CFBundleName CFBundleDisplayName CFBundleExecutable].each do |key|
@@ -1397,6 +1436,8 @@ package_verify_run = package_verify.fetch("run")
   'aarch64-apple-darwin) expected_arch=arm64 ;;',
   'x86_64-apple-darwin) expected_arch=x86_64 ;;',
   '[[ -f "$main_executable" && -x "$main_executable" && ! -L "$main_executable" ]]',
+  '/usr/bin/grep -aFq -- "$EXPECTED_BANNER_ARTIFACT" "$main_executable"',
+  '/usr/bin/grep -aFq -- "$FORBIDDEN_BANNER_ARTIFACT" "$main_executable"',
   'sidecar_names=(',
   'buzz-backend-kubernetes',
   'git-credential-nostr',
@@ -2254,7 +2295,15 @@ expected_target_output.each do |target, expected_by_script|
       pnpm() { printf '%s\n' "$*"; }
     BASH
     stdout, stderr, status = Open3.capture3(
-      {"BASH_COMPAT" => "3.2", "DESKTOP_TARGET" => target},
+      {
+        "BASH_COMPAT" => "3.2",
+        "BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" => "true",
+        "BUZZ_BUILD_CHANNEL" => "personal-staging",
+        "BUZZ_BUILD_DEEP_LINK_SCHEME" => "buzz-personal-staging",
+        "DESKTOP_TARGET" => target,
+        "VITE_BUZZ_BUILD_CHANNEL" => "personal-staging",
+        "VITE_BUZZ_DEEP_LINK_SCHEME" => "buzz-personal-staging",
+      },
       "/bin/bash", "-c", harness, chdir: repo_root,
     )
     require_desktop(status.success?, "Desktop Bash 3.2 #{label} fixture failed for #{target}: #{stderr}")
@@ -3635,6 +3684,9 @@ done
 [[ -f "$relay_env_example" && -r "$relay_env_example" && ! -L "$relay_env_example" ]]
 [[ $(grep -Ec '^BUZZ_RECONCILE_CHANNELS=' "$relay_env_example") -eq 1 ]]
 [[ $(grep -Fxc 'BUZZ_RECONCILE_CHANNELS=true' "$relay_env_example") -eq 1 ]]
+[[ $(grep -Ec '^BUZZ_WEB_DESKTOP_SCHEME=' "$relay_env_example") -eq 1 ]]
+[[ $(grep -Fxc 'BUZZ_WEB_DESKTOP_SCHEME=buzz' "$relay_env_example") -eq 1 ]]
+[[ $(grep -Fxc '# Personal-staging override only: BUZZ_WEB_DESKTOP_SCHEME=buzz-personal-staging' "$relay_env_example") -eq 1 ]]
 for channel_reconciliation_contract in \
   '`BUZZ_RECONCILE_CHANNELS=true`' \
   'personal staging and personal production' \
@@ -3644,6 +3696,14 @@ for channel_reconciliation_contract in \
   'Gate 1 evidence'; do
   grep -Fq "$channel_reconciliation_contract" "$release_runbook"
   grep -Fq "$channel_reconciliation_contract" "$deploy_runbook"
+done
+for web_desktop_scheme_contract in \
+  '`BUZZ_WEB_DESKTOP_SCHEME=buzz-personal-staging`' \
+  'same-digest promotion' \
+  '`buzz-personal-staging`' \
+  'default `buzz`'; do
+  grep -Fq "$web_desktop_scheme_contract" "$release_runbook"
+  grep -Fq "$web_desktop_scheme_contract" "$deploy_runbook"
 done
 for desktop_release_contract in \
   'exact ten-file candidate' \
@@ -3679,6 +3739,22 @@ grep -Fq "^Cap(Inh|Prm|Eff|Bnd|Amb):" "$relay_runtime_contract"
 grep -Fq '^NoNewPrivs:' "$relay_runtime_contract"
 grep -Fq '/usr/local/bin/personal-relay-migrate' "$relay_runtime_contract"
 grep -Fq '.State.ExitCode' "$relay_runtime_contract"
+grep -Fq 'BUZZ_WEB_DESKTOP_SCHEME=buzz' "$relay_runtime_contract"
+grep -Fq 'data-buzz-runtime-config=' "$relay_runtime_contract"
+grep -Fq 'buzz-personal-staging' "$relay_runtime_contract"
+grep -Fq "personal-staging) expected_desktop_scheme=buzz-personal-staging" "$relay_smoke_test"
+grep -Fq "personal-production) expected_desktop_scheme=buzz" "$relay_smoke_test"
+grep -Fq '/invite/runtime-scheme-smoke' "$relay_smoke_test"
+grep -Fq 'BUZZ_WEB_DESKTOP_SCHEME must be exactly' "$relay_config"
+grep -Fq 'read_web_spa_index' "$relay_router"
+grep -Fq 'data-buzz-runtime-config="desktop-scheme"' "$web_index"
+grep -Fq 'buzz-personal-staging' "$web_desktop_deep_link"
+grep -Fq 'desktopDeepLink("join"' "$web_invite_page"
+grep -Fq 'desktopDeepLink(' "$web_connect_button"
+if grep -Fq 'buzz://' "$web_invite_page" "$web_connect_button"; then
+  printf '%s\n' "relay-served web deep links must use the validated runtime scheme helper" >&2
+  exit 1
+fi
 [[ $(grep -Fc 'runtime-contract-test.sh "$IMAGE_REF"' "$relay_workflow") -eq 2 ]]
 publish_job=$(awk '/^  publish:$/ { keep=1 } keep { print }' "$relay_workflow")
 if grep -Eq '(^|[;&|[:space:]])(cargo|pnpm|just|tauri)[[:space:]]|docker[[:space:]]+(run|pull)|runtime-contract-test\.sh' \

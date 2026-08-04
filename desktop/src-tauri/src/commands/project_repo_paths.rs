@@ -145,13 +145,26 @@ pub(crate) fn find_local_repo_dir(
 }
 
 pub(crate) fn default_repos_root_candidates() -> Vec<std::path::PathBuf> {
+    default_repos_root_candidates_for(
+        nest_dir(),
+        dirs::home_dir(),
+        !crate::desktop_profile::is_personal_staging_build(),
+    )
+}
+
+fn default_repos_root_candidates_for(
+    nest: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    include_production_fallback: bool,
+) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-    candidates.extend(nest_dir().map(|path| path.join("REPOS")));
-    candidates.extend(
-        dirs::home_dir()
-            .map(|home| home.join(".buzz").join("REPOS"))
-            .filter(|path| !candidates.iter().any(|candidate| candidate == path)),
-    );
+    candidates.extend(nest.map(|path| path.join("REPOS")));
+    if include_production_fallback {
+        candidates.extend(
+            home.map(|home| home.join(".buzz").join("REPOS"))
+                .filter(|path| !candidates.iter().any(|candidate| candidate == path)),
+        );
+    }
     candidates
 }
 
@@ -189,4 +202,32 @@ pub(crate) fn canonical_repos_roots(
         return Err("reposDir is not accessible".to_string());
     }
     Ok(roots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_repos_root_candidates_for;
+    use std::path::PathBuf;
+
+    #[test]
+    fn personal_staging_never_falls_back_to_production_repos() {
+        let home = PathBuf::from("/Users/example");
+        let staging_nest = home.join(".buzz-personal-staging");
+
+        assert_eq!(
+            default_repos_root_candidates_for(
+                Some(staging_nest.clone()),
+                Some(home.clone()),
+                false,
+            ),
+            vec![staging_nest.join("REPOS")]
+        );
+        assert_eq!(
+            default_repos_root_candidates_for(Some(home.join(".buzz-dev")), Some(home), true),
+            vec![
+                PathBuf::from("/Users/example/.buzz-dev/REPOS"),
+                PathBuf::from("/Users/example/.buzz/REPOS"),
+            ]
+        );
+    }
 }

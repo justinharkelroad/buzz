@@ -3,12 +3,15 @@ use super::*;
 #[test]
 fn nest_dir_is_under_home() {
     if let Some(dir) = nest_dir() {
-        // Accepts both .buzz (prod) and .buzz-dev (dev) depending on
-        // whether init_nest_dir was called before this test ran.
+        // Accept every compile-time profile depending on whether
+        // init_nest_dir was called before this test ran.
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(
-            name == NEST_DIR_PROD || name == NEST_DIR_DEV,
-            "nest_dir must end with .buzz or .buzz-dev, got {dir:?}"
+            matches!(
+                name,
+                NEST_DIR_PROD | NEST_DIR_DEV | NEST_DIR_PERSONAL_STAGING
+            ),
+            "nest_dir must end with a known profile suffix, got {dir:?}"
         );
     }
 }
@@ -23,10 +26,27 @@ fn init_nest_dir_prod_sets_buzz() {
     if let Some(d) = dir {
         let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(
-            name == NEST_DIR_PROD || name == NEST_DIR_DEV,
-            "nest_dir suffix must be .buzz or .buzz-dev, got {d:?}"
+            matches!(
+                name,
+                NEST_DIR_PROD | NEST_DIR_DEV | NEST_DIR_PERSONAL_STAGING
+            ),
+            "nest_dir suffix must belong to a known profile, got {d:?}"
         );
     }
+}
+
+#[test]
+fn nest_dir_names_are_isolated_by_profile() {
+    assert_eq!(nest_dir_name_for(false, false), ".buzz");
+    assert_eq!(nest_dir_name_for(true, false), ".buzz-dev");
+    assert_eq!(nest_dir_name_for(false, true), ".buzz-personal-staging");
+    assert_eq!(nest_dir_name_for(true, true), ".buzz-personal-staging");
+}
+
+#[test]
+fn pre_init_fallback_never_crosses_from_staging_to_production() {
+    assert_eq!(fallback_nest_dir_name_for(false), ".buzz");
+    assert_eq!(fallback_nest_dir_name_for(true), ".buzz-personal-staging");
 }
 
 #[test]
@@ -343,12 +363,18 @@ fn ensure_skill_symlinks_skip_dangling_symlink() {
 
 #[test]
 fn cli_link_name_prod_is_buzz() {
-    assert_eq!(cli_link_name(false), "buzz");
+    assert_eq!(cli_link_name_for(false, false), "buzz");
 }
 
 #[test]
 fn cli_link_name_dev_is_buzz_dev() {
-    assert_eq!(cli_link_name(true), "buzz-dev");
+    assert_eq!(cli_link_name_for(true, false), "buzz-dev");
+}
+
+#[test]
+fn cli_link_name_personal_staging_is_isolated() {
+    assert_eq!(cli_link_name_for(false, true), "buzz-personal-staging");
+    assert_eq!(cli_link_name_for(true, true), "buzz-personal-staging");
 }
 
 #[cfg(unix)]
@@ -363,7 +389,7 @@ fn ensure_cli_symlink_creates_symlink_prod() {
     fs::create_dir_all(&local_bin).unwrap();
 
     // Prod link name is "buzz"; simulate the symlink creation path.
-    let link = local_bin.join(cli_link_name(false));
+    let link = local_bin.join(cli_link_name_for(false, false));
     std::os::unix::fs::symlink(exe_parent.join("buzz"), &link).unwrap();
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("buzz"));
@@ -381,9 +407,9 @@ fn ensure_cli_symlink_creates_symlink_dev() {
     fs::create_dir_all(&local_bin).unwrap();
 
     // Dev link must be "buzz-dev", never "buzz".
-    assert_eq!(cli_link_name(true), "buzz-dev");
+    assert_eq!(cli_link_name_for(true, false), "buzz-dev");
 
-    let link = local_bin.join(cli_link_name(true));
+    let link = local_bin.join(cli_link_name_for(true, false));
     std::os::unix::fs::symlink(exe_parent.join("buzz"), &link).unwrap();
     assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(fs::read_link(&link).unwrap(), exe_parent.join("buzz"));
@@ -397,7 +423,7 @@ fn ensure_cli_symlink_does_not_clobber_regular_file_prod() {
     let tmp = tempfile::tempdir().unwrap();
     let local_bin = tmp.path().join("local_bin");
     fs::create_dir_all(&local_bin).unwrap();
-    let link = local_bin.join(cli_link_name(false));
+    let link = local_bin.join(cli_link_name_for(false, false));
     fs::write(&link, "user-installed binary").unwrap();
 
     // Regular files are preserved — the Ok(_) branch skips them.
@@ -411,7 +437,7 @@ fn ensure_cli_symlink_does_not_clobber_regular_file_dev() {
     let tmp = tempfile::tempdir().unwrap();
     let local_bin = tmp.path().join("local_bin");
     fs::create_dir_all(&local_bin).unwrap();
-    let link = local_bin.join(cli_link_name(true));
+    let link = local_bin.join(cli_link_name_for(true, false));
     fs::write(&link, "user-installed buzz-dev binary").unwrap();
 
     // Regular files at the dev path are also preserved.
@@ -944,7 +970,7 @@ fn test_path_is_dev_nest_prod_path_returns_false() {
 
 #[test]
 fn test_path_is_dev_nest_unrelated_path_returns_false() {
-    let path = std::path::Path::new("/Users/someone/.buzz-staging");
+    let path = std::path::Path::new("/Users/someone/.buzz-personal-staging");
     assert!(
         !path_is_dev_nest(path),
         "unrelated path must not be identified as dev nest"

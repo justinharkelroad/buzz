@@ -13,6 +13,82 @@ test("home page shows repositories section", async ({ page }) => {
   await expect(page.getByText("Repositories")).toBeVisible();
 });
 
+test("invite deep links use the production scheme by default", async ({
+  page,
+}) => {
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+
+  await page.goto("/invite/production-code");
+  await expect(
+    page.getByRole("link", { name: "Accept invite in Buzz" }),
+  ).toHaveAttribute(
+    "href",
+    "buzz://join?relay=ws%3A%2F%2F127.0.0.1%3A4173&code=production-code",
+  );
+});
+
+test("relay runtime configuration selects the personal staging scheme", async ({
+  page,
+}) => {
+  let hostedDownloadRequested = false;
+  await page.route(
+    "https://api.github.com/repos/block/buzz/releases**",
+    async (route) => {
+      hostedDownloadRequested = true;
+      await route.abort();
+    },
+  );
+  await page.route("**/invite/staging-code", async (route) => {
+    const response = await route.fetch();
+    const body = await response.text();
+    const schemeTag = body.match(
+      /<meta\b[^>]*data-buzz-runtime-config="desktop-scheme"[^>]*>/u,
+    )?.[0];
+    if (!schemeTag) throw new Error("desktop scheme runtime marker is missing");
+    const stagingTag = schemeTag.replace(
+      /content="buzz"/u,
+      'content="buzz-personal-staging"',
+    );
+    if (stagingTag === schemeTag) {
+      throw new Error("desktop scheme default content is missing");
+    }
+    await route.fulfill({
+      response,
+      body: body.replace(schemeTag, stagingTag),
+    });
+  });
+  await page.route("**/api/join-policy", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ policy: null }),
+    });
+  });
+
+  await page.goto("/invite/staging-code");
+  await expect(
+    page.getByRole("link", { name: "Accept invite in Buzz" }),
+  ).toHaveAttribute(
+    "href",
+    "buzz-personal-staging://join?relay=ws%3A%2F%2F127.0.0.1%3A4173&code=staging-code",
+  );
+  await expect(
+    page.getByText(
+      "This personal staging app is admin-provided. Ask your Buzz administrator for the approved staging installer.",
+    ),
+  ).toBeVisible();
+  await expect(page.getByRole("link", { name: "Download it now" })).toHaveCount(
+    0,
+  );
+  expect(hostedDownloadRequested).toBe(false);
+});
+
 test("invite requires age and legal consent before opening Buzz", async ({
   page,
 }) => {

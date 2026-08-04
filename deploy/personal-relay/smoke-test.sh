@@ -18,6 +18,7 @@ Read-only checks:
   - exact approved target and explicit forbidden-origin rejection
   - TLS policy, liveness, and readiness
   - NIP-11 relay identity and closed-relay declarations
+  - environment-specific desktop deep-link scheme in the served invite page
   - WebSocket upgrade and NIP-42 AUTH challenge
 
 Optional variables:
@@ -88,6 +89,12 @@ approved_origin=$(jq -r .approved_origin "$approval_record")
 expected_relay_pubkey=$(jq -r .expected_relay_pubkey "$approval_record")
 [[ "$record_environment" == "$expected_environment" ]] || \
   fail "approval record environment does not match BUZZ_SMOKE_EXPECTED_ENVIRONMENT"
+
+case "$expected_environment" in
+  personal-staging) expected_desktop_scheme=buzz-personal-staging ;;
+  personal-production) expected_desktop_scheme=buzz ;;
+  *) fail "unsupported smoke environment: $expected_environment" ;;
+esac
 
 if [[ "$expected_environment" == "personal-production" ]]; then
   [[ -n "$gate9_approval_reference" ]] || \
@@ -164,6 +171,7 @@ base_url=${target_origin%/}
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 nip11_path="$tmp_dir/nip11.json"
+web_index_path="$tmp_dir/invite-index.html"
 
 curl_args=(--fail --silent --show-error --max-time "$timeout_seconds")
 
@@ -184,6 +192,28 @@ jq -e '.limitation.auth_required == true and .limitation.restricted_writes == tr
   fail "NIP-11 does not declare authenticated, restricted relay behavior"
 jq -e '.supported_nips | index(42) != null and index(43) != null' "$nip11_path" >/dev/null ||
   fail "NIP-11 does not advertise required NIP-42 and NIP-43 support"
+
+echo "checking desktop deep-link scheme"
+curl "${curl_args[@]}" \
+  -H 'Accept: text/html' \
+  "$base_url/invite/runtime-scheme-smoke" >"$web_index_path"
+node --input-type=module - "$web_index_path" "$expected_desktop_scheme" <<'NODE' ||
+  fail "served invite page does not contain the expected desktop deep-link scheme"
+import { readFileSync } from "node:fs";
+
+const html = readFileSync(process.argv[2], "utf8");
+const expected = process.argv[3];
+const metaTags = html.match(/<meta\b[^>]*>/giu) ?? [];
+const schemeTags = metaTags.filter((tag) =>
+  /\bname=(['"])buzz-desktop-scheme\1/iu.test(tag),
+);
+if (schemeTags.length !== 1) process.exit(2);
+const content = schemeTags[0].match(/\bcontent=(['"])([^'"]*)\1/iu)?.[2];
+if (content !== expected) process.exit(3);
+if (!/\bdata-buzz-runtime-config=(['"])desktop-scheme\1/iu.test(schemeTags[0])) {
+  process.exit(4);
+}
+NODE
 
 ws_url=${BUZZ_SMOKE_WS_URL:-}
 if [[ -z "$ws_url" ]]; then

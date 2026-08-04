@@ -4,7 +4,13 @@
  * Format: `buzz://message?channel=<uuid>&id=<eventId>[&thread=<rootId>]`
  */
 
-const MESSAGE_LINK_SCHEME = "buzz:";
+import {
+  DESKTOP_DEEP_LINK_SCHEME,
+  isSupportedDesktopDeepLinkProtocol,
+  resolveDesktopDeepLinkScheme,
+  supportedDesktopDeepLinkSchemes,
+} from "@/shared/lib/desktopDeepLinkScheme";
+
 const MESSAGE_LINK_HOST = "message";
 
 export type MessageLinkInput = {
@@ -38,7 +44,10 @@ export type MessageLinkParseResult =
  * Empty `threadRootId` is treated as "no thread" so callers can pass through
  * the result of `getThreadReference(tags).rootId` without extra null checks.
  */
-export function buildMessageLink(input: MessageLinkInput): string {
+export function buildMessageLink(
+  input: MessageLinkInput,
+  configuredScheme = DESKTOP_DEEP_LINK_SCHEME,
+): string {
   if (!input.channelId) {
     throw new Error("buildMessageLink: channelId is required");
   }
@@ -52,14 +61,18 @@ export function buildMessageLink(input: MessageLinkInput): string {
   if (input.threadRootId) {
     params.set("thread", input.threadRootId);
   }
-  return `${MESSAGE_LINK_SCHEME}//${MESSAGE_LINK_HOST}?${params.toString()}`;
+  const scheme = resolveDesktopDeepLinkScheme(configuredScheme);
+  return `${scheme}://${MESSAGE_LINK_HOST}?${params.toString()}`;
 }
 
 /**
  * Parse a `buzz://message?…` URL. Returns a discriminated result so callers can
  * render a fallback (e.g. a plain link) without throwing.
  */
-export function parseMessageLink(url: string): MessageLinkParseResult {
+export function parseMessageLink(
+  url: string,
+  configuredScheme = DESKTOP_DEEP_LINK_SCHEME,
+): MessageLinkParseResult {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -67,7 +80,7 @@ export function parseMessageLink(url: string): MessageLinkParseResult {
     return { ok: false, reason: "invalid-url" };
   }
 
-  if (parsed.protocol !== MESSAGE_LINK_SCHEME) {
+  if (!isSupportedDesktopDeepLinkProtocol(parsed.protocol, configuredScheme)) {
     return { ok: false, reason: "wrong-scheme" };
   }
   // `new URL("buzz://message?…")` puts "message" in `hostname`.
@@ -98,9 +111,15 @@ export function parseMessageLink(url: string): MessageLinkParseResult {
  * Convenience: returns true if the given href is a supported message link.
  * Cheap pre-check used by the markdown renderer before parsing.
  */
-export function isMessageLink(href: string | undefined | null): boolean {
+export function isMessageLink(
+  href: string | undefined | null,
+  configuredScheme = DESKTOP_DEEP_LINK_SCHEME,
+): boolean {
   if (!href) return false;
-  return href.startsWith("buzz://message?") || href === "buzz://message";
+  return supportedDesktopDeepLinkSchemes(configuredScheme).some(
+    (scheme) =>
+      href.startsWith(`${scheme}://message?`) || href === `${scheme}://message`,
+  );
 }
 
 type MessageLinkRenderInput = {
