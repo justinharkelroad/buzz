@@ -53,6 +53,121 @@ fi
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/release.yml"
 grep -q 'verify-release-ref\.sh' "$repo_root/.github/workflows/docker.yml"
 grep -q 'test-release-ref-contract\.sh' "$repo_root/.github/workflows/ci.yml"
+
+# Pull requests may read public registry caches, but must never export to them.
+# Fork-owned repositories still see their own PRs as same-repository events, so
+# checking head.repo is not a sufficient write guard for Block-owned caches.
+cache_guard="$repo_root/scripts/check-workflow-cache-to-guards.rb"
+ruby "$cache_guard" "$repo_root/.github/workflows"
+
+cache_fixture_root="$tmp/cache-to-fixtures"
+mkdir -p "$cache_fixture_root/safe"
+cat >"$cache_fixture_root/safe/canonical.yml" <<'YAML'
+cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=inline') || '' }}
+block:
+  cache-to: |
+    type=local,dest=/tmp/cache
+    ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=block') || '' }}
+guarded-indirection:
+  cache-to: ${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && env.REVIEWED_CACHE_TO || '' }}
+ordinary-input-expression:
+  with:
+    ref: ${{ github.sha }}
+YAML
+ruby "$cache_guard" "$cache_fixture_root/safe"
+
+hidden_fixture="$cache_fixture_root/hidden-workflow"
+mkdir -p "$hidden_fixture"
+printf '%s\n' "cache-to: type=local,dest=/tmp/cache" >"$hidden_fixture/visible.yml"
+printf '%s\n' "cache-to: type=registry,ref=unsafe" >"$hidden_fixture/.workflow.yml"
+if ruby "$cache_guard" "$hidden_fixture" >/dev/null 2>&1; then
+  echo "cache-to guard skipped an unsafe hidden workflow" >&2
+  exit 1
+fi
+
+expect_cache_guard_rejection() {
+  local name="$1" fixture
+  fixture="$cache_fixture_root/$name"
+  mkdir -p "$fixture"
+  printf '%s\n' "${@:2}" >"$fixture/workflow.yml"
+  if ruby "$cache_guard" "$fixture" >/dev/null 2>&1; then
+    echo "cache-to guard accepted unsafe fixture: $name" >&2
+    exit 1
+  fi
+}
+
+expect_cache_guard_rejection unguarded-inline \
+  "cache-to: type=registry,ref=unsafe"
+expect_cache_guard_rejection unsafe-middle \
+  "cache-to: |" \
+  "  \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-one') || '' }}" \
+  "  type=registry,ref=unsafe-middle" \
+  "  \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-two') || '' }}"
+expect_cache_guard_rejection pull-request-only-guard \
+  "cache-to: \${{ github.event_name != 'pull_request' && format('type=registry,ref=unsafe-target') || '' }}"
+expect_cache_guard_rejection pull-request-target-only-guard \
+  "cache-to: \${{ github.event_name != 'pull_request_target' && format('type=registry,ref=unsafe-pr') || '' }}"
+expect_cache_guard_rejection unguarded-indirection \
+  "cache-to: \${{ env.CACHE_TO }}"
+expect_cache_guard_rejection yaml-alias \
+  "cache-to: *reviewed_cache_destination"
+expect_cache_guard_rejection mixed-unresolved \
+  "cache-to: |" \
+  "  type=local,dest=/tmp/cache" \
+  "  \${{ steps.cache.outputs.destination }}"
+expect_cache_guard_rejection same-item-mixed-expression \
+  "cache-to: \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-one') || '' }}\${{ env.CACHE_TO }}\${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-two') || '' }}"
+expect_cache_guard_rejection same-item-literal-middle \
+  "cache-to: \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-one') || '' }}type=registry,ref=unsafe-middle\${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=registry,ref=safe-two') || '' }}"
+expect_cache_guard_rejection unsafe-expression-fallback \
+  "cache-to: \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && format('type=local,dest=/tmp/safe') || 'type=registry,ref=unsafe' || '' }}"
+expect_cache_guard_rejection quoted-key \
+  "'cache-to': type=registry,ref=unsafe"
+expect_cache_guard_rejection flow-map \
+  "with: {cache-to: type=registry,ref=unsafe}"
+expect_cache_guard_rejection uppercase-flow-key \
+  "with: {CACHE-TO: type=registry,ref=unsafe}"
+expect_cache_guard_rejection mixed-case-block-key \
+  "with:" \
+  "  CaChE-To: type=registry,ref=unsafe"
+expect_cache_guard_rejection duplicate-case-variants \
+  "with:" \
+  "  cache-to: type=local,dest=/tmp/cache" \
+  "  CACHE-TO: type=registry,ref=unsafe"
+expect_cache_guard_rejection inserted-input-map \
+  "with:" \
+  "  \${{ insert }}: \${{ fromJSON('{\"cache-to\":\"type=registry,ref=unsafe\"}') }}"
+expect_cache_guard_rejection expression-input-map \
+  "with: \${{ fromJSON('{\"cache-to\":\"type=registry,ref=unsafe\"}') }}"
+expect_cache_guard_rejection uppercase-expression-input-map \
+  "WITH: \${{ fromJSON('{\"cache-to\":\"type=registry,ref=unsafe\"}') }}"
+expect_cache_guard_rejection explicit-mapping-key \
+  "with:" \
+  "  ? cache-to" \
+  "  : type=registry,ref=unsafe"
+expect_cache_guard_rejection escaped-unicode-key \
+  '"\u0063ache-to": type=registry,ref=unsafe'
+expect_cache_guard_rejection escaped-hex-key \
+  '"cache\x2dto": type=registry,ref=unsafe'
+expect_cache_guard_rejection tagged-escaped-key \
+  '!!str "\u0063ache-to": type=registry,ref=unsafe'
+expect_cache_guard_rejection binary-key \
+  '!!binary Y2FjaGUtdG8=: type=registry,ref=unsafe'
+expect_cache_guard_rejection merged-cache-mapping \
+  "cache-defaults: &cache_defaults" \
+  "  cache-to: type=registry,ref=unsafe" \
+  "job:" \
+  "  <<: *cache_defaults"
+expect_cache_guard_rejection alias-key \
+  "cache-key-name: &cache_key cache-to" \
+  "with:" \
+  "  ? *cache_key" \
+  "  : type=registry,ref=unsafe"
+expect_cache_guard_rejection split-expression \
+  "cache-to: |" \
+  "  \${{ github.event_name != 'pull_request' && github.event_name != 'pull_request_target' &&" \
+  "      format('type=registry,ref=split') || '' }}"
+
 "$repo_root/scripts/test-signed-canary-contract.sh"
 auto_tag="$repo_root/.github/workflows/auto-tag-on-release-pr-merge.yml"
 grep -q 'actions/create-github-app-token@' "$auto_tag"

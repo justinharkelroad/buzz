@@ -136,18 +136,18 @@ Controls which authors' events the harness forwards to the agent. Events from di
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `anyone`, `nobody`. |
-| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is always implicitly included. |
+| `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | - | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). The owner and cryptographically verified same-owner sibling agents are implicitly included. |
 
 **Modes:**
 
 | Mode | Behavior |
 |------|----------|
-| `owner-only` | Forward only events from the agent's registered owner. If no owner is set, all events are dropped until the owner is resolved. |
-| `allowlist` | Forward events from the listed pubkeys plus the owner. |
-| `anyone` | Forward all events (no author filtering). |
+| `owner-only` | Forward only events from the agent's registered owner and cryptographically verified same-owner sibling agents. If no owner is set, all events are dropped until the owner is resolved. |
+| `allowlist` | Forward events from the listed pubkeys, the owner, and verified same-owner sibling agents. In a DM, a listed external pubkey is eligible only in a relay-verified 1:1 DM whose exact participant set is that author plus this agent. |
+| `anyone` | Forward all events in regular channels. In DMs, only the owner and verified same-owner sibling agents are eligible; `anyone` does not grant external DM access. |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |
 
-The gate applies to **all** inbound events — @mentions, DMs, thread replies, and any event delivered by the relay. Owner control commands are checked **before** the gate, so the owner can still manage the harness regardless of mode:
+The gate applies to **all** inbound events: @mentions, DMs, thread replies, and any event delivered by the relay. External DM delegation fails closed: an unlisted author, a group DM, malformed or unavailable relay participant metadata, or an unknown channel never receives an external grant. Sender-controlled message `p` tags are not used to establish the DM participant set. Owner control commands are checked **before** the gate, so the owner can still manage the harness regardless of mode:
 
 | Command | Effect |
 |---------|--------|
@@ -159,7 +159,7 @@ Use `!cancel` to stop only the current turn; it is a no-op when the channel is i
 
 Owner control commands must be kind:9 stream messages from the owner, must mention this agent with a `p` tag, and are consumed by the harness instead of being forwarded to the agent.
 
-> **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
+> **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to open regular channels. To grant an external person DM access, use `allowlist`, list their exact pubkey, and use a relay-verified 1:1 DM with the agent.
 
 **Examples:**
 

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # Public Buzz relay image — published as ghcr.io/block/buzz:<tag>.
 #
@@ -28,7 +28,7 @@ ARG EXTRA_CA_CERTS=
 ARG NPM_REGISTRY=
 
 # ─── Stage 1: cargo-chef base ───────────────────────────────────────────────
-FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION}@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS chef
 # Trust an optional corporate-proxy CA before any network fetch (no-op if unset).
 ARG EXTRA_CA_CERTS
 COPY --chmod=0644 ${EXTRA_CA_CERTS:-Dockerfile} /tmp/extra-ca/src
@@ -81,7 +81,7 @@ RUN strip target/release/buzz-relay \
 # ─── Stage 4: web bundle (pnpm + vite) ──────────────────────────────────────
 # Independent of the Rust layers so a CSS change doesn't bust Rust cache and
 # vice versa.
-FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim AS web-builder
+FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7 AS web-builder
 WORKDIR /build
 # Trust an optional corporate-proxy CA so corepack + pnpm can fetch over an
 # intercepting TLS gateway (no-op if EXTRA_CA_CERTS is unset).
@@ -119,7 +119,7 @@ COPY admin-web/ admin-web/
 RUN pnpm -C web build && pnpm -C admin-web build
 
 # ─── Stage 5: shared runtime ────────────────────────────────────────────────
-FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
+FROM debian:${DEBIAN_VERSION}-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime-base
 
 # OCI annotations: required for GHCR to auto-link the image to this repo and
 # inherit its visibility. org.opencontainers.image.source is the load-bearing
@@ -169,6 +169,25 @@ FROM runtime-base AS runtime-debug
 COPY --from=builder /build/target/release/buzz-relay /usr/local/bin/buzz-relay
 COPY --from=builder /build/target/release/buzz-admin /usr/local/bin/buzz-admin
 COPY --from=builder /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
+
+# Railway mounts the personal relay's Git volume as root. This opt-in target
+# starts through a fixed-path wrapper that adjusts only /data/git and then
+# drops to UID/GID 1000. The normal runtime targets remain non-root.
+FROM runtime-base AS runtime-personal
+USER root:root
+# The shared Debian runtime already provides setpriv through util-linux. Keep a
+# build-time assertion here so a future base-image change cannot silently remove
+# the fixed privilege-drop primitive used by the personal entrypoint.
+RUN test -x /usr/bin/setpriv
+COPY --from=stripped-binaries /build/target/release/buzz-relay /usr/local/bin/buzz-relay
+COPY --from=stripped-binaries /build/target/release/buzz-admin /usr/local/bin/buzz-admin
+COPY --from=stripped-binaries /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
+COPY --chmod=0755 deploy/personal-relay/git-volume-entrypoint.sh /usr/local/bin/personal-relay-entrypoint
+COPY --chmod=0755 deploy/personal-relay/migrate.sh /usr/local/bin/personal-relay-migrate
+ENV BUZZ_GIT_REPO_PATH=/data/git \
+    HOME=/var/lib/buzz
+ENTRYPOINT ["/usr/local/bin/personal-relay-entrypoint"]
+CMD ["/usr/local/bin/buzz-relay"]
 
 # Keep the stripped runtime as the final/default Dockerfile target so existing
 # `docker build .` callers and release tags retain their current behavior.

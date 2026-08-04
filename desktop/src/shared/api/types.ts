@@ -1,3 +1,7 @@
+import type { RespondToMode } from "./relayAgentTypes";
+
+export type { RelayAgent, RespondToMode } from "./relayAgentTypes";
+
 export type ChannelType = "stream" | "forum" | "dm";
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
@@ -267,18 +271,6 @@ export type RelayMember = {
   createdAt: string;
 };
 
-export type RelayAgent = {
-  pubkey: string;
-  name: string;
-  agentType: string;
-  channels: string[];
-  channelIds: string[];
-  capabilities: string[];
-  status: "online" | "away" | "offline";
-  respondTo: RespondToMode | null;
-  respondToAllowlist: string[];
-};
-
 export type ManagedAgentRuntimeLifecycle =
   | "starting"
   | "listening"
@@ -381,13 +373,6 @@ export type ManagedAgent = {
    */
   respondToAllowlist: string[];
 };
-
-/**
- * Inbound author gate mode. Mirrors `buzz-acp`'s `--respond-to` CLI flag.
- * `"nobody"` is supported by the harness but not surfaced through this API —
- * it's a heartbeat-only mode without a meaningful GUI use case.
- */
-export type RespondToMode = "owner-only" | "allowlist" | "anyone";
 
 export type BackendProviderCandidate = {
   id: string;
@@ -602,7 +587,6 @@ export type AgentModelInfo = {
 };
 
 // ── Config bridge types ──────────────────────────────────────────────────────
-
 export type ConfigOrigin =
   | "buzzExplicit"
   | "acpNativeRead"
@@ -612,7 +596,8 @@ export type ConfigOrigin =
   | "personaDefault"
   | "globalDefault"
   | "runtimeOverride"
-  | "harnessConstraint";
+  | "harnessConstraint"
+  | "harnessDefault";
 
 export type ConfigWriteMechanism =
   | { type: "respawnWithEnvVar"; envKey: string }

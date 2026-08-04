@@ -1,0 +1,2806 @@
+name: Personal Relay Image
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - ".cargo/**"
+      - ".dockerignore"
+      - ".github/workflows/personal-relay-image.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "admin-web/**"
+      - "crates/**"
+      - "deploy/personal-relay/**"
+      - "migrations/**"
+      - "package.json"
+      - "patches/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "rust-toolchain.toml"
+      - "schema/**"
+      - "web/**"
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact 40-character candidate SHA. It must equal github.sha."
+        required: true
+        type: string
+      confirmation:
+        description: "Enter PUBLISH_PERSONAL_RELAY"
+        required: true
+        type: string
+
+concurrency:
+  group: personal-relay-image-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  release-approval:
+    name: Seal solo-owner release authorization
+    if: github.event_name == 'workflow_dispatch'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: personal-relay-release
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      authorization_artifact_digest: ${{ steps.authorization-artifact.outputs.digest }}
+      authorization_artifact_expires_at: ${{ steps.authorization-artifact.outputs.expires_at }}
+      authorization_artifact_id: ${{ steps.authorization-artifact.outputs.id }}
+      authorization_artifact_name: ${{ steps.authorization-name.outputs.name }}
+    steps:
+      - name: Capture and validate protected owner authorization
+        id: approval
+        env:
+          APPROVED_SOURCE_SHA: ${{ vars.PERSONAL_APPROVED_RELAY_SHA }}
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          INPUT_CONFIRMATION: ${{ inputs.confirmation }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "justinharkelroad/buzz" ]]
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]] || {
+            echo "::error::only repository owner justinharkelroad may authorize a personal relay release"
+            exit 1
+          }
+          [[ "$INPUT_CONFIRMATION" == "PUBLISH_PERSONAL_RELAY" ]] || {
+            echo "::error::publication confirmation did not match"
+            exit 1
+          }
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]] || {
+            echo "::error::release authorization must use the protected main release workflow"
+            exit 1
+          }
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]] || {
+            echo "::error::release authorization requires fresh run attempt 1"
+            exit 1
+          }
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]] || {
+            echo "::error::release authorization requires the protected main ref"
+            exit 1
+          }
+          [[ "$INPUT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$INPUT_SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+            echo "::error::source_sha must be the exact protected-main workflow SHA"
+            exit 1
+          }
+          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$APPROVED_SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+            echo "::error::personal-relay-release must protect the exact PERSONAL_APPROVED_RELAY_SHA"
+            exit 1
+          }
+          [[ "${{ needs.prepare.outputs.source_sha }}" == "$GITHUB_SHA" ]]
+          [[ "$IMAGE_NAME" == "ghcr.io/justinharkelroad/buzz-relay-personal" ]] || {
+            echo "::error::release target must be the single authorized personal relay image"
+            exit 1
+          }
+          [[ "$CANDIDATE_TAG" == "sha-${GITHUB_SHA}" ]] || {
+            echo "::error::candidate tag must be deterministically bound to the approved source"
+            exit 1
+          }
+
+          branch_json=/tmp/personal-relay-release-main-branch.json
+          rules_json=/tmp/personal-relay-release-main-effective-rules.json
+          rulesets_json=/tmp/personal-relay-release-main-rulesets.json
+          environment_raw=/tmp/personal-relay-release-environment.raw.json
+          environment_json=/tmp/personal-relay-release-environment.json
+          branch_policies_json=/tmp/personal-relay-release-branch-policies.json
+          run_identity_json=/tmp/personal-relay-release-run-identity.json
+          authorization_json=/tmp/personal-relay-release-authorization.json
+          for evidence_path in \
+            "$branch_json" "$rules_json" "$rulesets_json" "$environment_raw" \
+            "$environment_json" "$branch_policies_json" "$run_identity_json" \
+            "$authorization_json"; do
+            [[ ! -e "$evidence_path" && ! -L "$evidence_path" ]]
+          done
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > "$branch_json"
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > "$rules_json"
+          ruleset_details=/tmp/personal-relay-release-main-rulesets.ndjson
+          [[ ! -e "$ruleset_details" && ! -L "$ruleset_details" ]]
+          : > "$ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' "$rules_json")
+          [[ ${#ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e '
+              type == "object"
+              and has("bypass_actors")
+              and (.bypass_actors | type == "array")
+            ' "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$ruleset_details" > "$rulesets_json"
+          jq -e --arg expected_sha "$INPUT_SOURCE_SHA" '
+            type == "object"
+            and keys == ["classic_required_pull_request_reviews", "commit", "name", "protected"]
+            and (.commit | keys) == ["sha"]
+            and .classic_required_pull_request_reviews == false
+            and .name == "main"
+            and .protected == true
+            and .commit.sha == $expected_sha
+          ' "$branch_json" >/dev/null
+          jq -e --arg expected_repository "$GITHUB_REPOSITORY" --slurpfile rulesets "$rulesets_json" '
+            def zero_review_pull_request:
+              .type == "pull_request"
+              and (.parameters | type == "object")
+              and .parameters.required_approving_review_count == 0
+              and .parameters.require_code_owner_review == false
+              and .parameters.require_last_push_approval == false;
+            def required_pull_request:
+              zero_review_pull_request
+              and .parameters.required_review_thread_resolution == true;
+            def exact_gate1_status_checks:
+              .type == "required_status_checks"
+              and (.parameters | type == "object")
+              and .parameters.strict_required_status_checks_policy == true
+              and .parameters.required_status_checks == [{
+                context: "Gate 1 receipt contract",
+                integration_id: 15368
+              }];
+            type == "array"
+            and length > 0
+            and all(.[].ruleset_id; type == "number" and . >= 1 and floor == .)
+            and all(.[];
+              type == "object"
+              and (.type | type == "string" and length > 0)
+              and .ruleset_source_type == "Repository"
+              and .ruleset_source == $expected_repository
+            )
+            and all(.[] | select(.type == "pull_request"); zero_review_pull_request)
+            and all(.[] | select(.type == "required_status_checks"); exact_gate1_status_checks)
+            and all(.[]; .type != "workflows" and .type != "required_deployments")
+            and ($rulesets | length == 1)
+            and ($rulesets[0] | type == "array" and length > 0)
+            and ($rulesets[0] | all(.[].id; type == "number" and . >= 1 and floor == .))
+            and ($rulesets[0] | map(.id) | unique | length) == ($rulesets[0] | length)
+            and ($rulesets[0] | all(.[];
+              type == "object"
+              and keys == ["bypass_actors", "enforcement", "id", "name", "source", "source_type", "target"]
+              and (.bypass_actors | type == "array")
+            ))
+            and (. as $effective_rules | any($rulesets[0][];
+              . as $ruleset
+              | $ruleset.target == "branch"
+              and $ruleset.enforcement == "active"
+              and $ruleset.source_type == "Repository"
+              and $ruleset.source == $expected_repository
+              and $ruleset.bypass_actors == []
+              and ([$effective_rules[] | select(.ruleset_id == $ruleset.id)] as $group
+                | length > 0
+                and all($group[];
+                  .ruleset_source_type == "Repository"
+                  and .ruleset_source == $expected_repository
+                )
+                and any($group[]; required_pull_request)
+                and any($group[]; .type == "deletion")
+                and any($group[]; .type == "non_fast_forward")
+                and any($group[]; exact_gate1_status_checks)
+              )
+            ))
+          ' "$rules_json" >/dev/null || {
+            echo "::error::live main protection does not satisfy the release verifier policy"
+            exit 1
+          }
+
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release" \
+            > "$environment_raw"
+          jq -S '{
+              id,
+              node_id,
+              name,
+              protection_rules: [.protection_rules[]] | sort_by(.type),
+              deployment_branch_policy
+            }' "$environment_raw" > "$environment_json"
+          gh api --hostname github.com --paginate \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release/deployment-branch-policies?per_page=100" \
+            | jq -sS '{
+                total_count: ([.[].branch_policies[]] | length),
+                branch_policies: [.[].branch_policies[] | {id, node_id, name}] | sort_by(.id)
+              }' > "$branch_policies_json"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            | jq -S '{
+                id,
+                run_attempt,
+                head_branch,
+                head_sha,
+                event,
+                path,
+                repository: {full_name: .repository.full_name},
+                actor: {login: .actor.login, id: .actor.id, node_id: .actor.node_id},
+                triggering_actor: {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id}
+              }' > "$run_identity_json"
+
+          jq -e '
+            type == "object"
+            and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
+            and .name == "personal-relay-release"
+            and (.id | type == "number" and . >= 1 and floor == .)
+            and (.node_id | type == "string" and length > 0)
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$environment_json" >/dev/null || {
+            echo "::error::personal-relay-release must be reviewer-free and allow only custom branches"
+            exit 1
+          }
+          jq -e '
+            type == "object"
+            and keys == ["branch_policies", "total_count"]
+            and .total_count == 1
+            and (.branch_policies | length) == 1
+            and (.branch_policies[0] | keys) == ["id", "name", "node_id"]
+            and (.branch_policies[0].id | type == "number" and . >= 1 and floor == .)
+            and (.branch_policies[0].node_id | type == "string" and length > 0)
+            and .branch_policies[0].name == "main"
+          ' "$branch_policies_json" >/dev/null || {
+            echo "::error::personal-relay-release must have exactly one normalized deployment branch policy for main"
+            exit 1
+          }
+          jq -e \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$GITHUB_SHA" '
+              type == "object"
+              and keys == ["actor", "event", "head_branch", "head_sha", "id", "path", "repository", "run_attempt", "triggering_actor"]
+              and .id == $run_id
+              and .run_attempt == 1
+              and .head_branch == "main"
+              and .head_sha == $sha
+              and .event == "workflow_dispatch"
+              and .path == ".github/workflows/personal-relay-image.yml@main"
+              and .repository.full_name == $repository
+              and .actor.login == "justinharkelroad"
+              and (.actor.id | type == "number" and . >= 1 and floor == .)
+              and (.actor.node_id | type == "string" and length > 0)
+              and .triggering_actor.login == "justinharkelroad"
+              and (.triggering_actor.id | type == "number" and . >= 1 and floor == .)
+              and (.triggering_actor.node_id | type == "string" and length > 0)
+            ' "$run_identity_json" >/dev/null
+          branch_metadata_sha256=$(sha256sum "$branch_json" | awk '{print $1}')
+          effective_rules_sha256=$(sha256sum "$rules_json" | awk '{print $1}')
+          rulesets_sha256=$(sha256sum "$rulesets_json" | awk '{print $1}')
+          environment_sha256=$(sha256sum "$environment_json" | awk '{print $1}')
+          branch_policies_sha256=$(sha256sum "$branch_policies_json" | awk '{print $1}')
+          run_identity_sha256=$(sha256sum "$run_identity_json" | awk '{print $1}')
+          jq -n \
+            --arg schema "personal-relay-release-authorization/v3" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$INPUT_SOURCE_SHA" \
+            --arg image_name "$IMAGE_NAME" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg branch "main" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg branch_metadata_sha256 "$branch_metadata_sha256" \
+            --arg effective_rules_sha256 "$effective_rules_sha256" \
+            --arg rulesets_sha256 "$rulesets_sha256" \
+            --arg environment_sha256 "$environment_sha256" \
+            --arg branch_policies_sha256 "$branch_policies_sha256" \
+            --arg run_identity_sha256 "$run_identity_sha256" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            '{
+              schema: $schema,
+              repository: $repository,
+              source_sha: $source_sha,
+              image_name: $image_name,
+              candidate_tag: $candidate_tag,
+              branch: $branch,
+              ref_protected: true,
+              workflow_sha: $workflow_sha,
+              workflow_ref: $workflow_ref,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              branch_metadata_sha256: $branch_metadata_sha256,
+              effective_rules_sha256: $effective_rules_sha256,
+              rulesets_sha256: $rulesets_sha256,
+              environment_sha256: $environment_sha256,
+              branch_policies_sha256: $branch_policies_sha256,
+              run_identity_sha256: $run_identity_sha256
+            }' > "$authorization_json"
+
+      - name: Stage sealed release authorization evidence
+        run: |
+          set -euo pipefail
+          stage=/tmp/personal-relay-release-authorization-evidence
+          [[ ! -e "$stage" ]]
+          install -d -m 0700 "$stage"
+          install -m 0444 /tmp/personal-relay-release-main-branch.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-main-effective-rules.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-main-rulesets.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-environment.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-branch-policies.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-run-identity.json "$stage/"
+          install -m 0444 /tmp/personal-relay-release-authorization.json "$stage/"
+          [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == "7" ]]
+          [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+          chmod 0555 "$stage"
+          [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 -perm /222 -print -quit)" ]]
+
+      - name: Create trusted authorization secret-scan policy
+        run: |
+          set -euo pipefail
+          policy_root=/tmp/personal-relay-authorization-trivy-policy
+          [[ ! -e "$policy_root" && ! -e trivyignores && ! -L trivyignores ]]
+          install -d -m 0700 "$policy_root"
+          printf '{}\n' > "$policy_root/trivy.yaml"
+          : > "$policy_root/trivy.ignore"
+          printf '{}\n' > "$policy_root/trivy.secret.yaml"
+          chmod 0400 "$policy_root"/*
+
+      - name: Reject secrets in sealed release authorization evidence
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-authorization-trivy-policy/trivy.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-authorization-trivy-policy/trivy.ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-authorization-trivy-policy/trivy.secret.yaml
+        with:
+          trivy-config: /tmp/personal-relay-authorization-trivy-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-authorization-trivy-policy/trivy.ignore
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-release-authorization-evidence
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-release-authorization-secret.json
+          exit-code: "1"
+          version: v0.70.0
+          cache: false
+
+      - name: Bind zero-secret authorization scan report
+        run: |
+          set -euo pipefail
+          report=/tmp/personal-relay-release-authorization-secret.json
+          bound_report=/tmp/personal-relay-release-authorization-secret-bound.json
+          [[ -s "$report" && ! -L "$report" && ! -e "$bound_report" ]]
+          jq '. + {Trivy: {Version: "0.70.0"}}' "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]?.Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+
+      - name: Resolve release authorization artifact name
+        id: authorization-name
+        run: echo "name=personal-relay-release-authorization-${GITHUB_SHA}-${GITHUB_RUN_ID}-1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload sealed release authorization evidence
+        id: authorization-upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.authorization-name.outputs.name }}
+          path: /tmp/personal-relay-release-authorization-evidence/
+          if-no-files-found: error
+          retention-days: 90
+          include-hidden-files: false
+
+      - name: Bind sealed release authorization artifact identity
+        id: authorization-artifact
+        env:
+          ARTIFACT_ID: ${{ steps.authorization-upload.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ steps.authorization-name.outputs.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_DIGEST: ${{ steps.authorization-upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          case "$UPLOAD_DIGEST" in
+            sha256:*) artifact_digest=$UPLOAD_DIGEST ;;
+            *) artifact_digest="sha256:$UPLOAD_DIGEST" ;;
+          esac
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" \
+            > /tmp/personal-relay-release-authorization-artifact.json
+          jq -e \
+            --argjson artifact_id "$ARTIFACT_ID" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --arg digest "$artifact_digest" \
+            --arg name "$ARTIFACT_NAME" '
+              .id == $artifact_id
+              and .name == $name
+              and .digest == $digest
+              and .expired == false
+              and .workflow_run.id == $run_id
+              and (.expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            ' /tmp/personal-relay-release-authorization-artifact.json >/dev/null
+          {
+            echo "digest=$artifact_digest"
+            echo "expires_at=$(jq -r .expires_at /tmp/personal-relay-release-authorization-artifact.json)"
+            echo "id=$ARTIFACT_ID"
+          } >> "$GITHUB_OUTPUT"
+
+  prepare:
+    name: Bind workflow to source
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_tag: ${{ steps.contract.outputs.candidate_tag }}
+      image_name: ${{ steps.contract.outputs.image_name }}
+      source_sha: ${{ steps.contract.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify invocation contract
+        id: contract
+        env:
+          INPUT_CONFIRMATION: ${{ inputs.confirmation }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          actual_sha=$(git rev-parse 'HEAD^{commit}')
+          [[ "$actual_sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::checkout does not match github.sha"
+            exit 1
+          }
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$REPOSITORY" == "justinharkelroad/buzz" ]] || {
+              echo "::error::publication is limited to Justin's personal fork"
+              exit 1
+            }
+            [[ "$RUN_ATTEMPT" == "1" && "$GITHUB_RUN_ATTEMPT" == "1" ]] || {
+              echo "::error::personal relay publication must use workflow run attempt 1; dispatch a new run instead of rerunning"
+              exit 1
+            }
+            [[ "$INPUT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::source_sha must be exactly 40 lowercase hexadecimal characters"
+              exit 1
+            }
+            [[ "$INPUT_SOURCE_SHA" == "$GITHUB_SHA" ]] || {
+              echo "::error::source_sha must exactly equal github.sha"
+              exit 1
+            }
+            [[ "$INPUT_CONFIRMATION" == "PUBLISH_PERSONAL_RELAY" ]] || {
+              echo "::error::publication confirmation did not match"
+              exit 1
+            }
+          fi
+
+          image_name=ghcr.io/justinharkelroad/buzz-relay-personal
+
+          {
+            echo "candidate_tag=sha-${GITHUB_SHA}"
+            echo "image_name=$image_name"
+            echo "source_sha=$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify personal release contracts for pull request
+        if: github.event_name == 'pull_request'
+        run: bash ./deploy/personal-relay/release-contract-test.sh
+
+  build-check:
+    name: Build-only check (${{ matrix.platform }})
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Build personal runtime without publication
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-personal
+          platforms: ${{ matrix.platform }}
+          tags: personal-relay-check:${{ matrix.arch }}
+          load: true
+          provenance: false
+          sbom: false
+
+      - name: Verify personal runtime contract
+        env:
+          IMAGE_REF: personal-relay-check:${{ matrix.arch }}
+        run: bash ./deploy/personal-relay/runtime-contract-test.sh "$IMAGE_REF"
+
+  release-gate:
+    name: Run approved-source release tests
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, release-approval]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: buzz
+          POSTGRES_PASSWORD: buzz_dev
+          POSTGRES_USER: buzz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U buzz -d buzz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      BUZZ_TEST_DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+      DATABASE_URL: postgres://buzz:buzz_dev@localhost:5432/buzz
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact sealed owner authorization
+        env:
+          ARTIFACT_DIGEST: ${{ needs.release-approval.outputs.authorization_artifact_digest }}
+          ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          ARTIFACT_ID: ${{ needs.release-approval.outputs.authorization_artifact_id }}
+          ARTIFACT_NAME: ${{ needs.release-approval.outputs.authorization_artifact_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$ARTIFACT_NAME" \
+            --digest "$ARTIFACT_DIGEST" \
+            --expires-at "$ARTIFACT_EXPIRES_AT" \
+            --output-dir /tmp/personal-relay-release-authorization \
+            --metadata-output /tmp/personal-relay-release-authorization-artifact.json \
+            --archive-output /tmp/personal-relay-release-authorization.zip
+
+      - name: Revalidate sealed owner authorization before candidate tests
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+
+          authorization_root=/tmp/personal-relay-release-authorization
+          expected_files=(
+            personal-relay-release-authorization.json
+            personal-relay-release-branch-policies.json
+            personal-relay-release-environment.json
+            personal-relay-release-main-branch.json
+            personal-relay-release-main-effective-rules.json
+            personal-relay-release-main-rulesets.json
+            personal-relay-release-run-identity.json
+          )
+          mapfile -t actual_files < <(find "$authorization_root" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${actual_files[*]}" == "${expected_files[*]}" ]]
+          [[ -z "$(find "$authorization_root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+
+          branch_json="$authorization_root/personal-relay-release-main-branch.json"
+          rules_json="$authorization_root/personal-relay-release-main-effective-rules.json"
+          rulesets_json="$authorization_root/personal-relay-release-main-rulesets.json"
+          environment_json="$authorization_root/personal-relay-release-environment.json"
+          branch_policies_json="$authorization_root/personal-relay-release-branch-policies.json"
+          run_identity_json="$authorization_root/personal-relay-release-run-identity.json"
+          authorization_json="$authorization_root/personal-relay-release-authorization.json"
+          branch_metadata_sha256=$(sha256sum "$branch_json" | awk '{print $1}')
+          effective_rules_sha256=$(sha256sum "$rules_json" | awk '{print $1}')
+          rulesets_sha256=$(sha256sum "$rulesets_json" | awk '{print $1}')
+          environment_sha256=$(sha256sum "$environment_json" | awk '{print $1}')
+          branch_policies_sha256=$(sha256sum "$branch_policies_json" | awk '{print $1}')
+          run_identity_sha256=$(sha256sum "$run_identity_json" | awk '{print $1}')
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image_name "$IMAGE_NAME" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg branch_metadata_sha256 "$branch_metadata_sha256" \
+            --arg effective_rules_sha256 "$effective_rules_sha256" \
+            --arg rulesets_sha256 "$rulesets_sha256" \
+            --arg environment_sha256 "$environment_sha256" \
+            --arg branch_policies_sha256 "$branch_policies_sha256" \
+            --arg run_identity_sha256 "$run_identity_sha256" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              type == "object"
+              and keys == ["branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+              and .schema == "personal-relay-release-authorization/v3"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .image_name == $image_name
+              and .candidate_tag == $candidate_tag
+              and .branch == "main"
+              and .ref_protected == true
+              and .workflow_sha == $workflow_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .branch_metadata_sha256 == $branch_metadata_sha256
+              and .effective_rules_sha256 == $effective_rules_sha256
+              and .rulesets_sha256 == $rulesets_sha256
+              and .environment_sha256 == $environment_sha256
+              and .branch_policies_sha256 == $branch_policies_sha256
+              and .run_identity_sha256 == $run_identity_sha256
+            ' "$authorization_json" >/dev/null
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$branch_json" \
+            --rules-json "$rules_json" \
+            --rulesets-json "$rulesets_json" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$environment_json" >/dev/null
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and (.branch_policies[0] | keys) == ["id", "name", "node_id"]
+            and .branch_policies[0].name == "main"
+          ' "$branch_policies_json" >/dev/null
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$run_identity_json" >/dev/null
+
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+
+      - name: Verify personal release contracts
+        run: bash ./deploy/personal-relay/release-contract-test.sh
+
+      - name: Fail if the candidate tag already exists
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          package_name=${IMAGE_NAME#ghcr.io/justinharkelroad/}
+          api_path="user/packages/container/${package_name}/versions?per_page=100"
+          if ! gh api --hostname github.com --paginate --slurp "$api_path" > /tmp/package-versions.json 2>/tmp/package-versions.err; then
+            if grep -q 'HTTP 404' /tmp/package-versions.err; then
+              printf '%s\n' '[]' > /tmp/package-versions.json
+            else
+              cat /tmp/package-versions.err >&2
+              exit 1
+            fi
+          fi
+          if jq -e --arg tag "$CANDIDATE_TAG" \
+            'any(.[][]?; any((.metadata.container.tags // [])[]?; . == $tag))' \
+            /tmp/package-versions.json >/dev/null; then
+            echo "::error::candidate tag already exists and will not be moved"
+            exit 1
+          fi
+
+      - name: Run workflow engine tests with HTTP support
+        run: cargo test --locked -p buzz-workflow --features reqwest
+
+      - name: Run database-backed dispatch regressions
+        run: |
+          set -euo pipefail
+          dispatch_tests=(
+            executor::tests::webhook_dispatch_revalidation_allows_current_admin
+            executor::tests::webhook_dispatch_denial_precedes_transport_and_disables_workflow
+            executor::tests::webhook_dispatch_revalidation_preserves_community_scope
+          )
+          for full_name in "${dispatch_tests[@]}"; do
+            list_file=$(mktemp /tmp/personal-relay-dispatch-test-list.XXXXXXXX)
+            cargo test --locked -p buzz-workflow --features reqwest "$full_name" -- \
+              --ignored --exact --list --format terse > "$list_file"
+            match_count=$(grep -Fxc -- "${full_name}: test" "$list_file" || true)
+            rm -f "$list_file"
+            [[ "$match_count" == 1 ]] || {
+              echo "::error::expected exactly one listed Rust test for buzz-workflow:${full_name}; found ${match_count}"
+              exit 1
+            }
+            cargo test --locked -p buzz-workflow --features reqwest "$full_name" -- \
+              --ignored --exact --test-threads=1
+          done
+
+  build-publish:
+    name: Build candidate digest (${{ matrix.platform }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, release-approval, release-gate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      BUILDX_CONFIG: /tmp/personal-relay-build-publish-buildx
+      DOCKER_CONFIG: /tmp/personal-relay-build-publish-docker
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Download exact sealed release authorization
+        env:
+          ARTIFACT_DIGEST: ${{ needs.release-approval.outputs.authorization_artifact_digest }}
+          ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          ARTIFACT_ID: ${{ needs.release-approval.outputs.authorization_artifact_id }}
+          ARTIFACT_NAME: ${{ needs.release-approval.outputs.authorization_artifact_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$ARTIFACT_NAME" \
+            --digest "$ARTIFACT_DIGEST" \
+            --expires-at "$ARTIFACT_EXPIRES_AT" \
+            --output-dir /tmp/personal-relay-release-authorization \
+            --metadata-output /tmp/personal-relay-release-authorization-artifact.json \
+            --archive-output /tmp/personal-relay-release-authorization.zip
+
+      - name: Revalidate sealed owner authorization before platform mutation
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          authorization_root=/tmp/personal-relay-release-authorization
+          branch_json="$authorization_root/personal-relay-release-main-branch.json"
+          rules_json="$authorization_root/personal-relay-release-main-effective-rules.json"
+          rulesets_json="$authorization_root/personal-relay-release-main-rulesets.json"
+          environment_json="$authorization_root/personal-relay-release-environment.json"
+          branch_policies_json="$authorization_root/personal-relay-release-branch-policies.json"
+          run_identity_json="$authorization_root/personal-relay-release-run-identity.json"
+          authorization_json="$authorization_root/personal-relay-release-authorization.json"
+          mapfile -t authorization_files < <(find "$authorization_root" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${authorization_files[*]}" == "personal-relay-release-authorization.json personal-relay-release-branch-policies.json personal-relay-release-environment.json personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json personal-relay-release-main-rulesets.json personal-relay-release-run-identity.json" ]]
+          [[ -z "$(find "$authorization_root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+
+          branch_metadata_sha256=$(sha256sum "$branch_json" | awk '{print $1}')
+          effective_rules_sha256=$(sha256sum "$rules_json" | awk '{print $1}')
+          rulesets_sha256=$(sha256sum "$rulesets_json" | awk '{print $1}')
+          environment_sha256=$(sha256sum "$environment_json" | awk '{print $1}')
+          branch_policies_sha256=$(sha256sum "$branch_policies_json" | awk '{print $1}')
+          run_identity_sha256=$(sha256sum "$run_identity_json" | awk '{print $1}')
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image_name "$IMAGE_NAME" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg branch_metadata_sha256 "$branch_metadata_sha256" \
+            --arg effective_rules_sha256 "$effective_rules_sha256" \
+            --arg rulesets_sha256 "$rulesets_sha256" \
+            --arg environment_sha256 "$environment_sha256" \
+            --arg branch_policies_sha256 "$branch_policies_sha256" \
+            --arg run_identity_sha256 "$run_identity_sha256" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              type == "object"
+              and keys == ["branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+              and .schema == "personal-relay-release-authorization/v3"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .image_name == $image_name
+              and .candidate_tag == $candidate_tag
+              and .branch == "main"
+              and .ref_protected == true
+              and .workflow_sha == $workflow_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .branch_metadata_sha256 == $branch_metadata_sha256
+              and .effective_rules_sha256 == $effective_rules_sha256
+              and .rulesets_sha256 == $rulesets_sha256
+              and .environment_sha256 == $environment_sha256
+              and .branch_policies_sha256 == $branch_policies_sha256
+              and .run_identity_sha256 == $run_identity_sha256
+            ' "$authorization_json" >/dev/null
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$branch_json" \
+            --rules-json "$rules_json" \
+            --rulesets-json "$rulesets_json" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$environment_json" >/dev/null
+          jq -e '.total_count == 1 and (.branch_policies | length) == 1 and (.branch_policies[0] | keys) == ["id", "name", "node_id"] and .branch_policies[0].name == "main"' \
+            "$branch_policies_json" >/dev/null
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$run_identity_json" >/dev/null
+
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > /tmp/personal-relay-release-current-main-branch.json
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > /tmp/personal-relay-release-current-main-effective-rules.json
+          current_ruleset_details=/tmp/personal-relay-release-current-main-rulesets.ndjson
+          : > "$current_ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t current_ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' /tmp/personal-relay-release-current-main-effective-rules.json)
+          [[ ${#current_ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${current_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${current_ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e 'type == "object" and has("bypass_actors") and (.bypass_actors | type == "array")' \
+              "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$current_ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$current_ruleset_details" \
+            > /tmp/personal-relay-release-current-main-rulesets.json
+          cmp "$branch_json" /tmp/personal-relay-release-current-main-branch.json
+          cmp "$rules_json" /tmp/personal-relay-release-current-main-effective-rules.json
+          cmp "$rulesets_json" /tmp/personal-relay-release-current-main-rulesets.json
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to personal GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fresh owner-authorization and protected-main recheck immediately before platform build and push
+        env:
+          AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          BASH_ENV: ""
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          ENV: ""
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          PATH: /usr/bin:/bin
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+
+          authorization_root=/tmp/personal-relay-release-authorization
+          sealed_branch="$authorization_root/personal-relay-release-main-branch.json"
+          sealed_rules="$authorization_root/personal-relay-release-main-effective-rules.json"
+          sealed_rulesets="$authorization_root/personal-relay-release-main-rulesets.json"
+          sealed_environment="$authorization_root/personal-relay-release-environment.json"
+          sealed_branch_policies="$authorization_root/personal-relay-release-branch-policies.json"
+          sealed_run_identity="$authorization_root/personal-relay-release-run-identity.json"
+          live_root=$(mktemp -d /tmp/personal-relay-live-platform-protection.XXXXXXXX)
+          chmod 0700 "$live_root"
+          live_branch="$live_root/branch.json"
+          live_rules="$live_root/effective-rules.json"
+          live_rulesets="$live_root/rulesets.json"
+          live_ruleset_details="$live_root/rulesets.ndjson"
+          live_environment_raw="$live_root/environment.raw.json"
+          live_environment="$live_root/environment.json"
+          live_branch_policies="$live_root/branch-policies.json"
+          live_run_identity="$live_root/run-identity.json"
+
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > "$live_branch"
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > "$live_rules"
+          : > "$live_ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t live_ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' "$live_rules")
+          [[ ${#live_ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${live_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${live_ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e 'type == "object" and has("bypass_actors") and (.bypass_actors | type == "array")' \
+              "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$live_ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$live_ruleset_details" > "$live_rulesets"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release" \
+            > "$live_environment_raw"
+          jq -S '{
+              id,
+              node_id,
+              name,
+              protection_rules: [.protection_rules[]] | sort_by(.type),
+              deployment_branch_policy
+            }' "$live_environment_raw" > "$live_environment"
+          gh api --hostname github.com --paginate \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release/deployment-branch-policies?per_page=100" \
+            | jq -sS '{
+                total_count: ([.[].branch_policies[]] | length),
+                branch_policies: [.[].branch_policies[] | {id, node_id, name}] | sort_by(.id)
+              }' > "$live_branch_policies"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            | jq -S '{
+                id,
+                run_attempt,
+                head_branch,
+                head_sha,
+                event,
+                path,
+                repository: {full_name: .repository.full_name},
+                actor: {login: .actor.login, id: .actor.id, node_id: .actor.node_id},
+                triggering_actor: {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id}
+              }' > "$live_run_identity"
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$live_branch" \
+            --rules-json "$live_rules" \
+            --rulesets-json "$live_rulesets" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          cmp "$sealed_branch" "$live_branch"
+          cmp "$sealed_rules" "$live_rules"
+          cmp "$sealed_rulesets" "$live_rulesets"
+          cmp "$sealed_environment" "$live_environment"
+          cmp "$sealed_branch_policies" "$live_branch_policies"
+          cmp "$sealed_run_identity" "$live_run_identity"
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$live_run_identity" >/dev/null
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$live_environment" >/dev/null
+          jq -e --arg image_name "$IMAGE_NAME" --arg candidate_tag "$CANDIDATE_TAG" '
+            .image_name == $image_name and .candidate_tag == $candidate_tag
+          ' "$authorization_root/personal-relay-release-authorization.json" >/dev/null
+          jq -en --arg expires_at "$AUTHORIZATION_ARTIFACT_EXPIRES_AT" '
+            ($expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (($expires_at | fromdateiso8601) > now)
+          ' >/dev/null
+
+      - name: Build and push platform manifest by digest
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-personal
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=Personal Buzz Relay
+          outputs: type=image,name=${{ needs.prepare.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true,oci-artifact=true
+          provenance: mode=max
+          sbom: true
+
+      - name: Remove GHCR credentials after pinned platform build
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          expected_config=/tmp/personal-relay-build-publish-docker
+          [[ "$DOCKER_CONFIG" == "$expected_config" ]]
+          if [[ -L "$DOCKER_CONFIG" ]]; then
+            unlink -- "$DOCKER_CONFIG"
+            echo "::error::refused to follow a symlinked Docker credential directory"
+            exit 1
+          fi
+          if [[ -e "$DOCKER_CONFIG" ]]; then
+            [[ -d "$DOCKER_CONFIG" && -O "$DOCKER_CONFIG" ]]
+            config_file="$DOCKER_CONFIG/config.json"
+            if [[ -L "$config_file" ]]; then
+              unlink -- "$config_file"
+              echo "::error::refused to follow a symlinked Docker credential file"
+              exit 1
+            fi
+            if [[ -e "$config_file" ]]; then
+              [[ -f "$config_file" && -O "$config_file" ]]
+              shred --force --iterations=3 --remove --zero -- "$config_file"
+            fi
+            [[ ! -e "$config_file" && ! -L "$config_file" ]]
+            [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+            rmdir -- "$DOCKER_CONFIG"
+          fi
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+
+      - name: Export platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p /tmp/personal-relay-digests
+          touch "/tmp/personal-relay-digests/${DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-digest-${{ matrix.arch }}
+          path: /tmp/personal-relay-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  runtime-validation:
+    name: Validate pushed candidate runtime (${{ matrix.platform }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build-publish]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    env:
+      DOCKER_CONFIG: /tmp/personal-relay-runtime-validation-docker
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact runtime validation source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Download platform digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: personal-relay-digest-${{ matrix.arch }}
+          path: /tmp/personal-relay-runtime-digest
+
+      - name: Resolve exact runtime digest
+        id: digest
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find /tmp/personal-relay-runtime-digest -mindepth 1 -maxdepth 1 -type f)
+          [[ ${#files[@]} -eq 1 ]]
+          digest="sha256:$(basename "${files[0]}")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to personal GHCR read-only
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull exact runtime
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+
+      - name: Shred GHCR credentials before candidate runtime execution
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          expected_config=/tmp/personal-relay-runtime-validation-docker
+          [[ "$DOCKER_CONFIG" == "$expected_config" ]]
+          if [[ -L "$DOCKER_CONFIG" ]]; then
+            unlink -- "$DOCKER_CONFIG"
+            echo "::error::refused to follow a symlinked Docker credential directory"
+            exit 1
+          fi
+          if [[ -e "$DOCKER_CONFIG" ]]; then
+            [[ -d "$DOCKER_CONFIG" && -O "$DOCKER_CONFIG" ]]
+            config_file="$DOCKER_CONFIG/config.json"
+            if [[ -L "$config_file" ]]; then
+              unlink -- "$config_file"
+              echo "::error::refused to follow a symlinked Docker credential file"
+              exit 1
+            fi
+            if [[ -e "$config_file" ]]; then
+              [[ -f "$config_file" && -O "$config_file" ]]
+              shred --force --iterations=3 --remove --zero -- "$config_file"
+            fi
+            [[ ! -e "$config_file" && ! -L "$config_file" ]]
+            [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+            rmdir -- "$DOCKER_CONFIG"
+          fi
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+
+      - name: Verify exact pushed platform runtime without registry credentials
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+        run: bash ./deploy/personal-relay/runtime-contract-test.sh "$IMAGE_REF"
+
+  scan:
+    name: Scan candidate digest (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, build-publish, runtime-validation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DOCKER_CONFIG: /tmp/personal-relay-scan-docker
+      TRIVY_DISABLE_TELEMETRY: "true"
+      TRIVY_OFFLINE_SCAN: "true"
+      TRIVY_SKIP_VERSION_CHECK: "true"
+      TRIVY_SKIP_VEX_REPO_UPDATE: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact scan source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Download platform digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: personal-relay-digest-${{ matrix.arch }}
+          path: /tmp/personal-relay-digest
+
+      - name: Resolve platform digest
+        id: digest
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find /tmp/personal-relay-digest -maxdepth 1 -type f)
+          [[ ${#files[@]} -eq 1 ]] || {
+            echo "::error::expected exactly one platform digest"
+            exit 1
+          }
+          digest="sha256:$(basename "${files[0]}")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to personal GHCR read-only
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch and bind the exact platform's raw SBOM attestation
+        env:
+          ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repository_path=${IMAGE_NAME#ghcr.io/}
+          [[ "$repository_path" != "$IMAGE_NAME" ]]
+          registry_token=$(
+            curl --fail --silent --show-error --location --retry 3 \
+              --user "$IMAGE_OWNER:$GH_TOKEN" \
+              --get \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:${repository_path}:pull" \
+              https://ghcr.io/token \
+              | jq -er '.token // .access_token'
+          )
+          echo "::add-mask::$registry_token"
+
+          registry_get() {
+            local path=$1
+            local output=$2
+            local accept=${3:-}
+            local args=(
+              --fail --silent --show-error --location --retry 3
+              --header "Authorization: Bearer ${registry_token}"
+            )
+            if [[ -n "$accept" ]]; then
+              args+=(--header "Accept: ${accept}")
+            fi
+            curl "${args[@]}" "https://ghcr.io/v2/${repository_path}/${path}" --output "$output"
+          }
+
+          digest_matches() {
+            local digest=$1
+            local path=$2
+            printf '%s  %s\n' "${digest#sha256:}" "$path" | sha256sum --check --status -
+          }
+
+          image_index="personal-relay-image-index-${ARCH}.json"
+          attestation_manifest="personal-relay-attestation-manifest-${ARCH}.json"
+          sbom_attestation="personal-relay-sbom-attestation-${ARCH}.intoto.json"
+          spdx="personal-relay-sbom-${ARCH}.spdx.json"
+
+          registry_get \
+            "manifests/${IMAGE_DIGEST}" \
+            "$image_index" \
+            'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json'
+          digest_matches "$IMAGE_DIGEST" "$image_index"
+
+          platform_digest=$(jq -er --arg arch "$ARCH" '
+            [
+              .manifests[]
+              | select(.mediaType == "application/vnd.oci.image.manifest.v1+json")
+              | select(.platform.os == "linux" and .platform.architecture == $arch)
+            ]
+            | if length == 1 then .[0].digest else error("expected one platform manifest") end
+          ' "$image_index")
+          attestation_digest=$(jq -er --arg platform_digest "$platform_digest" '
+            [
+              .manifests[]
+              | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")
+              | select(.annotations["vnd.docker.reference.digest"] == $platform_digest)
+              | select(.platform.os == "unknown" and .platform.architecture == "unknown")
+            ]
+            | if length == 1 then .[0].digest else error("expected one attestation manifest") end
+          ' "$image_index")
+
+          registry_get \
+            "manifests/${attestation_digest}" \
+            "$attestation_manifest" \
+            'application/vnd.oci.image.manifest.v1+json'
+          digest_matches "$attestation_digest" "$attestation_manifest"
+          jq -e --arg platform_digest "$platform_digest" '
+            .artifactType == "application/vnd.docker.attestation.manifest.v1+json"
+            and .subject.mediaType == "application/vnd.oci.image.manifest.v1+json"
+            and .subject.digest == $platform_digest
+            and (.subject.size | type == "number" and . > 0)
+          ' "$attestation_manifest" >/dev/null
+          sbom_layer_digest=$(jq -er '
+            [
+              .layers[]
+              | select(.mediaType == "application/vnd.in-toto+json")
+              | select(.annotations["in-toto.io/predicate-type"] == "https://spdx.dev/Document")
+            ]
+            | if length == 1 then .[0].digest else error("expected one SPDX attestation layer") end
+          ' "$attestation_manifest")
+
+          registry_get "blobs/${sbom_layer_digest}" "$sbom_attestation"
+          digest_matches "$sbom_layer_digest" "$sbom_attestation"
+          jq -e --arg subject "${platform_digest#sha256:}" '
+            (."_type" == "https://in-toto.io/Statement/v0.1" or
+              ."_type" == "https://in-toto.io/Statement/v1")
+            and .predicateType == "https://spdx.dev/Document"
+            and (.subject | type == "array" and length == 1)
+            and .subject[0].digest.sha256 == $subject
+            and .predicate.SPDXID == "SPDXRef-DOCUMENT"
+            and (.predicate.packages | type == "array" and length > 0)
+          ' "$sbom_attestation" >/dev/null
+          jq '.predicate' "$sbom_attestation" > "$spdx"
+
+      - name: Create fail-closed Trivy policy inputs
+        run: |
+          set -euo pipefail
+          policy_root=/tmp/personal-relay-trivy-policy
+          [[ ! -e "$policy_root" ]] || {
+            echo "::error::trusted Trivy policy root already exists"
+            exit 1
+          }
+          [[ ! -e trivyignores && ! -L trivyignores ]] || {
+            echo "::error::candidate checkout must not preseed trivy-action's generated ignore file"
+            exit 1
+          }
+          install -d -m 0700 "$policy_root"
+          printf '{}\n' > "$policy_root/trivy.yaml"
+          : > "$policy_root/trivy.ignore"
+          printf '{}\n' > "$policy_root/trivy.secret.yaml"
+          chmod 0400 "$policy_root/trivy.yaml" "$policy_root/trivy.ignore" "$policy_root/trivy.secret.yaml"
+          [[ "$(cat "$policy_root/trivy.yaml")" == "{}" ]]
+          [[ ! -s "$policy_root/trivy.ignore" ]]
+          [[ "$(cat "$policy_root/trivy.secret.yaml")" == "{}" ]]
+
+      - name: Export exact image vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/${{ matrix.arch }}
+        with:
+          trivy-config: /tmp/personal-relay-trivy-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-trivy-policy/trivy.ignore
+          image-ref: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          scanners: vuln
+          vuln-type: os,library
+          format: json
+          output: personal-relay-trivy-image-${{ matrix.arch }}.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          list-all-pkgs: true
+          exit-code: "0"
+          version: v0.70.0
+          cache: false
+
+      - name: Export attached SPDX vulnerability report with the same database
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          trivy-config: /tmp/personal-relay-trivy-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-trivy-policy/trivy.ignore
+          scan-type: sbom
+          scan-ref: personal-relay-sbom-${{ matrix.arch }}.spdx.json
+          scanners: vuln
+          vuln-type: os,library
+          format: json
+          output: personal-relay-trivy-sbom-${{ matrix.arch }}.json
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          list-all-pkgs: true
+          exit-code: "0"
+          version: v0.70.0
+          skip-setup-trivy: true
+          cache: false
+
+      - name: Remove GHCR credentials before candidate policy execution
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          expected_config=/tmp/personal-relay-scan-docker
+          [[ "$DOCKER_CONFIG" == "$expected_config" ]]
+          if [[ -L "$DOCKER_CONFIG" ]]; then
+            unlink -- "$DOCKER_CONFIG"
+            echo "::error::refused to follow a symlinked Docker credential directory"
+            exit 1
+          fi
+          if [[ -e "$DOCKER_CONFIG" ]]; then
+            [[ -d "$DOCKER_CONFIG" && -O "$DOCKER_CONFIG" ]]
+            config_file="$DOCKER_CONFIG/config.json"
+            if [[ -L "$config_file" ]]; then
+              unlink -- "$config_file"
+              echo "::error::refused to follow a symlinked Docker credential file"
+              exit 1
+            fi
+            if [[ -e "$config_file" ]]; then
+              [[ -f "$config_file" && -O "$config_file" ]]
+              shred --force --iterations=3 --remove --zero -- "$config_file"
+            fi
+            [[ ! -e "$config_file" && ! -L "$config_file" ]]
+            [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+            rmdir -- "$DOCKER_CONFIG"
+          fi
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+
+      - name: Record scanner and database identity
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          vulnerability_db="$GITHUB_WORKSPACE/.cache/trivy/db/trivy.db"
+          java_db="$GITHUB_WORKSPACE/.cache/trivy/java-db/trivy-java.db"
+          test -s "$vulnerability_db"
+          vulnerability_db_sha256=$(sha256sum "$vulnerability_db" | awk '{print $1}')
+          java_db_sha256=null
+          if [[ -s "$java_db" ]]; then
+            java_db_sha256=$(sha256sum "$java_db" | awk '{print $1}')
+          fi
+          trivy version --cache-dir "$GITHUB_WORKSPACE/.cache/trivy" --format json \
+            | jq \
+              --arg vulnerability_db_sha256 "$vulnerability_db_sha256" \
+              --arg java_db_sha256 "$java_db_sha256" \
+              '. + {
+                VulnerabilityDBSHA256: $vulnerability_db_sha256,
+                JavaDBSHA256: (if $java_db_sha256 == "null" then null else $java_db_sha256 end)
+              }' \
+            > "personal-relay-trivy-version-${ARCH}.json"
+          jq -e '
+            .Version == "0.70.0"
+            and (.VulnerabilityDB.UpdatedAt | type == "string" and length > 0)
+            and (.VulnerabilityDBSHA256 | test("^[0-9a-f]{64}$"))
+            and (.JavaDBSHA256 == null or (.JavaDBSHA256 | test("^[0-9a-f]{64}$")))
+          ' \
+            "personal-relay-trivy-version-${ARCH}.json" >/dev/null
+
+      - name: Enforce the exact image and attached SPDX report union
+        id: enforce-scan-policy
+        env:
+          ARCH: ${{ matrix.arch }}
+          IMAGE_DIGEST: ${{ steps.digest.outputs.digest }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.digest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          bash ./deploy/personal-relay/trivy-report-policy.sh \
+            --image-report "personal-relay-trivy-image-${ARCH}.json" \
+            --sbom-report "personal-relay-trivy-sbom-${ARCH}.json" \
+            --image-index "personal-relay-image-index-${ARCH}.json" \
+            --attestation-manifest "personal-relay-attestation-manifest-${ARCH}.json" \
+            --sbom-attestation "personal-relay-sbom-attestation-${ARCH}.intoto.json" \
+            --spdx "personal-relay-sbom-${ARCH}.spdx.json" \
+            --expected-image-ref "$IMAGE_REF" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --expected-arch "$ARCH" \
+            --expected-source-sha "$SOURCE_SHA" \
+            --expected-trivy-version 0.70.0 \
+            > "personal-relay-trivy-policy-${ARCH}.json"
+
+      - name: Stage exact scan evidence for proactive secret scanning
+        if: ${{ always() }}
+        id: stage-scan-evidence
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          stage="/tmp/personal-relay-scan-evidence-${ARCH}"
+          [[ ! -e "$stage" ]]
+          install -d -m 0700 "$stage"
+          evidence_files=(
+            "personal-relay-attestation-manifest-${ARCH}.json"
+            "personal-relay-image-index-${ARCH}.json"
+            "personal-relay-sbom-attestation-${ARCH}.intoto.json"
+            "personal-relay-sbom-${ARCH}.spdx.json"
+            "personal-relay-trivy-image-${ARCH}.json"
+            "personal-relay-trivy-policy-${ARCH}.json"
+            "personal-relay-trivy-sbom-${ARCH}.json"
+            "personal-relay-trivy-version-${ARCH}.json"
+          )
+          for evidence_file in "${evidence_files[@]}"; do
+            [[ -f "$evidence_file" && ! -L "$evidence_file" && -s "$evidence_file" ]]
+            install -m 0444 "$evidence_file" "$stage/"
+          done
+          [[ "$(find "$stage" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" == "8" ]]
+          [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+
+      - name: Reject secrets in exact scan evidence
+        if: ${{ always() && steps.stage-scan-evidence.outcome == 'success' }}
+        id: secret-scan-evidence
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-trivy-policy/trivy.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-policy/trivy.ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-policy/trivy.secret.yaml
+        with:
+          trivy-config: /tmp/personal-relay-trivy-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-trivy-policy/trivy.ignore
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-scan-evidence-${{ matrix.arch }}
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-scan-secret-${{ matrix.arch }}.json
+          exit-code: "1"
+          version: v0.70.0
+          skip-setup-trivy: true
+          cache: false
+
+      - name: Bind zero-secret scan-evidence report
+        if: ${{ always() && steps.secret-scan-evidence.outcome == 'success' }}
+        id: bind-secret-scan-evidence
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          report="/tmp/personal-relay-scan-secret-${ARCH}.json"
+          bound_report="/tmp/personal-relay-scan-secret-bound-${ARCH}.json"
+          [[ -s "$report" && ! -L "$report" && ! -e "$bound_report" ]]
+          jq '. + {Trivy: {Version: "0.70.0"}}' "$report" > "$bound_report"
+          install -m 0444 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]?.Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+
+      - name: Upload exact scan evidence even when policy blocks
+        if: ${{ always() && steps.bind-secret-scan-evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-scan-${{ matrix.arch }}
+          path: /tmp/personal-relay-scan-evidence-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 90
+          include-hidden-files: false
+
+  publish:
+    name: Create candidate manifest and attest digest
+    if: github.event_name == 'workflow_dispatch'
+    needs: [prepare, release-approval, release-gate, build-publish, runtime-validation, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      BUILDX_CONFIG: /tmp/personal-relay-publish-buildx
+      DOCKER_CONFIG: /tmp/personal-relay-publish-docker
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Reverify exact publication source
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: test "$(git rev-parse 'HEAD^{commit}')" = "$GITHUB_SHA" && test "$SOURCE_SHA" = "$GITHUB_SHA"
+
+      - name: Download exact sealed release authorization
+        env:
+          ARTIFACT_DIGEST: ${{ needs.release-approval.outputs.authorization_artifact_digest }}
+          ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          ARTIFACT_ID: ${{ needs.release-approval.outputs.authorization_artifact_id }}
+          ARTIFACT_NAME: ${{ needs.release-approval.outputs.authorization_artifact_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash ./deploy/personal-relay/download-exact-artifact.sh \
+            --artifact-id "$ARTIFACT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --name "$ARTIFACT_NAME" \
+            --digest "$ARTIFACT_DIGEST" \
+            --expires-at "$ARTIFACT_EXPIRES_AT" \
+            --output-dir /tmp/personal-relay-release-authorization \
+            --metadata-output /tmp/personal-relay-release-authorization-artifact.json \
+            --archive-output /tmp/personal-relay-release-authorization.zip
+
+      - name: Revalidate sealed owner authorization before final mutation
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+          authorization_root=/tmp/personal-relay-release-authorization
+          branch_json="$authorization_root/personal-relay-release-main-branch.json"
+          rules_json="$authorization_root/personal-relay-release-main-effective-rules.json"
+          rulesets_json="$authorization_root/personal-relay-release-main-rulesets.json"
+          environment_json="$authorization_root/personal-relay-release-environment.json"
+          branch_policies_json="$authorization_root/personal-relay-release-branch-policies.json"
+          run_identity_json="$authorization_root/personal-relay-release-run-identity.json"
+          authorization_json="$authorization_root/personal-relay-release-authorization.json"
+          mapfile -t authorization_files < <(find "$authorization_root" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${authorization_files[*]}" == "personal-relay-release-authorization.json personal-relay-release-branch-policies.json personal-relay-release-environment.json personal-relay-release-main-branch.json personal-relay-release-main-effective-rules.json personal-relay-release-main-rulesets.json personal-relay-release-run-identity.json" ]]
+          [[ -z "$(find "$authorization_root" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+
+          branch_metadata_sha256=$(sha256sum "$branch_json" | awk '{print $1}')
+          effective_rules_sha256=$(sha256sum "$rules_json" | awk '{print $1}')
+          rulesets_sha256=$(sha256sum "$rulesets_json" | awk '{print $1}')
+          environment_sha256=$(sha256sum "$environment_json" | awk '{print $1}')
+          branch_policies_sha256=$(sha256sum "$branch_policies_json" | awk '{print $1}')
+          run_identity_sha256=$(sha256sum "$run_identity_json" | awk '{print $1}')
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg image_name "$IMAGE_NAME" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg branch_metadata_sha256 "$branch_metadata_sha256" \
+            --arg effective_rules_sha256 "$effective_rules_sha256" \
+            --arg rulesets_sha256 "$rulesets_sha256" \
+            --arg environment_sha256 "$environment_sha256" \
+            --arg branch_policies_sha256 "$branch_policies_sha256" \
+            --arg run_identity_sha256 "$run_identity_sha256" \
+            --argjson run_id "$GITHUB_RUN_ID" '
+              type == "object"
+              and keys == ["branch", "branch_metadata_sha256", "branch_policies_sha256", "candidate_tag", "effective_rules_sha256", "environment_sha256", "image_name", "ref_protected", "repository", "rulesets_sha256", "run_attempt", "run_id", "run_identity_sha256", "schema", "source_sha", "workflow_ref", "workflow_sha"]
+              and .schema == "personal-relay-release-authorization/v3"
+              and .repository == $repository
+              and .source_sha == $source_sha
+              and .image_name == $image_name
+              and .candidate_tag == $candidate_tag
+              and .branch == "main"
+              and .ref_protected == true
+              and .workflow_sha == $workflow_sha
+              and .workflow_ref == $workflow_ref
+              and .run_id == $run_id
+              and .run_attempt == 1
+              and .branch_metadata_sha256 == $branch_metadata_sha256
+              and .effective_rules_sha256 == $effective_rules_sha256
+              and .rulesets_sha256 == $rulesets_sha256
+              and .environment_sha256 == $environment_sha256
+              and .branch_policies_sha256 == $branch_policies_sha256
+              and .run_identity_sha256 == $run_identity_sha256
+            ' "$authorization_json" >/dev/null
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$branch_json" \
+            --rules-json "$rules_json" \
+            --rulesets-json "$rulesets_json" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$environment_json" >/dev/null
+          jq -e '.total_count == 1 and (.branch_policies | length) == 1 and (.branch_policies[0] | keys) == ["id", "name", "node_id"] and .branch_policies[0].name == "main"' \
+            "$branch_policies_json" >/dev/null
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$run_identity_json" >/dev/null
+
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > /tmp/personal-relay-release-current-main-branch.json
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > /tmp/personal-relay-release-current-main-effective-rules.json
+          current_ruleset_details=/tmp/personal-relay-release-current-main-rulesets.ndjson
+          : > "$current_ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t current_ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' /tmp/personal-relay-release-current-main-effective-rules.json)
+          [[ ${#current_ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${current_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${current_ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e 'type == "object" and has("bypass_actors") and (.bypass_actors | type == "array")' \
+              "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$current_ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$current_ruleset_details" \
+            > /tmp/personal-relay-release-current-main-rulesets.json
+          cmp "$branch_json" /tmp/personal-relay-release-current-main-branch.json
+          cmp "$rules_json" /tmp/personal-relay-release-current-main-effective-rules.json
+          cmp "$rulesets_json" /tmp/personal-relay-release-current-main-rulesets.json
+
+      - name: Download platform digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/personal-relay-digests
+          pattern: personal-relay-digest-*
+          merge-multiple: true
+
+      - name: Download exact platform scan evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/personal-relay-scan
+          pattern: personal-relay-scan-*
+          merge-multiple: true
+
+      - name: Reverify exact platform scan bindings
+        env:
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            summary="/tmp/personal-relay-scan/personal-relay-trivy-policy-${arch}.json"
+            version="/tmp/personal-relay-scan/personal-relay-trivy-version-${arch}.json"
+            test -s "$summary"
+            test -s "$version"
+            jq -e \
+              --arg arch "$arch" \
+              --arg image "$IMAGE_NAME" \
+              --arg source_sha "$SOURCE_SHA" '
+                .artifact.architecture == $arch
+                and .artifact.source_sha == $source_sha
+                and .artifact.image_ref == ($image + "@" + .artifact.image_digest)
+                and (.artifact.image_digest | test("^sha256:[0-9a-f]{64}$"))
+                and .scanner == {name: "Trivy", version: "0.70.0"}
+                and .high_critical.fixed_findings == 0
+              ' "$summary" >/dev/null
+            digest=$(jq -r '.artifact.image_digest | sub("^sha256:"; "")' "$summary")
+            test -f "/tmp/personal-relay-digests/${digest}"
+          done
+          jq -s 'sort_by(.artifact.architecture)' \
+            /tmp/personal-relay-scan/personal-relay-trivy-policy-*.json \
+            > personal-relay-scan-policy-summaries.json
+          jq -e '
+            length == 2
+            and (map(.artifact.architecture) == ["amd64", "arm64"])
+            and (map(.artifact.image_digest) | unique | length == 2)
+          ' personal-relay-scan-policy-summaries.json >/dev/null
+          jq -n \
+            --slurpfile amd64 /tmp/personal-relay-scan/personal-relay-trivy-version-amd64.json \
+            --slurpfile arm64 /tmp/personal-relay-scan/personal-relay-trivy-version-arm64.json \
+            '[{architecture: "amd64"} + $amd64[0], {architecture: "arm64"} + $arm64[0]]' \
+            > personal-relay-trivy-databases.json
+          jq -e '
+            length == 2
+            and (map(.Version) | unique == ["0.70.0"])
+            and (map(.VulnerabilityDB.UpdatedAt) | unique | length == 1)
+            and (map(.VulnerabilityDBSHA256) | unique | length == 1)
+            and (map(.JavaDBSHA256) | unique | length == 1)
+          ' personal-relay-trivy-databases.json >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+
+      - name: Log in to personal GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Recheck that the candidate tag does not exist
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          package_name=${IMAGE_NAME#ghcr.io/justinharkelroad/}
+          api_path="user/packages/container/${package_name}/versions?per_page=100"
+          gh api --hostname github.com --paginate --slurp "$api_path" > /tmp/package-versions.json
+          if jq -e --arg tag "$CANDIDATE_TAG" \
+            'any(.[][]?; any((.metadata.container.tags // [])[]?; . == $tag))' \
+            /tmp/package-versions.json >/dev/null; then
+            echo "::error::candidate tag already exists and will not be moved"
+            exit 1
+          fi
+
+      - name: Fresh owner-authorization and protected-main recheck immediately before manifest and tag creation
+        env:
+          AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          BASH_ENV: ""
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          ENV: ""
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          PATH: /usr/bin:/bin
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+
+          authorization_root=/tmp/personal-relay-release-authorization
+          sealed_branch="$authorization_root/personal-relay-release-main-branch.json"
+          sealed_rules="$authorization_root/personal-relay-release-main-effective-rules.json"
+          sealed_rulesets="$authorization_root/personal-relay-release-main-rulesets.json"
+          sealed_environment="$authorization_root/personal-relay-release-environment.json"
+          sealed_branch_policies="$authorization_root/personal-relay-release-branch-policies.json"
+          sealed_run_identity="$authorization_root/personal-relay-release-run-identity.json"
+          live_root=$(mktemp -d /tmp/personal-relay-live-manifest-protection.XXXXXXXX)
+          chmod 0700 "$live_root"
+          live_branch="$live_root/branch.json"
+          live_rules="$live_root/effective-rules.json"
+          live_rulesets="$live_root/rulesets.json"
+          live_ruleset_details="$live_root/rulesets.ndjson"
+          live_environment_raw="$live_root/environment.raw.json"
+          live_environment="$live_root/environment.json"
+          live_branch_policies="$live_root/branch-policies.json"
+          live_run_identity="$live_root/run-identity.json"
+
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > "$live_branch"
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > "$live_rules"
+          : > "$live_ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t live_ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' "$live_rules")
+          [[ ${#live_ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${live_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${live_ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e 'type == "object" and has("bypass_actors") and (.bypass_actors | type == "array")' \
+              "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$live_ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$live_ruleset_details" > "$live_rulesets"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release" \
+            > "$live_environment_raw"
+          jq -S '{
+              id,
+              node_id,
+              name,
+              protection_rules: [.protection_rules[]] | sort_by(.type),
+              deployment_branch_policy
+            }' "$live_environment_raw" > "$live_environment"
+          gh api --hostname github.com --paginate \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release/deployment-branch-policies?per_page=100" \
+            | jq -sS '{
+                total_count: ([.[].branch_policies[]] | length),
+                branch_policies: [.[].branch_policies[] | {id, node_id, name}] | sort_by(.id)
+              }' > "$live_branch_policies"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            | jq -S '{
+                id,
+                run_attempt,
+                head_branch,
+                head_sha,
+                event,
+                path,
+                repository: {full_name: .repository.full_name},
+                actor: {login: .actor.login, id: .actor.id, node_id: .actor.node_id},
+                triggering_actor: {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id}
+              }' > "$live_run_identity"
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$live_branch" \
+            --rules-json "$live_rules" \
+            --rulesets-json "$live_rulesets" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          cmp "$sealed_branch" "$live_branch"
+          cmp "$sealed_rules" "$live_rules"
+          cmp "$sealed_rulesets" "$live_rulesets"
+          cmp "$sealed_environment" "$live_environment"
+          cmp "$sealed_branch_policies" "$live_branch_policies"
+          cmp "$sealed_run_identity" "$live_run_identity"
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$live_run_identity" >/dev/null
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$live_environment" >/dev/null
+          jq -e --arg image_name "$IMAGE_NAME" --arg candidate_tag "$CANDIDATE_TAG" '
+            .image_name == $image_name and .candidate_tag == $candidate_tag
+          ' "$authorization_root/personal-relay-release-authorization.json" >/dev/null
+          jq -en --arg expires_at "$AUTHORIZATION_ARTIFACT_EXPIRES_AT" '
+            ($expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (($expires_at | fromdateiso8601) > now)
+          ' >/dev/null
+
+      - name: Create non-overwriting candidate tag and resolve digest
+        id: manifest
+        working-directory: /tmp/personal-relay-digests
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          digest_refs=()
+          for digest in *; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
+            digest_refs+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+          [[ ${#digest_refs[@]} -eq 2 ]] || {
+            echo "::error::expected exactly two platform digests"
+            exit 1
+          }
+          candidate_ref="${IMAGE_NAME}:${CANDIDATE_TAG}"
+          docker buildx imagetools create \
+            -t "$candidate_ref" \
+            --metadata-file /tmp/personal-relay-manifest-create.json \
+            "${digest_refs[@]}"
+          manifest_digest=$(jq -er '
+            .["containerimage.descriptor"]
+            | select(.mediaType == "application/vnd.oci.image.index.v1+json")
+            | .digest
+          ' /tmp/personal-relay-manifest-create.json)
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          {
+            echo "candidate_ref=$candidate_ref"
+            echo "digest=$manifest_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify the exact merged descriptor union by digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repository_path=${IMAGE_NAME#ghcr.io/}
+          [[ "$repository_path" != "$IMAGE_NAME" ]]
+          registry_token=$(
+            curl --fail --silent --show-error --location --retry 3 \
+              --user "$IMAGE_OWNER:$GH_TOKEN" \
+              --get \
+              --data-urlencode service=ghcr.io \
+              --data-urlencode "scope=repository:${repository_path}:pull" \
+              https://ghcr.io/token \
+              | jq -er '.token // .access_token'
+          )
+          echo "::add-mask::$registry_token"
+
+          curl --fail --silent --show-error --location --retry 3 \
+            --header "Authorization: Bearer ${registry_token}" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/${repository_path}/manifests/${IMAGE_DIGEST}" \
+            --output personal-relay-merged-index.json
+          printf '%s  %s\n' \
+            "${IMAGE_DIGEST#sha256:}" \
+            personal-relay-merged-index.json \
+            | sha256sum --check --status -
+
+          metadata_size=$(jq -er --arg digest "$IMAGE_DIGEST" '
+            .["containerimage.descriptor"]
+            | select(.digest == $digest)
+            | .size
+          ' /tmp/personal-relay-manifest-create.json)
+          actual_size=$(wc -c < personal-relay-merged-index.json)
+          actual_size=${actual_size//[[:space:]]/}
+          [[ "$metadata_size" == "$actual_size" ]]
+
+          jq -s '
+            map(.manifests) | add | sort_by(.digest)
+          ' \
+            /tmp/personal-relay-scan/personal-relay-image-index-amd64.json \
+            /tmp/personal-relay-scan/personal-relay-image-index-arm64.json \
+            > personal-relay-expected-merged-descriptors.json
+          jq -e \
+            --slurpfile expected personal-relay-expected-merged-descriptors.json '
+              .schemaVersion == 2
+              and .mediaType == "application/vnd.oci.image.index.v1+json"
+              and (.manifests | type == "array")
+              and (.manifests | sort_by(.digest)) == $expected[0]
+            ' personal-relay-merged-index.json >/dev/null
+
+      - name: Fresh owner-authorization and protected-main recheck immediately before provenance attestation
+        env:
+          AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          BASH_ENV: ""
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.candidate_tag }}
+          ENV: ""
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          PATH: /usr/bin:/bin
+          REF_PROTECTED: ${{ github.ref_protected }}
+          RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REPOSITORY" == "justinharkelroad/buzz" && "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]]
+          [[ "$WORKFLOW_REF" == "justinharkelroad/buzz/.github/workflows/personal-relay-image.yml@refs/heads/main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$REF_PROTECTED" == "true" ]]
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]]
+
+          authorization_root=/tmp/personal-relay-release-authorization
+          sealed_branch="$authorization_root/personal-relay-release-main-branch.json"
+          sealed_rules="$authorization_root/personal-relay-release-main-effective-rules.json"
+          sealed_rulesets="$authorization_root/personal-relay-release-main-rulesets.json"
+          sealed_environment="$authorization_root/personal-relay-release-environment.json"
+          sealed_branch_policies="$authorization_root/personal-relay-release-branch-policies.json"
+          sealed_run_identity="$authorization_root/personal-relay-release-run-identity.json"
+          live_root=$(mktemp -d /tmp/personal-relay-live-attestation-protection.XXXXXXXX)
+          chmod 0700 "$live_root"
+          live_branch="$live_root/branch.json"
+          live_rules="$live_root/effective-rules.json"
+          live_rulesets="$live_root/rulesets.json"
+          live_ruleset_details="$live_root/rulesets.ndjson"
+          live_environment_raw="$live_root/environment.raw.json"
+          live_environment="$live_root/environment.json"
+          live_branch_policies="$live_root/branch-policies.json"
+          live_run_identity="$live_root/run-identity.json"
+
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]]
+          set +e
+          classic_reviews_headers=$(GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api \
+            --hostname github.com --include \
+            "repos/$GITHUB_REPOSITORY/branches/main/protection/required_pull_request_reviews" \
+            2>/dev/null)
+          classic_reviews_exit=$?
+          set -e
+          classic_reviews_status=$(printf '%s\n' "$classic_reviews_headers" | awk 'NR == 1 {print $2}')
+          case "$classic_reviews_status" in
+            404) ;;
+            200)
+              echo "::error::classic main required pull-request reviews are configured"
+              exit 1
+              ;;
+            *)
+              echo "::error::classic main required pull-request review absence could not be proven (HTTP ${classic_reviews_status:-unknown}, gh exit $classic_reviews_exit)"
+              exit 1
+              ;;
+          esac
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/branches/main" \
+            | jq -S '{
+                classic_required_pull_request_reviews: false,
+                name,
+                protected,
+                commit: {sha: .commit.sha}
+              }' \
+            > "$live_branch"
+          gh api --hostname github.com --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" \
+            | jq -S '
+              def canonical:
+                if type == "object" then
+                  to_entries | sort_by(.key) | map(.value |= canonical) | from_entries
+                elif type == "array" then map(canonical)
+                else . end;
+              [.[][] | {
+                type,
+                parameters: (.parameters | canonical),
+                ruleset_id,
+                ruleset_source_type,
+                ruleset_source
+              }]
+              | sort_by(.ruleset_id // 0, .type // "", (.parameters | tojson), .ruleset_source_type // "", .ruleset_source // "")
+            ' \
+            > "$live_rules"
+          : > "$live_ruleset_details"
+          [[ -n "$RULESET_EVIDENCE_TOKEN" ]] || {
+            echo "::error::PERSONAL_RULESET_EVIDENCE_TOKEN is required to expose ruleset bypass actors"
+            exit 1
+          }
+          mapfile -t live_ruleset_ids < <(jq -er '[.[].ruleset_id] | unique[]' "$live_rules")
+          [[ ${#live_ruleset_ids[@]} -ge 1 ]]
+          for ruleset_id in "${live_ruleset_ids[@]}"; do
+            [[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+            ruleset_raw="${live_ruleset_details}.${ruleset_id}.raw.json"
+            [[ ! -e "$ruleset_raw" && ! -L "$ruleset_raw" ]]
+            GH_TOKEN="$RULESET_EVIDENCE_TOKEN" gh api --hostname github.com \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id" > "$ruleset_raw"
+            jq -e 'type == "object" and has("bypass_actors") and (.bypass_actors | type == "array")' \
+              "$ruleset_raw" >/dev/null || {
+              echo "::error::ruleset API did not expose bypass_actors to PERSONAL_RULESET_EVIDENCE_TOKEN"
+              exit 1
+            }
+            jq -cS '{
+              id,
+              name,
+              target,
+              source_type,
+              source,
+              enforcement,
+              bypass_actors: (.bypass_actors | sort_by(.actor_type // "", .actor_id // 0, .bypass_mode // ""))
+            }' \
+              "$ruleset_raw" >> "$live_ruleset_details"
+            rm -f "$ruleset_raw"
+          done
+          jq -sS 'sort_by(.id)' "$live_ruleset_details" > "$live_rulesets"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release" \
+            > "$live_environment_raw"
+          jq -S '{
+              id,
+              node_id,
+              name,
+              protection_rules: [.protection_rules[]] | sort_by(.type),
+              deployment_branch_policy
+            }' "$live_environment_raw" > "$live_environment"
+          gh api --hostname github.com --paginate \
+            "repos/$GITHUB_REPOSITORY/environments/personal-relay-release/deployment-branch-policies?per_page=100" \
+            | jq -sS '{
+                total_count: ([.[].branch_policies[]] | length),
+                branch_policies: [.[].branch_policies[] | {id, node_id, name}] | sort_by(.id)
+              }' > "$live_branch_policies"
+          gh api --hostname github.com \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/1" \
+            | jq -S '{
+                id,
+                run_attempt,
+                head_branch,
+                head_sha,
+                event,
+                path,
+                repository: {full_name: .repository.full_name},
+                actor: {login: .actor.login, id: .actor.id, node_id: .actor.node_id},
+                triggering_actor: {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id}
+              }' > "$live_run_identity"
+          bash ./deploy/personal-relay/validate-main-protection.sh \
+            --branch-json "$live_branch" \
+            --rules-json "$live_rules" \
+            --rulesets-json "$live_rulesets" \
+            --expected-repository justinharkelroad/buzz \
+            --expected-sha "$SOURCE_SHA"
+          cmp "$sealed_branch" "$live_branch"
+          cmp "$sealed_rules" "$live_rules"
+          cmp "$sealed_rulesets" "$live_rulesets"
+          cmp "$sealed_environment" "$live_environment"
+          cmp "$sealed_branch_policies" "$live_branch_policies"
+          cmp "$sealed_run_identity" "$live_run_identity"
+          jq -e '
+            .actor.login == "justinharkelroad"
+            and .triggering_actor.login == "justinharkelroad"
+            and .actor == .triggering_actor
+          ' "$live_run_identity" >/dev/null
+          jq -e '
+            .name == "personal-relay-release"
+            and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
+            and ([.protection_rules[] | select(.type == "required_reviewers")] | length) == 0
+          ' "$live_environment" >/dev/null
+          jq -e --arg image_name "$IMAGE_NAME" --arg candidate_tag "$CANDIDATE_TAG" '
+            .image_name == $image_name and .candidate_tag == $candidate_tag
+          ' "$authorization_root/personal-relay-release-authorization.json" >/dev/null
+          jq -en --arg expires_at "$AUTHORIZATION_ARTIFACT_EXPIRES_AT" '
+            ($expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (($expires_at | fromdateiso8601) > now)
+          ' >/dev/null
+
+      - name: Attest merged image provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-name: ${{ needs.prepare.outputs.image_name }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+          show-summary: false
+
+      - name: Remove GHCR credentials after registry attestation
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          expected_config=/tmp/personal-relay-publish-docker
+          [[ "$DOCKER_CONFIG" == "$expected_config" ]]
+          if [[ -L "$DOCKER_CONFIG" ]]; then
+            unlink -- "$DOCKER_CONFIG"
+            echo "::error::refused to follow a symlinked Docker credential directory"
+            exit 1
+          fi
+          if [[ -e "$DOCKER_CONFIG" ]]; then
+            [[ -d "$DOCKER_CONFIG" && -O "$DOCKER_CONFIG" ]]
+            config_file="$DOCKER_CONFIG/config.json"
+            if [[ -L "$config_file" ]]; then
+              unlink -- "$config_file"
+              echo "::error::refused to follow a symlinked Docker credential file"
+              exit 1
+            fi
+            if [[ -e "$config_file" ]]; then
+              [[ -f "$config_file" && -O "$config_file" ]]
+              shred --force --iterations=3 --remove --zero -- "$config_file"
+            fi
+            [[ ! -e "$config_file" && ! -L "$config_file" ]]
+            [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+            rmdir -- "$DOCKER_CONFIG"
+          fi
+          [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
+
+      - name: Verify repository-scoped attestation and inspect predicate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.manifest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://${IMAGE_REF}" \
+            --hostname github.com \
+            -R "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --source-digest "$SOURCE_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --signer-workflow github.com/justinharkelroad/buzz/.github/workflows/personal-relay-image.yml \
+            --signer-digest "$SOURCE_SHA" \
+            --deny-self-hosted-runners \
+            --format json > personal-relay-attestation-verification.json
+          jq -e \
+            --arg image "$IMAGE_NAME" \
+            --arg digest "${IMAGE_DIGEST#sha256:}" '
+              length == 1
+              and all(.[].verificationResult.statement;
+                .predicateType == "https://slsa.dev/provenance/v1"
+                and (.subject | type == "array" and length == 1)
+                and .subject[0].name == $image
+                and .subject[0].digest == {sha256: $digest}
+              )
+            ' personal-relay-attestation-verification.json >/dev/null
+          jq '[.[0].verificationResult.statement.predicate]' \
+            personal-relay-attestation-verification.json \
+            > personal-relay-attestation-predicate.json
+
+      - name: Write non-secret release ledger
+        env:
+          AUTHORIZATION_ARTIFACT_DIGEST: ${{ needs.release-approval.outputs.authorization_artifact_digest }}
+          AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
+          AUTHORIZATION_ARTIFACT_ID: ${{ needs.release-approval.outputs.authorization_artifact_id }}
+          AUTHORIZATION_ARTIFACT_NAME: ${{ needs.release-approval.outputs.authorization_artifact_name }}
+          CANDIDATE_REF: ${{ steps.manifest.outputs.candidate_ref }}
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.digest }}
+          IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$AUTHORIZATION_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$AUTHORIZATION_ARTIFACT_NAME" == "personal-relay-release-authorization-${SOURCE_SHA}-${GITHUB_RUN_ID}-1" ]]
+          [[ "$AUTHORIZATION_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -en --arg expires_at "$AUTHORIZATION_ARTIFACT_EXPIRES_AT" '
+            ($expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (($expires_at | fromdateiso8601) > now)
+          ' >/dev/null
+          merged_index_sha256=$(sha256sum personal-relay-merged-index.json | awk '{print $1}')
+          manifest_create_sha256=$(sha256sum /tmp/personal-relay-manifest-create.json | awk '{print $1}')
+          branch_metadata_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-main-branch.json | awk '{print $1}')
+          effective_rules_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-main-effective-rules.json | awk '{print $1}')
+          rulesets_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-main-rulesets.json | awk '{print $1}')
+          environment_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-environment.json | awk '{print $1}')
+          branch_policies_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-branch-policies.json | awk '{print $1}')
+          run_identity_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-run-identity.json | awk '{print $1}')
+          authorization_sha256=$(sha256sum /tmp/personal-relay-release-authorization/personal-relay-release-authorization.json | awk '{print $1}')
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg image "$IMAGE_NAME" \
+            --arg candidate_ref "$CANDIDATE_REF" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg deployment_ref "${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --arg merged_index_sha256 "$merged_index_sha256" \
+            --arg manifest_create_sha256 "$manifest_create_sha256" \
+            --arg branch_metadata_sha256 "$branch_metadata_sha256" \
+            --arg effective_rules_sha256 "$effective_rules_sha256" \
+            --arg rulesets_sha256 "$rulesets_sha256" \
+            --arg environment_sha256 "$environment_sha256" \
+            --arg branch_policies_sha256 "$branch_policies_sha256" \
+            --arg run_identity_sha256 "$run_identity_sha256" \
+            --arg authorization_sha256 "$authorization_sha256" \
+            --arg authorization_artifact_name "$AUTHORIZATION_ARTIFACT_NAME" \
+            --arg authorization_artifact_digest "$AUTHORIZATION_ARTIFACT_DIGEST" \
+            --arg authorization_artifact_expires_at "$AUTHORIZATION_ARTIFACT_EXPIRES_AT" \
+            --arg workflow_run "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --argjson authorization_artifact_id "$AUTHORIZATION_ARTIFACT_ID" \
+            --argjson workflow_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile scan_policy personal-relay-scan-policy-summaries.json \
+            --slurpfile scanner_databases personal-relay-trivy-databases.json \
+            --slurpfile authorization /tmp/personal-relay-release-authorization/personal-relay-release-authorization.json \
+            '{repository: $repository, source_sha: $source_sha, workflow_ref: $workflow_ref, workflow_sha: $workflow_sha, image: $image, candidate_ref: $candidate_ref, candidate_tag_policy: "best-effort non-overwriting marker; never used for deployment or digest resolution", digest: $digest, deployment_ref: $deployment_ref, artifact_status: "candidate_only", deployment_eligible: false, deployment_blockers: ["separate owner-authorized protected Gate 1 run", "recorded disposition for every remaining HIGH and CRITICAL finding"], main_protection: {branch: "main", commit_sha: $source_sha, ref_protected: true, branch_metadata_sha256: $branch_metadata_sha256, effective_rules_sha256: $effective_rules_sha256, rulesets_sha256: $rulesets_sha256}, release_authorization: {environment: "personal-relay-release", authorized_owner: "justinharkelroad", image_name: $authorization[0].image_name, candidate_tag: $authorization[0].candidate_tag, environment_sha256: $environment_sha256, branch_policies_sha256: $branch_policies_sha256, run_identity_sha256: $run_identity_sha256, authorization_sha256: $authorization_sha256, evidence_artifact: {id: $authorization_artifact_id, name: $authorization_artifact_name, digest: $authorization_artifact_digest, expires_at: $authorization_artifact_expires_at}}, merged_manifest: {raw_index_sha256: $merged_index_sha256, create_metadata_sha256: $manifest_create_sha256, descriptor_policy: "exact union of the two scanned platform indexes"}, sbom: "raw OCI descriptor chain and OCI-artifact subject cryptographically bind each retained SPDX predicate to its exact platform manifest", vulnerability_gate: "exact Trivy JSON image and subject-bound SPDX report union blocks fixed HIGH and CRITICAL findings on AMD64 and ARM64", unfixed_high_critical_finding_rows: ($scan_policy[0] | map(.high_critical.unfixed_findings) | add // 0), scan_policy: $scan_policy[0], scanner_databases: $scanner_databases[0], database_regressions: "three webhook dispatch authority tests passed against pinned Postgres", workflow_run: $workflow_run, workflow_run_attempt: $workflow_run_attempt}' \
+            > personal-relay-release.json
+
+      - name: Stage release evidence at one deterministic artifact root
+        run: |
+          set -euo pipefail
+          evidence_root=/tmp/personal-relay-final-evidence
+          mkdir "$evidence_root"
+
+          evidence_files=(
+            personal-relay-attestation-predicate.json
+            personal-relay-attestation-verification.json
+            personal-relay-expected-merged-descriptors.json
+            personal-relay-merged-index.json
+            personal-relay-release.json
+            personal-relay-scan-policy-summaries.json
+            personal-relay-trivy-databases.json
+            /tmp/personal-relay-release-authorization-artifact.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-authorization.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-main-branch.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-main-effective-rules.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-main-rulesets.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-environment.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-branch-policies.json
+            /tmp/personal-relay-release-authorization/personal-relay-release-run-identity.json
+            /tmp/personal-relay-manifest-create.json
+            /tmp/personal-relay-scan/*
+          )
+          for evidence_file in "${evidence_files[@]}"; do
+            [[ -f "$evidence_file" && ! -L "$evidence_file" ]] || {
+              echo "::error::release evidence is not a regular file: $evidence_file"
+              exit 1
+            }
+            evidence_name=${evidence_file##*/}
+            [[ ! -e "$evidence_root/$evidence_name" ]] || {
+              echo "::error::duplicate release evidence basename: $evidence_name"
+              exit 1
+            }
+            install -m 0644 "$evidence_file" "$evidence_root/$evidence_name"
+          done
+          [[ -s "$evidence_root/personal-relay-release.json" ]]
+          [[ $(find "$evidence_root" -mindepth 1 -maxdepth 1 -type f | wc -l) -eq ${#evidence_files[@]} ]]
+
+          evidence_manifest=/tmp/personal-relay-final-evidence.sha256
+          (
+            cd "$evidence_root"
+            for evidence_name in *; do
+              sha256sum "$evidence_name"
+            done
+          ) > "$evidence_manifest"
+          [[ $(wc -l < "$evidence_manifest") -eq ${#evidence_files[@]} ]]
+          install -m 0444 "$evidence_manifest" "$evidence_root/personal-relay-final-evidence.sha256"
+          chmod 0444 "$evidence_root"/*
+          chmod 0555 "$evidence_root"
+
+      - name: Verify staged release evidence is unchanged
+        working-directory: /tmp/personal-relay-final-evidence
+        run: |
+          set -euo pipefail
+          [[ "$(stat -c '%a' .)" == "555" ]]
+          [[ -z "$(find . -mindepth 1 -maxdepth 1 ! -type f -print -quit)" ]]
+          [[ -z "$(find . -mindepth 1 -maxdepth 1 -perm /222 -print -quit)" ]]
+          sha256sum --check --strict personal-relay-final-evidence.sha256
+
+      - name: Create trusted final-evidence secret-scan policy
+        run: |
+          set -euo pipefail
+          policy_root=/tmp/personal-relay-final-trivy-policy
+          [[ ! -e "$policy_root" && ! -e trivyignores && ! -L trivyignores ]]
+          install -d -m 0700 "$policy_root"
+          printf '{}\n' > "$policy_root/trivy.yaml"
+          : > "$policy_root/trivy.ignore"
+          printf '{}\n' > "$policy_root/trivy.secret.yaml"
+          chmod 0400 "$policy_root"/*
+
+      - name: Reject secrets in final release evidence
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_CONFIG: /tmp/personal-relay-final-trivy-policy/trivy.yaml
+          TRIVY_IGNOREFILE: /tmp/personal-relay-final-trivy-policy/trivy.ignore
+          TRIVY_SECRET_CONFIG: /tmp/personal-relay-final-trivy-policy/trivy.secret.yaml
+        with:
+          trivy-config: /tmp/personal-relay-final-trivy-policy/trivy.yaml
+          trivyignores: /tmp/personal-relay-final-trivy-policy/trivy.ignore
+          scan-type: fs
+          scan-ref: /tmp/personal-relay-final-evidence
+          scanners: secret
+          format: json
+          output: /tmp/personal-relay-final-evidence-secret.json
+          exit-code: "1"
+          version: v0.70.0
+          cache: false
+
+      - name: Bind zero-secret final-evidence report
+        run: |
+          set -euo pipefail
+          report=/tmp/personal-relay-final-evidence-secret.json
+          bound_report=/tmp/personal-relay-final-evidence-secret-bound.json
+          [[ -s "$report" && ! -L "$report" && ! -e "$bound_report" ]]
+          jq '. + {Trivy: {Version: "0.70.0"}}' "$report" > "$bound_report"
+          install -m 0600 "$bound_report" "$report"
+          jq -e '
+            .SchemaVersion == 2
+            and .ArtifactType == "filesystem"
+            and .Trivy.Version == "0.70.0"
+            and ([.Results[]?.Secrets[]?] | length) == 0
+          ' "$report" >/dev/null
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: personal-relay-evidence-${{ github.sha }}
+          path: /tmp/personal-relay-final-evidence/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        env:
+          IMAGE_REF: ${{ needs.prepare.outputs.image_name }}@${{ steps.manifest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          {
+            echo "### Personal relay artifact"
+            echo
+            echo "Source: \`$SOURCE_SHA\`"
+            echo
+            echo "Deployment image: \`$IMAGE_REF\`"
+            echo
+            echo "The digest-qualified image is immutable but remains candidate-only."
+            echo
+            echo "Deployment eligibility requires a separate protected Gate 1 review and recorded dispositions."
+            echo
+            echo "This workflow publishes an artifact only. It does not deploy Railway or change hosted Buzz."
+          } >> "$GITHUB_STEP_SUMMARY"

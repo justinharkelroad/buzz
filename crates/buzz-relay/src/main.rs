@@ -26,6 +26,8 @@ use buzz_relay::telemetry;
 use buzz_workflow::WorkflowEngine;
 use tokio_util::sync::CancellationToken;
 
+const CHANNEL_RECONCILIATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
         matches!(
@@ -571,8 +573,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Emit kind:39000/39002 discovery events for channels that exist in the DB
     // but don't have corresponding events (e.g. seeded via direct SQL inserts).
-    // Only runs when BUZZ_RECONCILE_CHANNELS=true (dev/CI environments).
-    // Production relays create channels through the event pipeline and don't need this.
+    // Opt-in with BUZZ_RECONCILE_CHANNELS=true. This is also a production-safe
+    // repair path for legacy/unmarked DM metadata: it is bound to the configured
+    // relay host's single community and signs with the running relay identity.
     if std::env::var("BUZZ_RECONCILE_CHANNELS").is_ok() {
         let reconcile_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -595,24 +598,24 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
             };
-            // Try immediately, then retry every 5s for up to 2 minutes.
-            // Handles CI pattern: relay starts → seed script inserts data → reconciliation.
-            for attempt in 0..24u32 {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                match buzz_relay::handlers::side_effects::reconcile_channel_events(
-                    &tenant,
-                    &reconcile_state,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "channel reconciliation attempt failed");
+            // Run immediately and then for the relay lifetime. DM discovery
+            // emission is post-commit best effort; a bounded startup loop would
+            // leave a late failure permanently unknown until another restart.
+            let cancel = reconcile_state.community_revalidator_cancel.clone();
+            run_periodic_until_cancelled(CHANNEL_RECONCILIATION_PERIOD, cancel, move || {
+                let state = Arc::clone(&reconcile_state);
+                let tenant = tenant.clone();
+                async move {
+                    if let Err(e) = buzz_relay::handlers::side_effects::reconcile_channel_events(
+                        &tenant, &state,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "periodic channel reconciliation failed");
                     }
                 }
-            }
+            })
+            .await;
         });
     }
 
@@ -1910,7 +1913,7 @@ mod tests {
     use super::{
         buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
         refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        InMemoryMetricKey, CHANNEL_RECONCILIATION_PERIOD,
     };
     use metrics::GaugeFn;
     use metrics_util::{
@@ -1941,6 +1944,35 @@ mod tests {
             .expect("loop must not wait for the next interval")
             .expect("loop task");
         assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_reconciliation_schedule_is_durable_beyond_legacy_startup_window() {
+        let cancel = CancellationToken::new();
+        let tick_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_tick = Arc::clone(&tick_count);
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            run_periodic_until_cancelled(CHANNEL_RECONCILIATION_PERIOD, task_cancel, move || {
+                let count = Arc::clone(&count_for_tick);
+                async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        for _ in 0..26 {
+            tokio::time::advance(CHANNEL_RECONCILIATION_PERIOD).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tick_count.load(std::sync::atomic::Ordering::Relaxed) > 24,
+            "reconciliation must not stop after the legacy 24-attempt window"
+        );
+        cancel.cancel();
+        task.await.expect("durable reconciliation loop");
     }
 
     #[test]

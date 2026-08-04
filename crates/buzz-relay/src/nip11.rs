@@ -304,10 +304,27 @@ async fn workspace_icon_for_host(state: &crate::state::AppState, raw_host: &str)
 /// Centralised so the content-negotiated root handler and the dedicated
 /// `/info` endpoint can't drift apart.
 pub(crate) fn nip11_facts(state: &crate::state::AppState) -> (Option<String>, bool) {
-    let has_stable_key = state.config.relay_private_key.is_some();
+    let has_stable_key = relay_signing_identity_is_stable(
+        state.config.relay_private_key.is_some(),
+        state.config.require_auth_token,
+    );
     let relay_self = has_stable_key.then(|| state.relay_keypair.public_key().to_hex());
     let advertise_nip43 = has_stable_key && state.config.require_relay_membership;
     (relay_self, advertise_nip43)
+}
+
+/// Whether startup selects a relay signing identity that survives restarts.
+///
+/// Production has a configured key. Open development mode uses the fixed
+/// fallback key selected in `main`, so it is stable too and must advertise
+/// NIP-11 `self`; otherwise the ACP harness cannot verify relay-signed channel
+/// metadata during normal `just relay` development. Authenticated production
+/// without a configured key remains invalid and is rejected during startup.
+fn relay_signing_identity_is_stable(
+    relay_private_key_configured: bool,
+    require_auth_token: bool,
+) -> bool {
+    relay_private_key_configured || !require_auth_token
 }
 
 /// Multi-tenant conformance static-input fence (surface row "NIP-11 relay info
@@ -505,6 +522,33 @@ mod tests {
         let pk = "0000000000000000000000000000000000000000000000000000000000000001";
         let info = RelayInfo::build(Some(pk), None, false, DEFAULT_MAX_FRAME_BYTES, None);
         assert_eq!(info.relay_self.as_deref(), Some(pk));
+        assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
+    }
+
+    #[test]
+    fn nip11_dev_fallback_identity_is_advertised_for_harness_verification() {
+        assert!(
+            relay_signing_identity_is_stable(false, false),
+            "the deterministic open-dev fallback key is stable across restarts"
+        );
+        assert!(
+            !relay_signing_identity_is_stable(false, true),
+            "authenticated production without a configured key must not be treated as stable"
+        );
+
+        let dev_keys =
+            nostr::Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("hardcoded dev key");
+        let info = RelayInfo::build(
+            relay_signing_identity_is_stable(false, false)
+                .then(|| dev_keys.public_key().to_hex())
+                .as_deref(),
+            None,
+            false,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+        );
+        assert_eq!(info.relay_self, Some(dev_keys.public_key().to_hex()));
         assert!(!info.supported_nips.contains(&NIP_RELAY_MEMBERSHIP));
     }
 

@@ -5,7 +5,9 @@ use crate::client::{
     BuzzClient,
 };
 use crate::error::CliError;
-use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
+use crate::validate::{
+    parse_uuid, read_or_stdin, sdk_err, validate_idempotency_key, validate_uuid,
+};
 
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
@@ -57,41 +59,61 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     Ok(())
 }
 
-/// Get workflow run history — query kinds [46001, 46002, 46003].
+fn workflow_runs_filter(
+    workflow_id: &str,
+    idempotency_key: Option<&str>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, CliError> {
+    validate_uuid(workflow_id)?;
+    let mut filter = serde_json::json!({
+        "kinds": [46001, 46005, 46006, 46007],
+        "#d": [workflow_id],
+        "limit": limit.unwrap_or(20).min(100)
+    });
+    if let Some(idempotency_key) = idempotency_key {
+        validate_idempotency_key(idempotency_key)?;
+        filter["#i"] = serde_json::json!([idempotency_key]);
+        filter["limit"] = serde_json::json!(1);
+    }
+    Ok(filter)
+}
+
+/// Get workflow run state through the relay's NIP-98 `/query` bridge.
 ///
-/// NOTE: The relay does not currently emit workflow execution events (46001-46003).
-/// Run history is stored in the workflow_runs DB table, not as Nostr events.
-/// This command will return an empty array until the relay adds event emission
-/// or a dedicated REST endpoint for run history.
+/// Supplying an idempotency key resolves the single durable webhook run for
+/// that key. Without it, this remains a normal lifecycle-event history query.
 pub async fn cmd_get_workflow_runs(
     client: &BuzzClient,
     workflow_id: &str,
+    idempotency_key: Option<&str>,
     limit: Option<u32>,
 ) -> Result<(), CliError> {
-    validate_uuid(workflow_id)?;
-    let limit = limit.unwrap_or(20).min(100);
-    let filter = serde_json::json!({
-        "kinds": [46001, 46002, 46003],
-        "#d": [workflow_id],
-        "limit": limit
-    });
+    let filter = workflow_runs_filter(workflow_id, idempotency_key, limit)?;
     let resp = client.query(&filter).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let normalized: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "event_id": e.get("id").and_then(|v| v.as_str()).unwrap_or(""),
-                "kind": e.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
-                "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-                "tags": e.get("tags").cloned().unwrap_or(serde_json::json!([])),
-            })
-        })
-        .collect();
+    let normalized: Vec<serde_json::Value> =
+        events.iter().map(normalize_workflow_run_event).collect();
     let output = serde_json::to_string(&normalized).unwrap_or_default();
     println!("{output}");
     Ok(())
+}
+
+fn normalize_workflow_run_event(event: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "event_id": event.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "pubkey": event.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
+        "sig": event.get("sig").and_then(|v| v.as_str()).unwrap_or(""),
+        "kind": event.get("kind").and_then(|v| v.as_u64()).unwrap_or(0),
+        "content": event.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+        "created_at": event
+            .get("created_at")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        "tags": event
+            .get("tags")
+            .cloned()
+            .unwrap_or(serde_json::json!([])),
+    })
 }
 
 /// Create a workflow — sign and submit a kind:30620 event.
@@ -228,9 +250,11 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
         WorkflowsCmd::Trigger { workflow, inputs } => {
             cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await
         }
-        WorkflowsCmd::Runs { workflow, limit } => {
-            cmd_get_workflow_runs(client, &workflow, limit).await
-        }
+        WorkflowsCmd::Runs {
+            workflow,
+            idempotency_key,
+            limit,
+        } => cmd_get_workflow_runs(client, &workflow, idempotency_key.as_deref(), limit).await,
         WorkflowsCmd::Approve {
             token,
             approved,
@@ -239,5 +263,51 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             // approved is already a bool — no parse_bool_flag needed
             cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORKFLOW_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn keyed_run_filter_matches_status_readback_contract() {
+        let filter =
+            workflow_runs_filter(WORKFLOW_ID, Some("agency-brain:synthetic_123"), Some(99))
+                .expect("valid filter");
+        assert_eq!(
+            filter,
+            serde_json::json!({
+                "kinds": [46001, 46005, 46006, 46007],
+                "#d": [WORKFLOW_ID],
+                "#i": ["agency-brain:synthetic_123"],
+                "limit": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn keyed_run_filter_rejects_invalid_idempotency_key() {
+        assert!(workflow_runs_filter(WORKFLOW_ID, Some("contains spaces"), None).is_err());
+    }
+
+    #[test]
+    fn run_output_preserves_relay_signature_evidence() {
+        let event = serde_json::json!({
+            "id": "a".repeat(64),
+            "pubkey": "b".repeat(64),
+            "sig": "c".repeat(128),
+            "kind": 46005,
+            "content": "{\"status\":\"completed\"}",
+            "created_at": 1_777_777_777,
+            "tags": [["d", WORKFLOW_ID]],
+        });
+
+        let normalized = normalize_workflow_run_event(&event);
+        assert_eq!(normalized["event_id"], event["id"]);
+        assert_eq!(normalized["pubkey"], event["pubkey"]);
+        assert_eq!(normalized["sig"], event["sig"]);
     }
 }

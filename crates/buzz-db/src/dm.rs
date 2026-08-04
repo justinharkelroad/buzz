@@ -122,6 +122,26 @@ pub async fn create_dm(
             )));
         }
     }
+    let mut unique_participants = std::collections::HashSet::with_capacity(participants.len());
+    if participants
+        .iter()
+        .any(|participant| !unique_participants.insert(*participant))
+    {
+        return Err(DbError::InvalidData(
+            "DM participants must be unique".to_string(),
+        ));
+    }
+    if created_by.len() != 32 {
+        return Err(DbError::InvalidData(format!(
+            "created_by pubkey must be 32 bytes, got {}",
+            created_by.len()
+        )));
+    }
+    if !participants.contains(&created_by) {
+        return Err(DbError::InvalidData(
+            "created_by must be one of the DM participants".to_string(),
+        ));
+    }
 
     let hash = compute_participant_hash(participants);
 
@@ -520,6 +540,15 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
 mod tests {
     use super::*;
 
+    async fn immutable_dm_test_pool() -> PgPool {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        PgPool::connect(&database_url)
+            .await
+            .expect("connect to immutable-DM test database")
+    }
+
     #[test]
     fn participant_hash_is_order_independent() {
         let a = [1u8; 32];
@@ -553,5 +582,183 @@ mod tests {
         let b = [255u8; 32];
         let h = compute_participant_hash(&[&a, &b]);
         assert_eq!(h.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn create_dm_rejects_duplicate_participants_before_opening_transaction() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://buzz:buzz_dev@127.0.0.1:1/buzz")
+            .expect("construct lazy test pool");
+        let participant = [1_u8; 32];
+        let error = create_dm(
+            &pool,
+            buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+            &[participant.as_slice(), participant.as_slice()],
+            &participant,
+        )
+        .await
+        .expect_err("duplicate participants must be rejected before DB access");
+        assert!(
+            matches!(error, DbError::InvalidData(message) if message == "DM participants must be unique")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn immutable_dm_database_guards_reject_mutations_and_allow_create_dm() {
+        let pool = immutable_dm_test_pool().await;
+        crate::migration::run_migrations(&pool)
+            .await
+            .expect("apply immutable-DM migration");
+
+        let community_id = Uuid::new_v4();
+        let community = buzz_core::CommunityId::from_uuid(community_id);
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("immutable-dm-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert test community");
+
+        let first = [1_u8; 32];
+        let second = [2_u8; 32];
+        let third = [3_u8; 32];
+        let malformed_creator = [4_u8; 31];
+        assert!(
+            create_dm(
+                &pool,
+                community,
+                &[first.as_slice(), second.as_slice()],
+                &malformed_creator,
+            )
+            .await
+            .is_err(),
+            "create_dm must reject a malformed created_by pubkey"
+        );
+        assert!(
+            create_dm(
+                &pool,
+                community,
+                &[first.as_slice(), second.as_slice()],
+                &third,
+            )
+            .await
+            .is_err(),
+            "create_dm must reject a created_by pubkey outside the participant set"
+        );
+        let dm = create_dm(
+            &pool,
+            community,
+            &[first.as_slice(), second.as_slice()],
+            &first,
+        )
+        .await
+        .expect("the proper create_dm transaction must satisfy deferred guards");
+
+        assert!(
+            sqlx::query("UPDATE channels SET visibility='open' WHERE community_id=$1 AND id=$2",)
+                .bind(community_id)
+                .bind(dm.id)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "DM visibility mutation must be rejected"
+        );
+        assert!(
+            sqlx::query("UPDATE channels SET participant_hash=$3 WHERE community_id=$1 AND id=$2",)
+                .bind(community_id)
+                .bind(dm.id)
+                .bind([9_u8; 32].as_slice())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "participant_hash mutation must be rejected"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE channels SET channel_type='stream' WHERE community_id=$1 AND id=$2",
+            )
+            .bind(community_id)
+            .bind(dm.id)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "transitioning out of DM type must be rejected"
+        );
+
+        let mut remove_tx = pool.begin().await.expect("begin member removal");
+        sqlx::query(
+            "UPDATE channel_members SET removed_at=NOW() \
+             WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+        )
+        .bind(community_id)
+        .bind(dm.id)
+        .bind(second.as_slice())
+        .execute(&mut *remove_tx)
+        .await
+        .expect("deferred removal reaches commit");
+        assert!(
+            remove_tx.commit().await.is_err(),
+            "active DM member removal must fail at the deferred constraint"
+        );
+
+        let mut add_tx = pool.begin().await.expect("begin member addition");
+        sqlx::query(
+            "INSERT INTO channel_members \
+             (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'member', $4)",
+        )
+        .bind(community_id)
+        .bind(dm.id)
+        .bind(third.as_slice())
+        .bind(first.as_slice())
+        .execute(&mut *add_tx)
+        .await
+        .expect("deferred addition reaches commit");
+        assert!(
+            add_tx.commit().await.is_err(),
+            "active DM member addition must fail at the deferred constraint"
+        );
+
+        let mut role_tx = pool.begin().await.expect("begin DM role mutation");
+        sqlx::query(
+            "UPDATE channel_members SET role='admin' \
+             WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3",
+        )
+        .bind(community_id)
+        .bind(dm.id)
+        .bind(second.as_slice())
+        .execute(&mut *role_tx)
+        .await
+        .expect("deferred role mutation reaches commit");
+        assert!(
+            role_tx.commit().await.is_err(),
+            "active DM roles must remain exactly member"
+        );
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO channels \
+                 (community_id, name, channel_type, visibility, created_by) \
+                 VALUES ($1, 'bad dm', 'dm', 'private', $2)",
+            )
+            .bind(community_id)
+            .bind(first.as_slice())
+            .execute(&pool)
+            .await
+            .is_err(),
+            "a generic DM insert without participant_hash must be rejected"
+        );
+
+        sqlx::query("DELETE FROM channels WHERE community_id=$1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("clean up immutable-DM test channels");
+        sqlx::query("DELETE FROM communities WHERE id=$1")
+            .bind(community_id)
+            .execute(&pool)
+            .await
+            .expect("clean up immutable-DM test community");
     }
 }

@@ -1,6 +1,12 @@
 import { Search } from "lucide-react";
 import * as React from "react";
 
+import {
+  useManagedAgentsQuery,
+  useRelayAgentsQuery,
+} from "@/features/agents/hooks";
+import { isAgentClassificationUnavailable } from "@/features/agents/lib/agentAutocompleteEligibility";
+import { filterPeopleShareRecipients } from "@/features/agents/lib/peopleShareRecipientPolicy";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import {
   useFlattenedUserSearchResults,
@@ -51,6 +57,30 @@ export function PersonaShareRecipients({
   const deferredSearchQuery = React.useDeferredValue(searchQuery.trim());
   const identityQuery = useIdentityQuery();
   const isArchived = useIsArchivedPredicate();
+  const managedAgentsQuery = useManagedAgentsQuery({ enabled: open });
+  const relayAgentsQuery = useRelayAgentsQuery({ enabled: open });
+  const managedAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (managedAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [managedAgentsQuery.data],
+  );
+  const relayAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [relayAgentsQuery.data],
+  );
+  const isAgentClassificationPending = isAgentClassificationUnavailable(
+    managedAgentsQuery.data,
+    relayAgentsQuery.data,
+  );
   const selectedPubkeys = React.useMemo(
     () => new Set(selectedUsers.map((user) => normalizePubkey(user.pubkey))),
     [selectedUsers],
@@ -69,10 +99,14 @@ export function PersonaShareRecipients({
     const currentPubkey = identityQuery.data?.pubkey
       ? normalizePubkey(identityQuery.data.pubkey)
       : null;
-    const candidates = userSearchResults.filter((user) => {
+    const people = filterPeopleShareRecipients(userSearchResults, {
+      isClassificationPending: isAgentClassificationPending,
+      managedAgentPubkeys,
+      relayAgentPubkeys,
+    });
+    const candidates = people.filter((user) => {
       const pubkey = normalizePubkey(user.pubkey);
       return (
-        !user.isAgent &&
         pubkey !== currentPubkey &&
         !excludedPubkeySet.has(pubkey) &&
         !selectedPubkeys.has(pubkey) &&
@@ -91,12 +125,17 @@ export function PersonaShareRecipients({
     deferredSearchQuery,
     excludedPubkeySet,
     identityQuery.data?.pubkey,
+    isAgentClassificationPending,
     isArchived,
+    managedAgentPubkeys,
+    relayAgentPubkeys,
     selectedPubkeys,
     userSearchResults,
   ]);
   const isSearchSettling =
-    userSearchQuery.isLoading || searchQuery.trim() !== deferredSearchQuery;
+    isAgentClassificationPending ||
+    userSearchQuery.isLoading ||
+    searchQuery.trim() !== deferredSearchQuery;
   const visibleSearchResults = isSearchSettling ? [] : searchResults;
   const handleDirectoryScroll = useUserSearchFetchMoreOnScroll(
     userSearchQuery,
@@ -112,11 +151,41 @@ export function PersonaShareRecipients({
 
   function selectUser(user: UserSearchResult) {
     if (selectedUsers.length >= RECIPIENT_LIMIT) return;
+    if (
+      filterPeopleShareRecipients([user], {
+        isClassificationPending: isAgentClassificationPending,
+        managedAgentPubkeys,
+        relayAgentPubkeys,
+      }).length === 0
+    ) {
+      return;
+    }
     onSelectionChange([...selectedUsers, user]);
     setSearchQuery("");
     setIsPickerOpen(true);
     searchInputRef.current?.focus({ preventScroll: true });
   }
+
+  React.useEffect(() => {
+    if (!open || isAgentClassificationPending || selectedUsers.length === 0) {
+      return;
+    }
+    const people = filterPeopleShareRecipients(selectedUsers, {
+      isClassificationPending: false,
+      managedAgentPubkeys,
+      relayAgentPubkeys,
+    });
+    if (people.length !== selectedUsers.length) {
+      onSelectionChange(people);
+    }
+  }, [
+    isAgentClassificationPending,
+    managedAgentPubkeys,
+    onSelectionChange,
+    open,
+    relayAgentPubkeys,
+    selectedUsers,
+  ]);
 
   function removeUser(pubkey: string) {
     onSelectionChange(

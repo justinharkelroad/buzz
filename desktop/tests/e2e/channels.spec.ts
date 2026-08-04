@@ -5,6 +5,7 @@ import {
   KIND_HUDDLE_STARTED,
   KIND_TYPING_INDICATOR,
 } from "../../src/shared/constants/kinds";
+import { waitForAnimations } from "../helpers/animations";
 import {
   TEST_IDENTITIES,
   installMockBridge,
@@ -27,7 +28,8 @@ const DM_RELAY_AGENT_PUBKEY =
 
 type MockFeedWindow = Window & {
   __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-    channelName: string;
+    channelId?: string;
+    channelName?: string;
     content: string;
     createdAt?: number;
     id?: string;
@@ -204,28 +206,31 @@ async function expectMembersTriggerCount(
 
 async function waitForMockLiveSubscription(
   page: import("@playwright/test").Page,
-  channelName: string,
+  channelName: string | undefined,
   kind?: number,
+  channelId?: string,
 ) {
   await expect
     .poll(async () => {
       return page.evaluate(
-        ({ currentChannelName, kind }) => {
+        ({ currentChannelId, currentChannelName, kind }) => {
           return (
             (
               window as Window & {
                 __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                  channelName: string;
+                  channelId?: string;
+                  channelName?: string;
                   kind?: number;
                 }) => boolean;
               }
             ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+              channelId: currentChannelId,
               channelName: currentChannelName,
               kind,
             }) ?? false
           );
         },
-        { currentChannelName: channelName, kind },
+        { currentChannelId: channelId, currentChannelName: channelName, kind },
       );
     })
     .toBe(true);
@@ -593,6 +598,146 @@ test("start a new direct message from the sidebar", async ({ page }) => {
   await expect(page.getByTestId("dm-list")).toContainText("charlie");
   await expect(page.getByTestId("chat-title")).toHaveText("charlie");
   await expect(page.getByTestId("section-actions-dms")).not.toBeFocused();
+});
+
+test("delegated-agent DM UI sends two Mary turns around an injected mock response", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        name: "quinn",
+        respondTo: "allowlist",
+        respondToAllowlist: [MOCK_IDENTITY_PUBKEY],
+      },
+    ],
+    searchProfiles: [
+      {
+        pubkey: DM_RELAY_AGENT_PUBKEY,
+        displayName: "quinn",
+        ownerPubkey: TEST_IDENTITIES.outsider.pubkey,
+        isAgent: true,
+      },
+    ],
+  });
+  await page.goto("/");
+  await openNewMessagePage(page);
+
+  const search = page.getByTestId("new-dm-search");
+  await search.fill("quinn");
+  const result = page.getByTestId(`new-dm-result-${DM_RELAY_AGENT_PUBKEY}`);
+  await expect(result).toBeVisible();
+  await expect(result).toContainText("agent");
+  await result.click();
+
+  const firstMessage = "Mary delegated DM turn one";
+  await page.getByTestId("message-input").fill(firstMessage);
+  await page.getByTestId("send-message").click();
+
+  await expect(page.getByTestId("chat-title")).toHaveText("quinn");
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    firstMessage,
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ content, agentPubkey }) => {
+          const event = (
+            window as Window & {
+              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
+                content: string;
+                kind: number;
+                tags: string[][];
+              }>;
+            }
+          ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
+            (candidate) => candidate.content === content,
+          );
+          return {
+            kind: event?.kind ?? null,
+            pTags: event?.tags.filter((tag) => tag[0] === "p") ?? [],
+            targetsAgent:
+              event?.tags
+                .filter((tag) => tag[0] === "p")
+                .some((tag) => tag[1] === agentPubkey) ?? false,
+          };
+        },
+        { content: firstMessage, agentPubkey: DM_RELAY_AGENT_PUBKEY },
+      ),
+    )
+    .toEqual({
+      kind: 9,
+      pTags: [["p", DM_RELAY_AGENT_PUBKEY]],
+      targetsAgent: true,
+    });
+
+  // This is a transport/UI fixture, not an ACP-generated response. The real
+  // two-turn ACP proof remains the staging acceptance gate.
+  const dmChannelId = await page.evaluate((content) => {
+    const event = window.__BUZZ_E2E_SIGNED_EVENTS__?.find(
+      (candidate) => candidate.content === content,
+    );
+    return event?.tags.find((tag) => tag[0] === "h")?.[1] ?? null;
+  }, firstMessage);
+  expect(dmChannelId).not.toBeNull();
+  if (!dmChannelId) throw new Error("Delegated DM send is missing its h tag");
+  await waitForMockLiveSubscription(page, undefined, undefined, dmChannelId);
+  await page.evaluate(
+    ({ agentPubkey, channelId, viewerPubkey }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelId,
+        content: "Injected delegated response one",
+        mentionPubkeys: [viewerPubkey],
+        pubkey: agentPubkey,
+      });
+    },
+    {
+      agentPubkey: DM_RELAY_AGENT_PUBKEY,
+      channelId: dmChannelId,
+      viewerPubkey: MOCK_IDENTITY_PUBKEY,
+    },
+  );
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "Injected delegated response one",
+  );
+
+  const followup = "Mary delegated DM turn two";
+  await page.getByTestId("message-input").fill(followup);
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-timeline")).toContainText(followup);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        ({ content, agentPubkey }) => {
+          const event = (
+            window as Window & {
+              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
+                content: string;
+                kind: number;
+                tags: string[][];
+              }>;
+            }
+          ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
+            (candidate) => candidate.content === content,
+          );
+          return {
+            kind: event?.kind ?? null,
+            pTags: event?.tags.filter((tag) => tag[0] === "p") ?? [],
+            targetsAgent:
+              event?.tags
+                .filter((tag) => tag[0] === "p")
+                .some((tag) => tag[1] === agentPubkey) ?? false,
+          };
+        },
+        { content: followup, agentPubkey: DM_RELAY_AGENT_PUBKEY },
+      ),
+    )
+    .toEqual({
+      kind: 9,
+      pTags: [["p", DM_RELAY_AGENT_PUBKEY]],
+      targetsAgent: true,
+    });
 });
 
 test("keeps typing focus while arrow keys traverse and select DM recipients", async ({
@@ -1336,8 +1481,26 @@ test("create channel template selector matches the lifecycle controls", async ({
         description: "Coordinate a new project from planning through launch.",
         channelType: "stream",
         visibility: "private",
-        canvasTemplate: null,
-        agents: { personas: [], teams: [] },
+        canvasTemplate: "# {channel.name}\n\nKickoff notes",
+        agents: {
+          personas: [
+            {
+              personaId: "planner",
+              runtime: null,
+              model: null,
+              role: null,
+              backend: null,
+            },
+          ],
+          teams: [
+            {
+              teamId: "research-team",
+              runtime: null,
+              model: null,
+              backend: null,
+            },
+          ],
+        },
         isBuiltin: false,
         createdAt: "2026-07-23T00:00:00Z",
         updatedAt: "2026-07-23T00:00:00Z",
@@ -1350,16 +1513,73 @@ test("create channel template selector matches the lifecycle controls", async ({
 
   const templateControl = page.getByTestId("create-channel-template");
   await expect(templateControl).toHaveRole("button");
-  await expect(templateControl).toHaveText("No template");
+  await expect(templateControl).toHaveText("None");
   await templateControl.click();
+  await expect(
+    page.getByRole("menuitem", { name: "Create new channel template…" }),
+  ).toBeVisible();
   await page.getByRole("menuitemradio", { name: "Project kickoff" }).click();
 
   await expect(templateControl).toHaveText("Project kickoff");
+  await expect(page.getByTestId("create-channel-template-summary")).toHaveText(
+    "Private · Canvas included · 1 agent · 1 team",
+  );
   await expect(page.getByTestId("create-channel-description")).toHaveValue(
     "Coordinate a new project from planning through launch.",
   );
   await expect(page.getByTestId("create-channel-permissions")).toContainText(
     "Private",
+  );
+  await page.getByTestId("create-channel-permissions").click();
+  await page.getByTestId("create-channel-permissions-option-open").click();
+  await expect(page.getByTestId("create-channel-template-summary")).toHaveText(
+    "Open · Canvas included · 1 agent · 1 team",
+  );
+});
+
+test("create channel exposes templates when the library is empty", async ({
+  page,
+}) => {
+  await installMockBridge(page, { channelTemplates: [] });
+  await page.goto("/");
+  await openCreateChannelDialog(page);
+
+  const typeContainer = page.getByTestId(
+    "create-channel-channel-type-container",
+  );
+  const visibilityContainer = page.getByTestId(
+    "create-channel-permissions-container",
+  );
+  const templateContainer = page.getByTestId(
+    "create-channel-template-container",
+  );
+  await expect(templateContainer).toContainText("TemplateOptional");
+  const typeBox = await typeContainer.boundingBox();
+  const visibilityBox = await visibilityContainer.boundingBox();
+  const templateBox = await templateContainer.boundingBox();
+  expect(typeBox).not.toBeNull();
+  expect(visibilityBox).not.toBeNull();
+  expect(templateBox).not.toBeNull();
+  expect(typeBox?.y ?? 0).toBeLessThan(visibilityBox?.y ?? 0);
+  expect(visibilityBox?.y ?? 0).toBeLessThan(templateBox?.y ?? 0);
+
+  const templateControl = page.getByTestId("create-channel-template");
+  await expect(templateControl).toHaveText("None");
+  await templateControl.click();
+  await page
+    .getByRole("menuitem", { name: "Create new channel template…" })
+    .click();
+
+  await expect(
+    page.getByText("Create template", { exact: true }),
+  ).toBeVisible();
+  await page.locator("#template-name").fill("Weekly planning");
+  await page.locator("#template-description").fill("Plan the next week.");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+
+  await expect(templateControl).toHaveText("Weekly planning");
+  await expect(page.getByTestId("create-channel-description")).toHaveValue(
+    "Plan the next week.",
   );
 });
 
@@ -1443,8 +1663,11 @@ test("ephemeral countdown refreshes when switching channels after a clock jump",
     await page
       .getByTestId("create-channel-description")
       .fill("Auto-cleaned test stream");
-    await page.getByTestId("create-channel-channel-type").click();
+    const channelType = page.getByTestId("create-channel-channel-type");
+    await waitForAnimations(page);
+    await channelType.click();
     await page.getByLabel("Temporary channel").click();
+    await expect(channelType).toHaveAccessibleName("Channel type: Temporary");
     await page.getByTestId("create-channel-submit").click();
     await expect(page.getByTestId("chat-title")).toContainText(channelName);
   }
@@ -1866,6 +2089,16 @@ test("channel date divider keeps the date sticky while the separator rule scroll
 test("shows and clears activity indicators for active channel agents", async ({
   page,
 }) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: TEST_IDENTITIES.alice.pubkey,
+        name: "alice",
+        respondTo: "anyone",
+        channelNames: ["agents"],
+      },
+    ],
+  });
   await page.goto("/");
 
   await page.getByTestId("channel-agents").click();
@@ -3936,6 +4169,17 @@ test("bulk remove stays hidden when row-level remove is not allowed", async ({
   const alicePubkey =
     "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
 
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: alicePubkey,
+        name: "alice",
+        respondTo: "owner-only",
+        channelNames: ["design"],
+      },
+    ],
+  });
+
   await page.goto("/");
 
   // Join the "design" channel (unjoined by default) via the channel browser.
@@ -3950,9 +4194,9 @@ test("bulk remove stays hidden when row-level remove is not allowed", async ({
 
   await openMembersSidebar(page, "design");
 
-  // Alice is a relay-observed bot in design (present in mockRelayAgents) that
-  // the user does not manage locally. Since there is no local managed agent
-  // for alice, hasActions is false and no 3-dot menu renders.
+  // Alice is explicitly seeded as a relay-observed bot in design that the user
+  // does not manage locally. Since there is no local managed agent for alice,
+  // hasActions is false and no 3-dot menu renders.
   await expect(page.getByTestId(`sidebar-member-${alicePubkey}`)).toBeVisible();
   await expect(
     page.getByTestId(`sidebar-member-menu-${alicePubkey}`),

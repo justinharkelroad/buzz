@@ -509,6 +509,153 @@ fn resolve_send_message_channel(
     Ok(trigger_channel.trim().to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebhookDispatchDenial {
+    RunNotRunning,
+    WorkflowInactive,
+    DefinitionDisabled,
+    DefinitionInvalid,
+    MissingChannel,
+    MissingWebhookStep,
+}
+
+impl WebhookDispatchDenial {
+    fn message(self) -> &'static str {
+        match self {
+            Self::RunNotRunning => "workflow run is not running",
+            Self::WorkflowInactive => "workflow is disabled or inactive",
+            Self::DefinitionDisabled => "stored workflow definition is disabled",
+            Self::DefinitionInvalid => "stored workflow definition is invalid",
+            Self::MissingChannel => "workflow has no channel scope",
+            Self::MissingWebhookStep => {
+                "current workflow definition no longer contains this webhook step"
+            }
+        }
+    }
+}
+
+/// Pure lifecycle check used before every outbound webhook dispatch.
+///
+/// The database-backed caller supplies freshly loaded run and workflow state.
+/// Keeping the decision pure makes each fail-closed branch testable without a
+/// Postgres fixture.
+fn validate_webhook_dispatch_state(
+    run_status: &buzz_db::workflow::RunStatus,
+    workflow_status: &buzz_db::workflow::WorkflowStatus,
+    workflow_enabled: bool,
+    workflow_channel_id: Option<Uuid>,
+    def: &WorkflowDef,
+    step_id: &str,
+) -> Result<Uuid, WebhookDispatchDenial> {
+    if *run_status != buzz_db::workflow::RunStatus::Running {
+        return Err(WebhookDispatchDenial::RunNotRunning);
+    }
+    if !workflow_enabled || *workflow_status != buzz_db::workflow::WorkflowStatus::Active {
+        return Err(WebhookDispatchDenial::WorkflowInactive);
+    }
+    if !def.enabled {
+        return Err(WebhookDispatchDenial::DefinitionDisabled);
+    }
+    if def.validate().is_err() {
+        return Err(WebhookDispatchDenial::DefinitionInvalid);
+    }
+    let channel_id = workflow_channel_id.ok_or(WebhookDispatchDenial::MissingChannel)?;
+    if !def
+        .steps
+        .iter()
+        .any(|step| step.id == step_id && matches!(&step.action, ActionDef::CallWebhook { .. }))
+    {
+        return Err(WebhookDispatchDenial::MissingWebhookStep);
+    }
+
+    Ok(channel_id)
+}
+
+/// Freshly revalidate a webhook run immediately before network dispatch.
+///
+/// Every lookup is scoped by the server-derived community. Any missing,
+/// malformed, disabled, inactive, or unauthorized state denies the outbound
+/// request. Authority loss also triggers a best-effort durable disable, but a
+/// failed disable never converts the denial into permission.
+async fn revalidate_webhook_dispatch(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+) -> Result<(), WorkflowError> {
+    let wf_run = engine
+        .db
+        .get_workflow_run(community_id, run_id)
+        .await
+        .map_err(|e| {
+            WorkflowError::WebhookError(format!(
+                "CallWebhook: failed to load workflow run {run_id}: {e}"
+            ))
+        })?;
+    let workflow = engine
+        .db
+        .get_workflow(community_id, wf_run.workflow_id)
+        .await
+        .map_err(|e| {
+            WorkflowError::WebhookError(format!(
+                "CallWebhook: failed to load workflow {}: {e}",
+                wf_run.workflow_id
+            ))
+        })?;
+    let def: WorkflowDef = serde_json::from_value(workflow.definition.clone()).map_err(|e| {
+        WorkflowError::WebhookError(format!(
+            "CallWebhook: failed to parse current workflow definition: {e}"
+        ))
+    })?;
+
+    let channel_id = validate_webhook_dispatch_state(
+        &wf_run.status,
+        &workflow.status,
+        workflow.enabled,
+        workflow.channel_id,
+        &def,
+        step_id,
+    )
+    .map_err(|reason| {
+        WorkflowError::WebhookError(format!(
+            "CallWebhook: dispatch authorization denied: {}",
+            reason.message()
+        ))
+    })?;
+
+    if let Err(authority_error) = engine
+        .check_owner_authority(community_id, channel_id, &workflow.owner_pubkey, &def)
+        .await
+    {
+        let denial = WorkflowError::WebhookError(format!(
+            "CallWebhook: current owner authority denied: {authority_error}"
+        ));
+
+        if let Err(disable_error) = engine
+            .db
+            .set_workflow_enabled(community_id, workflow.id, false)
+            .await
+        {
+            warn!(
+                workflow_id = %workflow.id,
+                channel_id = %channel_id,
+                "CallWebhook: authorization denied; failed to disable workflow: {disable_error}"
+            );
+        } else {
+            engine.invalidate_channel_workflows(community_id, channel_id);
+            info!(
+                workflow_id = %workflow.id,
+                channel_id = %channel_id,
+                "CallWebhook: disabled workflow after owner authority loss"
+            );
+        }
+
+        return Err(denial);
+    }
+
+    Ok(())
+}
+
 /// Dispatch a resolved action and return its output.
 ///
 /// For MVP, most actions log their intent and return a success output.
@@ -622,6 +769,8 @@ pub async fn dispatch_action(
             headers,
             body,
         } => {
+            revalidate_webhook_dispatch(engine, community_id, run_id, step_id).await?;
+
             let method_str = method.as_deref().unwrap_or("POST");
             info!(run_id = %run_id, step = step_id, "CallWebhook → {method_str} {url}");
 
@@ -1219,6 +1368,9 @@ async fn execute_steps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_db::channel::{ChannelType, ChannelVisibility, MemberRole};
+    use buzz_db::{Db, DbConfig};
+    use nostr::Keys;
     use serde_json::json;
 
     fn make_trigger() -> TriggerContext {
@@ -1833,5 +1985,340 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+
+    fn webhook_definition(enabled: bool) -> WorkflowDef {
+        serde_json::from_value(json!({
+            "name": "dispatch revalidation",
+            "trigger": {"on": "message_posted"},
+            "steps": [{
+                "id": "hook",
+                "action": "call_webhook",
+                "url": "https://example.com/hook"
+            }],
+            "enabled": enabled
+        }))
+        .expect("valid webhook definition")
+    }
+
+    #[test]
+    fn webhook_dispatch_state_allows_only_current_running_active_step() {
+        let channel_id = Uuid::new_v4();
+        let def = webhook_definition(true);
+
+        let result = validate_webhook_dispatch_state(
+            &buzz_db::workflow::RunStatus::Running,
+            &buzz_db::workflow::WorkflowStatus::Active,
+            true,
+            Some(channel_id),
+            &def,
+            "hook",
+        );
+
+        assert_eq!(result, Ok(channel_id));
+    }
+
+    #[test]
+    fn webhook_dispatch_state_denies_non_running_runs() {
+        let def = webhook_definition(true);
+        for status in [
+            buzz_db::workflow::RunStatus::Pending,
+            buzz_db::workflow::RunStatus::WaitingApproval,
+            buzz_db::workflow::RunStatus::Completed,
+            buzz_db::workflow::RunStatus::Failed,
+            buzz_db::workflow::RunStatus::Cancelled,
+        ] {
+            assert_eq!(
+                validate_webhook_dispatch_state(
+                    &status,
+                    &buzz_db::workflow::WorkflowStatus::Active,
+                    true,
+                    Some(Uuid::new_v4()),
+                    &def,
+                    "hook",
+                ),
+                Err(WebhookDispatchDenial::RunNotRunning)
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_dispatch_state_denies_inactive_workflow_rows() {
+        let def = webhook_definition(true);
+        let channel_id = Some(Uuid::new_v4());
+
+        assert_eq!(
+            validate_webhook_dispatch_state(
+                &buzz_db::workflow::RunStatus::Running,
+                &buzz_db::workflow::WorkflowStatus::Active,
+                false,
+                channel_id,
+                &def,
+                "hook",
+            ),
+            Err(WebhookDispatchDenial::WorkflowInactive)
+        );
+        for status in [
+            buzz_db::workflow::WorkflowStatus::Disabled,
+            buzz_db::workflow::WorkflowStatus::Archived,
+        ] {
+            assert_eq!(
+                validate_webhook_dispatch_state(
+                    &buzz_db::workflow::RunStatus::Running,
+                    &status,
+                    true,
+                    channel_id,
+                    &def,
+                    "hook",
+                ),
+                Err(WebhookDispatchDenial::WorkflowInactive)
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_dispatch_state_denies_stale_or_invalid_definition() {
+        let channel_id = Some(Uuid::new_v4());
+        let disabled = webhook_definition(false);
+        assert_eq!(
+            validate_webhook_dispatch_state(
+                &buzz_db::workflow::RunStatus::Running,
+                &buzz_db::workflow::WorkflowStatus::Active,
+                true,
+                channel_id,
+                &disabled,
+                "hook",
+            ),
+            Err(WebhookDispatchDenial::DefinitionDisabled)
+        );
+
+        let mut invalid = webhook_definition(true);
+        invalid.steps.clear();
+        assert_eq!(
+            validate_webhook_dispatch_state(
+                &buzz_db::workflow::RunStatus::Running,
+                &buzz_db::workflow::WorkflowStatus::Active,
+                true,
+                channel_id,
+                &invalid,
+                "hook",
+            ),
+            Err(WebhookDispatchDenial::DefinitionInvalid)
+        );
+
+        let current = webhook_definition(true);
+        assert_eq!(
+            validate_webhook_dispatch_state(
+                &buzz_db::workflow::RunStatus::Running,
+                &buzz_db::workflow::WorkflowStatus::Active,
+                true,
+                channel_id,
+                &current,
+                "removed_hook",
+            ),
+            Err(WebhookDispatchDenial::MissingWebhookStep)
+        );
+    }
+
+    #[test]
+    fn webhook_dispatch_state_requires_channel_scope() {
+        assert_eq!(
+            validate_webhook_dispatch_state(
+                &buzz_db::workflow::RunStatus::Running,
+                &buzz_db::workflow::WorkflowStatus::Active,
+                true,
+                None,
+                &webhook_definition(true),
+                "hook",
+            ),
+            Err(WebhookDispatchDenial::MissingChannel)
+        );
+    }
+
+    struct WebhookDispatchFixture {
+        engine: WorkflowEngine,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        run_id: Uuid,
+    }
+
+    async fn setup_webhook_dispatch_fixture(role: MemberRole) -> WebhookDispatchFixture {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+        let db = Db::new(&DbConfig {
+            database_url,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect to test DB");
+        db.migrate().await.expect("run migrations");
+
+        let community_id = db
+            .ensure_configured_community(&format!(
+                "workflow-dispatch-{}.example",
+                Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create test community")
+            .id;
+        let channel_owner = Keys::generate().public_key().to_bytes().to_vec();
+        let workflow_owner = if role == MemberRole::Owner {
+            channel_owner.clone()
+        } else {
+            Keys::generate().public_key().to_bytes().to_vec()
+        };
+        db.ensure_user(community_id, &channel_owner)
+            .await
+            .expect("create channel owner");
+        db.ensure_user(community_id, &workflow_owner)
+            .await
+            .expect("create workflow owner");
+
+        let channel = db
+            .create_channel(
+                community_id,
+                "workflow-webhook-dispatch",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                &channel_owner,
+                None,
+            )
+            .await
+            .expect("create test channel");
+        if role != MemberRole::Owner {
+            db.add_member(
+                community_id,
+                channel.id,
+                &workflow_owner,
+                role,
+                Some(&channel_owner),
+            )
+            .await
+            .expect("add workflow owner");
+        }
+
+        let definition =
+            serde_json::to_string(&webhook_definition(true)).expect("serialize webhook definition");
+        let workflow_id = db
+            .create_workflow(
+                community_id,
+                Some(channel.id),
+                &workflow_owner,
+                "webhook-dispatch-test",
+                &definition,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+        let run_id = db
+            .create_workflow_run(community_id, workflow_id, None, None)
+            .await
+            .expect("create workflow run");
+        db.update_workflow_run(
+            community_id,
+            run_id,
+            buzz_db::workflow::RunStatus::Running,
+            0,
+            &json!([]),
+            None,
+        )
+        .await
+        .expect("mark workflow run running");
+
+        WebhookDispatchFixture {
+            engine: WorkflowEngine::new(db, crate::WorkflowConfig::default()),
+            community_id,
+            workflow_id,
+            run_id,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_dispatch_revalidation_allows_current_admin() {
+        let fixture = setup_webhook_dispatch_fixture(MemberRole::Admin).await;
+
+        revalidate_webhook_dispatch(
+            &fixture.engine,
+            fixture.community_id,
+            fixture.run_id,
+            "hook",
+        )
+        .await
+        .expect("current admin should retain webhook authority");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_dispatch_denial_precedes_transport_and_disables_workflow() {
+        let fixture = setup_webhook_dispatch_fixture(MemberRole::Member).await;
+        let action = ActionDef::CallWebhook {
+            url: "not a valid URL".to_owned(),
+            method: None,
+            headers: None,
+            body: None,
+        };
+
+        let err = dispatch_action(
+            "hook",
+            &action,
+            &fixture.engine,
+            fixture.community_id,
+            fixture.run_id,
+            &TriggerContext::default(),
+        )
+        .await
+        .expect_err("plain member must be denied before transport");
+        assert!(
+            err.to_string().contains("current owner authority denied"),
+            "transport must not replace the authority denial: {err}"
+        );
+
+        let workflow = fixture
+            .engine
+            .db
+            .get_workflow(fixture.community_id, fixture.workflow_id)
+            .await
+            .expect("load disabled workflow");
+        assert!(!workflow.enabled, "denied workflow should be disabled");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn webhook_dispatch_revalidation_preserves_community_scope() {
+        let fixture = setup_webhook_dispatch_fixture(MemberRole::Owner).await;
+        let other_community = fixture
+            .engine
+            .db
+            .ensure_configured_community(&format!(
+                "workflow-dispatch-other-{}.example",
+                Uuid::new_v4().simple()
+            ))
+            .await
+            .expect("create other community")
+            .id;
+
+        let err =
+            revalidate_webhook_dispatch(&fixture.engine, other_community, fixture.run_id, "hook")
+                .await
+                .expect_err("run must not resolve across communities");
+        assert!(
+            err.to_string().contains("failed to load workflow run"),
+            "unexpected error: {err}"
+        );
+
+        let workflow = fixture
+            .engine
+            .db
+            .get_workflow(fixture.community_id, fixture.workflow_id)
+            .await
+            .expect("load original community workflow");
+        assert!(
+            workflow.enabled,
+            "wrong-community denial must not mutate the original workflow"
+        );
     }
 }

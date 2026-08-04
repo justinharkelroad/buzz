@@ -301,6 +301,41 @@ async fn actor_owns_any_owner_agent(
     Ok(false)
 }
 
+fn validate_immutable_dm_admin_route(
+    kind: u32,
+    event: &Event,
+    existing_channel_is_dm: bool,
+) -> anyhow::Result<()> {
+    if kind == 9007
+        && event
+            .tags
+            .iter()
+            .any(|tag| tag.kind().to_string() == "channel_type" && tag.content() == Some("dm"))
+    {
+        return Err(anyhow::anyhow!(
+            "kind:9007 cannot create DMs; use kind:41010 DM_OPEN"
+        ));
+    }
+    if !existing_channel_is_dm {
+        return Ok(());
+    }
+    match kind {
+        9000 | 9001 | 9021 | 9022 => Err(anyhow::anyhow!(
+            "DM participant sets are immutable; use kind:41010/41011 to create a new DM"
+        )),
+        9002 if event
+            .tags
+            .iter()
+            .any(|tag| tag.kind().to_string() == "visibility") =>
+        {
+            Err(anyhow::anyhow!(
+                "DM channel visibility is immutable and must remain private"
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Validate an admin kind event BEFORE storage.
 pub async fn validate_admin_event(
     tenant: &TenantContext,
@@ -308,8 +343,11 @@ pub async fn validate_admin_event(
     event: &Event,
     state: &Arc<AppState>,
 ) -> anyhow::Result<()> {
-    // CREATE_GROUP doesn't need an existing channel — skip h-tag extraction
+    // CREATE_GROUP doesn't need an existing channel; skip h-tag extraction.
+    // DMs must use KIND_DM_OPEN so the database can atomically bind their
+    // immutable participant set and participant_hash.
     if kind == 9007 {
+        validate_immutable_dm_admin_route(kind, event, false)?;
         return Ok(());
     }
 
@@ -326,6 +364,9 @@ pub async fn validate_admin_event(
         .get_channel(tenant.community(), channel_id)
         .await
         .map_err(|_| anyhow::anyhow!("channel not found"))?;
+    if channel.channel_type == "dm" {
+        validate_immutable_dm_admin_route(kind, event, true)?;
+    }
     let is_unarchive_request = kind == 9002
         && event.tags.iter().any(|t| {
             let parts = t.as_slice();
@@ -991,7 +1032,10 @@ async fn emit_addressable_discovery_event(
     relay_pubkey_hex: &str,
 ) -> anyhow::Result<()> {
     // Ensure the new event's created_at is strictly greater than any existing event
-    // of the same (kind, pubkey, channel_id). Without this, rapid successive updates
+    // of the same (kind, pubkey, channel_id). This intentionally does not filter by
+    // `d`: Db::replace_addressable_event uses that exact tuple, so a malformed trusted
+    // event with a missing/wrong d must still drive the repair timestamp. Without this,
+    // rapid successive updates
     // (e.g. set topic then set purpose in the same second) can produce events with
     // identical created_at, causing the second to be rejected by stale-write protection
     // (NIP-16 tiebreaker: lower event ID wins, which is random).
@@ -999,21 +1043,29 @@ async fn emit_addressable_discovery_event(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let relay_pubkey = state.relay_keypair.public_key().to_bytes().to_vec();
+    let d_tag = channel_id.to_string();
     let min_ts = {
         let existing = state
             .db
             .query_events(&buzz_db::event::EventQuery {
                 kinds: Some(vec![kind as i32]),
                 channel_id: Some(channel_id),
+                pubkey: Some(relay_pubkey.clone()),
                 limit: Some(1),
                 ..buzz_db::event::EventQuery::for_community(tenant.community())
             })
-            .await
-            .unwrap_or_default();
-        existing
-            .first()
-            .map(|e| e.event.created_at.as_secs() + 1)
-            .unwrap_or(now)
+            .await?;
+        match existing.first() {
+            Some(stored) => stored
+                .event
+                .created_at
+                .as_secs()
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("kind:{kind} discovery timestamp overflow"))?
+                .max(now),
+            None => now,
+        }
     };
     let ts = now.max(min_ts);
 
@@ -1027,10 +1079,29 @@ async fn emit_addressable_discovery_event(
         .db
         .replace_addressable_event(tenant.community(), &event, Some(channel_id))
         .await?;
-    if was_inserted {
-        let kind_u32 = event_kind_u32(&stored.event);
-        dispatch_persistent_event(tenant, state, &stored, kind_u32, relay_pubkey_hex, None).await;
+    if !was_inserted {
+        anyhow::bail!(
+            "kind:{kind} channel {channel_id} discovery write was dominated; repair not proven"
+        );
     }
+    let current = state
+        .db
+        .query_events(&buzz_db::event::EventQuery {
+            kinds: Some(vec![kind as i32]),
+            channel_id: Some(channel_id),
+            pubkey: Some(relay_pubkey),
+            d_tag: Some(d_tag),
+            limit: Some(1),
+            ..buzz_db::event::EventQuery::for_community(tenant.community())
+        })
+        .await?;
+    if current.first().map(|current| current.event.id) != Some(event.id) {
+        anyhow::bail!(
+            "kind:{kind} channel {channel_id} discovery write did not become trusted current head"
+        );
+    }
+    let kind_u32 = event_kind_u32(&stored.event);
+    dispatch_persistent_event(tenant, state, &stored, kind_u32, relay_pubkey_hex, None).await;
     Ok(())
 }
 
@@ -1047,13 +1118,44 @@ pub async fn emit_group_discovery_events(
     state: &Arc<AppState>,
     channel_id: Uuid,
 ) -> anyhow::Result<()> {
+    emit_group_discovery_events_selected(tenant, state, channel_id, DiscoveryEmissionSet::all())
+        .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiscoveryEmissionSet {
+    metadata: bool,
+    admins: bool,
+    members: bool,
+}
+
+impl DiscoveryEmissionSet {
+    const fn all() -> Self {
+        Self {
+            metadata: true,
+            admins: true,
+            members: true,
+        }
+    }
+
+    const fn any(self) -> bool {
+        self.metadata || self.admins || self.members
+    }
+}
+
+async fn emit_group_discovery_events_selected(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    selected: DiscoveryEmissionSet,
+) -> anyhow::Result<()> {
     let channel = state.db.get_channel(tenant.community(), channel_id).await?;
     let members = state.db.get_members(tenant.community(), channel_id).await?;
 
     let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
     let group_id = channel_id.to_string();
 
-    {
+    if selected.metadata {
         let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
         tags.push(Tag::parse(["name", &channel.name])?);
         if let Some(ref desc) = channel.description {
@@ -1072,12 +1174,7 @@ pub async fn emit_group_discovery_events(
         // Not a security boundary — access control is handled by channel-scoped storage.
         if channel.channel_type == "dm" {
             tags.push(Tag::parse(["hidden"])?);
-            // Include participant pubkeys in kind:39000 for DMs so clients can
-            // resolve display names without a separate kind:39002 fetch.
-            for m in &members {
-                let pubkey_hex = hex::encode(&m.pubkey);
-                tags.push(Tag::parse(["p", &pubkey_hex])?);
-            }
+            tags.extend(immutable_dm_discovery_tags(&members)?);
         }
         // Buzz channels always require explicit membership
         tags.push(Tag::parse(["closed"])?);
@@ -1116,7 +1213,7 @@ pub async fn emit_group_discovery_events(
         .await?;
     }
 
-    {
+    if selected.admins {
         let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
         for m in members
             .iter()
@@ -1136,7 +1233,7 @@ pub async fn emit_group_discovery_events(
         .await?;
     }
 
-    {
+    if selected.members {
         let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
         for m in &members {
             let pubkey_hex = hex::encode(&m.pubkey);
@@ -1156,6 +1253,158 @@ pub async fn emit_group_discovery_events(
     }
 
     Ok(())
+}
+
+/// Build canonical participant tags plus the immutable-set commitment for DM
+/// kind:39000 metadata. Membership bytes are validated, sorted, and rejected
+/// on duplicates before any relay-signed metadata is emitted.
+fn immutable_dm_discovery_tags(
+    members: &[buzz_db::channel::MemberRecord],
+) -> anyhow::Result<Vec<Tag>> {
+    use buzz_core::dm::{
+        dm_participant_commitment_hex, DM_PARTICIPANT_COMMITMENT_TAG,
+        DM_PARTICIPANT_COMMITMENT_VERSION,
+    };
+
+    let mut participants = members
+        .iter()
+        .map(|member| {
+            member.pubkey.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "DM member pubkey must be 32 bytes, got {}",
+                    member.pubkey.len()
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<[u8; 32]>>>()?;
+    participants.sort_unstable();
+    let commitment = dm_participant_commitment_hex(&participants)
+        .map_err(|error| anyhow::anyhow!("invalid immutable DM participant set: {error}"))?;
+
+    let mut tags = Vec::with_capacity(participants.len() + 1);
+    for participant in &participants {
+        tags.push(Tag::parse(["p", &hex::encode(participant)])?);
+    }
+    tags.push(Tag::parse([
+        DM_PARTICIPANT_COMMITMENT_TAG,
+        DM_PARTICIPANT_COMMITMENT_VERSION,
+        &commitment,
+    ])?);
+    Ok(tags)
+}
+
+#[derive(Clone, Copy)]
+struct ChannelDiscoveryExpectation<'a> {
+    channel_id: Uuid,
+    channel_name: &'a str,
+    channel_type: &'a str,
+    visibility: &'a str,
+    archived: bool,
+    description: Option<&'a str>,
+    topic: Option<&'a str>,
+    purpose: Option<&'a str>,
+    ttl_seconds: Option<i32>,
+    ttl_deadline: Option<&'a chrono::DateTime<chrono::Utc>>,
+    relay_pubkey: &'a nostr::PublicKey,
+    members: &'a [buzz_db::channel::MemberRecord],
+}
+
+fn discovery_event_matches_channel(
+    event: &Event,
+    expected: &ChannelDiscoveryExpectation<'_>,
+) -> bool {
+    let Ok(metadata) = buzz_core::dm::verify_relay_channel_metadata(
+        event,
+        &expected.channel_id.to_string(),
+        expected.relay_pubkey,
+    ) else {
+        return false;
+    };
+    let expected_metadata_visibility = if expected.visibility == "open" {
+        "public"
+    } else {
+        expected.visibility
+    };
+    let expected_deadline = expected.ttl_deadline.map(chrono::DateTime::to_rfc3339);
+    if metadata.name != expected.channel_name
+        || metadata.channel_type != expected.channel_type
+        || metadata.visibility != expected_metadata_visibility
+        || metadata.archived != expected.archived
+        || metadata.description.as_deref() != expected.description.filter(|value| !value.is_empty())
+        || metadata.topic.as_deref() != expected.topic.filter(|value| !value.is_empty())
+        || metadata.purpose.as_deref() != expected.purpose.filter(|value| !value.is_empty())
+        || metadata.ttl_seconds != expected.ttl_seconds
+        || metadata.ttl_deadline.as_deref() != expected_deadline.as_deref()
+    {
+        return false;
+    }
+    if expected.channel_type != "dm" {
+        return metadata.kind == buzz_core::dm::VerifiedChannelKind::Regular;
+    }
+    if metadata.kind != buzz_core::dm::VerifiedChannelKind::Dm {
+        return false;
+    }
+    let mut expected_participants = expected
+        .members
+        .iter()
+        .map(|member| (member.pubkey.len() == 32).then(|| hex::encode(member.pubkey.as_slice())))
+        .collect::<Option<Vec<_>>>();
+    let Some(ref mut expected_participants) = expected_participants else {
+        return false;
+    };
+    expected_participants.sort();
+    expected_participants.dedup();
+    metadata.participant_pubkeys == *expected_participants
+}
+
+fn discovery_role_event_matches_channel(
+    event: &Event,
+    channel_id: Uuid,
+    relay_pubkey: &nostr::PublicKey,
+    members: &[buzz_db::channel::MemberRecord],
+    kind: u32,
+) -> bool {
+    let verified = match kind {
+        KIND_NIP29_GROUP_ADMINS => buzz_core::dm::verify_relay_group_admins(event, relay_pubkey),
+        KIND_NIP29_GROUP_MEMBERS => buzz_core::dm::verify_relay_group_members(event, relay_pubkey),
+        _ => return false,
+    };
+    let Ok(verified) = verified else {
+        return false;
+    };
+    if verified.channel_id != channel_id {
+        return false;
+    }
+
+    let mut expected = Vec::new();
+    for member in members {
+        if kind == KIND_NIP29_GROUP_ADMINS && !matches!(member.role.as_str(), "owner" | "admin") {
+            continue;
+        }
+        let role_is_canonical = if kind == KIND_NIP29_GROUP_ADMINS {
+            matches!(member.role.as_str(), "owner" | "admin")
+        } else {
+            matches!(
+                member.role.as_str(),
+                "owner" | "admin" | "member" | "guest" | "bot"
+            )
+        };
+        if member.pubkey.len() != 32 || !role_is_canonical {
+            return false;
+        }
+        expected.push(buzz_core::dm::VerifiedGroupRole {
+            pubkey: hex::encode(&member.pubkey),
+            role: member.role.clone(),
+        });
+    }
+    expected.sort();
+    if expected
+        .windows(2)
+        .any(|pair| pair[0].pubkey == pair[1].pubkey)
+    {
+        return false;
+    }
+    verified.roles == expected
 }
 
 async fn handle_agent_profile(
@@ -3043,14 +3292,16 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
-/// Reconcile channels that exist in the DB but don't have kind:39000 events.
+/// Reconcile all relay-authored NIP-29 discovery snapshots independently.
 ///
 /// This handles the case where channels were created via direct SQL inserts
 /// (e.g. test seed scripts) rather than through the Nostr event pipeline.
-/// Emits kind:39000 (metadata) and kind:39002 (members) for each channel
-/// that is missing its discovery events.
+/// Missing, stale, malformed, wrong-signer, or DB-divergent kind:39000,
+/// kind:39001, and kind:39002 heads are repaired without rewriting a sibling
+/// snapshot that is already canonical.
 ///
-/// Idempotent: checks for existing kind:39000 events before emitting.
+/// Idempotent: every current head is verified against the durable relay signer
+/// and exact channel/member state before an event is emitted.
 pub async fn reconcile_channel_events(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -3064,32 +3315,103 @@ pub async fn reconcile_channel_events(
 
     let mut reconciled = 0u32;
     for channel in &channels {
-        // Check if kind:39000 event already exists for this channel.
         let channel_id_str = channel.id.to_string();
-        let existing = match state
-            .db
-            .query_events(&EventQuery {
-                kinds: Some(vec![39000]),
-                d_tag: Some(channel_id_str.clone()),
-                limit: Some(1),
-                ..EventQuery::for_community(tenant.community())
-            })
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
+        let members = match state.db.get_members(tenant.community(), channel.id).await {
+            Ok(members) => members,
+            Err(error) => {
                 tracing::warn!(
                     channel_id = %channel.id,
-                    error = %e,
-                    "reconcile: failed to query existing discovery events"
+                    %error,
+                    "reconcile: failed to read channel participants"
                 );
                 continue;
             }
         };
+        let relay_pubkey = state.relay_keypair.public_key();
+        let expected = ChannelDiscoveryExpectation {
+            channel_id: channel.id,
+            channel_name: &channel.name,
+            channel_type: &channel.channel_type,
+            visibility: &channel.visibility,
+            archived: channel.archived_at.is_some(),
+            description: channel.description.as_deref(),
+            topic: channel.topic.as_deref(),
+            purpose: channel.purpose.as_deref(),
+            ttl_seconds: channel.ttl_seconds,
+            ttl_deadline: channel.ttl_deadline.as_ref(),
+            relay_pubkey: &relay_pubkey,
+            members: &members,
+        };
 
-        if existing.is_empty() {
-            // No discovery event — emit one.
-            if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
+        let mut current = std::collections::HashMap::<u32, Event>::new();
+        let mut query_failed = false;
+        for kind in [
+            KIND_NIP29_GROUP_METADATA,
+            KIND_NIP29_GROUP_ADMINS,
+            KIND_NIP29_GROUP_MEMBERS,
+        ] {
+            match state
+                .db
+                .query_events(&EventQuery {
+                    kinds: Some(vec![kind as i32]),
+                    channel_id: Some(channel.id),
+                    pubkey: Some(relay_pubkey.to_bytes().to_vec()),
+                    d_tag: Some(channel_id_str.clone()),
+                    limit: Some(1),
+                    ..EventQuery::for_community(tenant.community())
+                })
+                .await
+            {
+                Ok(events) => {
+                    if let Some(stored) = events.first() {
+                        current.insert(kind, stored.event.clone());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        channel_id = %channel.id,
+                        kind,
+                        %error,
+                        "reconcile: failed to query current discovery head"
+                    );
+                    query_failed = true;
+                    break;
+                }
+            }
+        }
+        if query_failed {
+            continue;
+        }
+
+        let selected = DiscoveryEmissionSet {
+            metadata: !current
+                .get(&KIND_NIP29_GROUP_METADATA)
+                .is_some_and(|event| discovery_event_matches_channel(event, &expected)),
+            admins: !current.get(&KIND_NIP29_GROUP_ADMINS).is_some_and(|event| {
+                discovery_role_event_matches_channel(
+                    event,
+                    channel.id,
+                    &relay_pubkey,
+                    &members,
+                    KIND_NIP29_GROUP_ADMINS,
+                )
+            }),
+            members: !current.get(&KIND_NIP29_GROUP_MEMBERS).is_some_and(|event| {
+                discovery_role_event_matches_channel(
+                    event,
+                    channel.id,
+                    &relay_pubkey,
+                    &members,
+                    KIND_NIP29_GROUP_MEMBERS,
+                )
+            }),
+        };
+
+        if selected.any() {
+            let prior_members = current.get(&KIND_NIP29_GROUP_MEMBERS).cloned();
+            if let Err(e) =
+                emit_group_discovery_events_selected(tenant, state, channel.id, selected).await
+            {
                 tracing::warn!(
                     channel_id = %channel.id,
                     error = %e,
@@ -3097,6 +3419,21 @@ pub async fn reconcile_channel_events(
                 );
             } else {
                 reconciled += 1;
+                if channel.archived_at.is_none() && (selected.metadata || selected.members) {
+                    let prior_for_removals = if selected.members {
+                        prior_members.as_ref()
+                    } else {
+                        None
+                    };
+                    retrigger_membership_after_repair(
+                        tenant,
+                        state,
+                        channel.id,
+                        &members,
+                        prior_for_removals,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -3105,6 +3442,67 @@ pub async fn reconcile_channel_events(
         tracing::info!(count = reconciled, "reconciled channel discovery events");
     }
     Ok(())
+}
+
+/// Repaired kind:39002 state must become visible to long-running ACP harnesses.
+/// Emit adds for every durable member and removals only for identities proven
+/// by the prior trusted snapshot but absent from the repaired DB set.
+async fn retrigger_membership_after_repair(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    members: &[buzz_db::channel::MemberRecord],
+    prior_event: Option<&Event>,
+) {
+    let relay_pubkey = state.relay_keypair.public_key();
+    let actor = relay_pubkey.to_bytes();
+    let current = members
+        .iter()
+        .filter(|member| member.pubkey.len() == 32)
+        .map(|member| member.pubkey.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    for target in &current {
+        if let Err(error) = emit_membership_notification(
+            tenant,
+            state,
+            channel_id,
+            target,
+            &actor,
+            KIND_MEMBER_ADDED_NOTIFICATION,
+        )
+        .await
+        {
+            warn!(channel = %channel_id, target = %hex::encode(target), %error, "failed to retrigger repaired membership add");
+        }
+    }
+
+    let Some(prior) = prior_event
+        .and_then(|event| buzz_core::dm::verify_relay_group_members(event, &relay_pubkey).ok())
+    else {
+        return;
+    };
+    for removed in prior.roles {
+        let Ok(pubkey) = nostr::PublicKey::from_hex(&removed.pubkey) else {
+            continue;
+        };
+        let target = pubkey.to_bytes().to_vec();
+        if current.contains(&target) {
+            continue;
+        }
+        if let Err(error) = emit_membership_notification(
+            tenant,
+            state,
+            channel_id,
+            &target,
+            &actor,
+            KIND_MEMBER_REMOVED_NOTIFICATION,
+        )
+        .await
+        {
+            warn!(channel = %channel_id, target = %removed.pubkey, %error, "failed to retrigger repaired membership removal");
+        }
+    }
 }
 
 /// Publish a kind:13535 archived identities list event (NIP-IA).
@@ -3372,6 +3770,619 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn reconciliation_test_state() -> (Arc<AppState>, sqlx::PgPool) {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+        config.database_url = database_url.clone();
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect reconciliation Postgres");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        db.migrate().await.expect("apply migrations");
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        (Arc::new(state), pool)
+    }
+
+    fn signed_admin_event(tags: Vec<Tag>) -> Event {
+        let keys = nostr::Keys::generate();
+        EventBuilder::new(Kind::Custom(9002), "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("sign admin event")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn channel_reconciliation_repairs_missing_members_snapshot_with_valid_metadata() {
+        use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+        use buzz_db::CreateCommunityWithOwnerResult;
+
+        let (state, pool) = reconciliation_test_state().await;
+        let owner = nostr::Keys::generate();
+        let bot = nostr::Keys::generate();
+        let guest = nostr::Keys::generate();
+        let host = format!("discovery-reconcile-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create test community")
+        {
+            CreateCommunityWithOwnerResult::Created(record) => record.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "Mary agent access",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create test channel");
+        state
+            .db
+            .add_member(
+                community,
+                channel.id,
+                &bot.public_key().to_bytes(),
+                MemberRole::Bot,
+                Some(&owner.public_key().to_bytes()),
+            )
+            .await
+            .expect("add bot member");
+        state
+            .db
+            .add_member(
+                community,
+                channel.id,
+                &guest.public_key().to_bytes(),
+                MemberRole::Guest,
+                Some(&owner.public_key().to_bytes()),
+            )
+            .await
+            .expect("add guest member");
+
+        emit_group_discovery_events_selected(
+            &tenant,
+            &state,
+            channel.id,
+            DiscoveryEmissionSet {
+                metadata: true,
+                admins: false,
+                members: false,
+            },
+        )
+        .await
+        .expect("seed valid metadata only");
+        let d = channel.id.to_string();
+        let metadata_before = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_NIP29_GROUP_METADATA as i32]),
+                channel_id: Some(channel.id),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                d_tag: Some(d.clone()),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(community)
+            })
+            .await
+            .expect("query seeded metadata")
+            .remove(0)
+            .event;
+
+        let wrong_signer = nostr::Keys::generate();
+        let stale_admins = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_ADMINS as u16), "")
+            .tags(vec![
+                Tag::parse(["d", &d]).unwrap(),
+                Tag::parse(["p", &guest.public_key().to_hex(), "admin"]).unwrap(),
+            ])
+            .sign_with_keys(&wrong_signer)
+            .expect("sign stale wrong-signer admins");
+        state
+            .db
+            .replace_addressable_event(community, &stale_admins, Some(channel.id))
+            .await
+            .expect("seed stale admins");
+
+        reconcile_channel_events(&tenant, &state)
+            .await
+            .expect("repair missing/stale discovery snapshots");
+        let members = state
+            .db
+            .get_members(community, channel.id)
+            .await
+            .expect("read durable members");
+        let metadata_after = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_NIP29_GROUP_METADATA as i32]),
+                channel_id: Some(channel.id),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                d_tag: Some(d.clone()),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(community)
+            })
+            .await
+            .expect("query metadata after repair")
+            .remove(0)
+            .event;
+        assert_eq!(
+            metadata_after.id, metadata_before.id,
+            "valid metadata must not be rewritten while siblings are repaired"
+        );
+        for kind in [KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS] {
+            let current = state
+                .db
+                .query_events(&buzz_db::event::EventQuery {
+                    kinds: Some(vec![kind as i32]),
+                    channel_id: Some(channel.id),
+                    pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                    d_tag: Some(d.clone()),
+                    limit: Some(1),
+                    ..buzz_db::event::EventQuery::for_community(community)
+                })
+                .await
+                .expect("query repaired role snapshot")
+                .remove(0)
+                .event;
+            assert!(discovery_role_event_matches_channel(
+                &current,
+                channel.id,
+                &state.relay_keypair.public_key(),
+                &members,
+                kind,
+            ));
+        }
+
+        for target in [owner.public_key(), bot.public_key(), guest.public_key()] {
+            let notification = state
+                .db
+                .query_events(&buzz_db::event::EventQuery {
+                    kinds: Some(vec![KIND_MEMBER_ADDED_NOTIFICATION as i32]),
+                    pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                    p_tag_hex: Some(target.to_hex()),
+                    global_only: true,
+                    limit: Some(1),
+                    ..buzz_db::event::EventQuery::for_community(community)
+                })
+                .await
+                .expect("query repaired membership retrigger")
+                .remove(0)
+                .event;
+            let verified = buzz_core::dm::verify_relay_membership_notification(
+                &notification,
+                &state.relay_keypair.public_key(),
+                &target,
+            )
+            .expect("repair must emit a trusted target-bound ADD retrigger");
+            assert_eq!(verified.channel_id, channel.id);
+        }
+
+        // Preserve valid 39001/39002, then replace only the trusted metadata
+        // tuple with a future wrong-d head. Runtime reconciliation must bump
+        // past it, restore canonical metadata, and emit fresh ADD triggers
+        // even though membership itself needed no repair. Clear the first
+        // repair's notifications so stale triggers cannot satisfy this proof.
+        sqlx::query("DELETE FROM event_mentions WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clear first repair notification mentions");
+        sqlx::query("DELETE FROM events WHERE community_id = $1 AND kind IN (44100, 44101)")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clear first repair notifications");
+
+        let wrong_d = Uuid::new_v4().to_string();
+        let trusted_wrong_d_metadata =
+            EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_METADATA as u16), "")
+                .tags(vec![
+                    Tag::parse(["d", &wrong_d]).unwrap(),
+                    Tag::parse(["name", "trusted wrong d"]).unwrap(),
+                    Tag::parse(["private"]).unwrap(),
+                    Tag::parse(["closed"]).unwrap(),
+                    Tag::parse(["t", "stream"]).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(
+                    metadata_after.created_at.as_secs() + 10,
+                ))
+                .sign_with_keys(&state.relay_keypair)
+                .expect("sign trusted wrong-d metadata");
+        assert!(
+            state
+                .db
+                .replace_addressable_event(community, &trusted_wrong_d_metadata, Some(channel.id),)
+                .await
+                .expect("insert trusted wrong-d runtime dominance head")
+                .1
+        );
+
+        reconcile_channel_events(&tenant, &state)
+            .await
+            .expect("repair trusted wrong-d metadata-only state");
+        let repaired_metadata = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_NIP29_GROUP_METADATA as i32]),
+                channel_id: Some(channel.id),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                d_tag: Some(d.clone()),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(community)
+            })
+            .await
+            .expect("query canonical metadata-only repair")
+            .remove(0)
+            .event;
+        assert!(
+            repaired_metadata.created_at > trusted_wrong_d_metadata.created_at,
+            "runtime repair must bump past a trusted replacement head whose d is wrong"
+        );
+        buzz_core::dm::verify_relay_channel_metadata(
+            &repaired_metadata,
+            &d,
+            &state.relay_keypair.public_key(),
+        )
+        .expect("runtime repair must restore canonical relay-signed metadata");
+
+        for target in [owner.public_key(), bot.public_key(), guest.public_key()] {
+            let notification = state
+                .db
+                .query_events(&buzz_db::event::EventQuery {
+                    kinds: Some(vec![KIND_MEMBER_ADDED_NOTIFICATION as i32]),
+                    pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                    p_tag_hex: Some(target.to_hex()),
+                    global_only: true,
+                    limit: Some(1),
+                    ..buzz_db::event::EventQuery::for_community(community)
+                })
+                .await
+                .expect("query metadata-only membership retrigger")
+                .remove(0)
+                .event;
+            let verified = buzz_core::dm::verify_relay_membership_notification(
+                &notification,
+                &state.relay_keypair.public_key(),
+                &target,
+            )
+            .expect("metadata-only repair must emit a trusted target-bound ADD retrigger");
+            assert_eq!(verified.channel_id, channel.id);
+        }
+
+        let current_members = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_NIP29_GROUP_MEMBERS as i32]),
+                channel_id: Some(channel.id),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                d_tag: Some(d.clone()),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(community)
+            })
+            .await
+            .expect("query current members")
+            .remove(0)
+            .event;
+        let wrong_members = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16), "")
+            .tags(vec![
+                Tag::parse(["d", &d]).unwrap(),
+                Tag::parse(["p", &bot.public_key().to_hex(), "", "bot"]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(
+                current_members.created_at.as_secs() + 10,
+            ))
+            .sign_with_keys(&wrong_signer)
+            .expect("sign wrong-signer member head");
+        state
+            .db
+            .replace_addressable_event(community, &wrong_members, Some(channel.id))
+            .await
+            .expect("seed wrong-signer member head");
+        reconcile_channel_events(&tenant, &state)
+            .await
+            .expect("ignore wrong-signer sibling coordinate");
+        let repaired_members = state
+            .db
+            .query_events(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_NIP29_GROUP_MEMBERS as i32]),
+                channel_id: Some(channel.id),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                d_tag: Some(d),
+                limit: Some(1),
+                ..buzz_db::event::EventQuery::for_community(community)
+            })
+            .await
+            .expect("query repaired member head")
+            .remove(0)
+            .event;
+        assert_eq!(
+            repaired_members.id, current_members.id,
+            "a future-dated wrong-signer sibling must not mask or rewrite the trusted head"
+        );
+        assert!(discovery_role_event_matches_channel(
+            &repaired_members,
+            channel.id,
+            &state.relay_keypair.public_key(),
+            &members,
+            KIND_NIP29_GROUP_MEMBERS,
+        ));
+
+        sqlx::query("DELETE FROM audit_log WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up audit log");
+        sqlx::query("DELETE FROM event_mentions WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up event mentions");
+        sqlx::query("DELETE FROM events WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up events");
+        sqlx::query("DELETE FROM channel_members WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up channel members");
+        sqlx::query("DELETE FROM channels WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up channels");
+        sqlx::query("DELETE FROM relay_members WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up relay members");
+        sqlx::query("DELETE FROM users WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up users");
+        sqlx::query("DELETE FROM communities WHERE id = $1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("clean up community");
+    }
+
+    #[test]
+    fn immutable_dm_admin_routes_reject_in_place_membership_and_visibility_mutations() {
+        let plain = signed_admin_event(Vec::new());
+        for kind in [9000, 9001, 9021, 9022] {
+            assert!(
+                validate_immutable_dm_admin_route(kind, &plain, true).is_err(),
+                "kind:{kind} must not mutate an existing DM"
+            );
+        }
+
+        let visibility = signed_admin_event(vec![Tag::parse(["visibility", "open"]).unwrap()]);
+        assert!(validate_immutable_dm_admin_route(9002, &visibility, true).is_err());
+        let rename = signed_admin_event(vec![Tag::parse(["name", "Renamed DM"]).unwrap()]);
+        assert!(validate_immutable_dm_admin_route(9002, &rename, true).is_ok());
+
+        let generic_dm = signed_admin_event(vec![Tag::parse(["channel_type", "dm"]).unwrap()]);
+        assert!(validate_immutable_dm_admin_route(9007, &generic_dm, false).is_err());
+        let generic_stream =
+            signed_admin_event(vec![Tag::parse(["channel_type", "stream"]).unwrap()]);
+        assert!(validate_immutable_dm_admin_route(9007, &generic_stream, false).is_ok());
+    }
+
+    #[test]
+    fn immutable_dm_discovery_tags_are_sorted_and_committed() {
+        let channel_id = Uuid::new_v4();
+        let members = vec![
+            MemberRecord {
+                channel_id,
+                pubkey: vec![2_u8; 32],
+                role: "member".to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            },
+            MemberRecord {
+                channel_id,
+                pubkey: vec![1_u8; 32],
+                role: "member".to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            },
+        ];
+
+        let tags = immutable_dm_discovery_tags(&members).expect("canonical DM tags");
+        let raw = tags.iter().map(Tag::as_slice).collect::<Vec<_>>();
+        assert_eq!(raw[0], &["p".to_string(), hex::encode([1_u8; 32])]);
+        assert_eq!(raw[1], &["p".to_string(), hex::encode([2_u8; 32])]);
+        let expected =
+            buzz_core::dm::dm_participant_commitment_hex(&[[1_u8; 32], [2_u8; 32]]).unwrap();
+        assert_eq!(
+            raw[2],
+            &[
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_TAG.to_string(),
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_VERSION.to_string(),
+                expected,
+            ]
+        );
+    }
+
+    #[test]
+    fn immutable_dm_reconciliation_matcher_rejects_unmarked_metadata() {
+        let relay = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let members = vec![
+            MemberRecord {
+                channel_id,
+                pubkey: vec![1_u8; 32],
+                role: "member".to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            },
+            MemberRecord {
+                channel_id,
+                pubkey: vec![2_u8; 32],
+                role: "member".to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            },
+        ];
+        let mut canonical_tags = vec![
+            Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+            Tag::parse(["name", "DM"]).unwrap(),
+            Tag::parse(["private"]).unwrap(),
+            Tag::parse(["closed"]).unwrap(),
+            Tag::parse(["hidden"]).unwrap(),
+            Tag::parse(["t", "dm"]).unwrap(),
+        ];
+        canonical_tags.extend(immutable_dm_discovery_tags(&members).unwrap());
+        let canonical = EventBuilder::new(Kind::Custom(39000), "")
+            .tags(canonical_tags)
+            .sign_with_keys(&relay)
+            .unwrap();
+        let relay_pubkey = relay.public_key();
+        let expected = ChannelDiscoveryExpectation {
+            channel_id,
+            channel_name: "DM",
+            channel_type: "dm",
+            visibility: "private",
+            archived: false,
+            description: None,
+            topic: None,
+            purpose: None,
+            ttl_seconds: None,
+            ttl_deadline: None,
+            relay_pubkey: &relay_pubkey,
+            members: &members,
+        };
+        assert!(discovery_event_matches_channel(&canonical, &expected));
+
+        let unmarked = EventBuilder::new(Kind::Custom(39000), "")
+            .tags([
+                Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["name", "DM"]).unwrap(),
+                Tag::parse(["private"]).unwrap(),
+                Tag::parse(["closed"]).unwrap(),
+                Tag::parse(["hidden"]).unwrap(),
+                Tag::parse(["t", "dm"]).unwrap(),
+            ])
+            .sign_with_keys(&relay)
+            .unwrap();
+        assert!(!discovery_event_matches_channel(&unmarked, &expected));
+    }
+
+    #[test]
+    fn channel_reconciliation_matcher_rejects_wrong_signer_or_stale_regular_metadata() {
+        let relay = nostr::Keys::generate();
+        let wrong_relay = nostr::Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let regular = EventBuilder::new(Kind::Custom(39000), "")
+            .tags([
+                Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+                Tag::parse(["name", "General"]).unwrap(),
+                Tag::parse(["public"]).unwrap(),
+                Tag::parse(["closed"]).unwrap(),
+                Tag::parse(["t", "stream"]).unwrap(),
+            ])
+            .sign_with_keys(&relay)
+            .unwrap();
+
+        let relay_pubkey = relay.public_key();
+        let wrong_relay_pubkey = wrong_relay.public_key();
+        let expected = ChannelDiscoveryExpectation {
+            channel_id,
+            channel_name: "General",
+            channel_type: "stream",
+            visibility: "open",
+            archived: false,
+            description: None,
+            topic: None,
+            purpose: None,
+            ttl_seconds: None,
+            ttl_deadline: None,
+            relay_pubkey: &relay_pubkey,
+            members: &[],
+        };
+        assert!(discovery_event_matches_channel(&regular, &expected));
+        let wrong_signer = ChannelDiscoveryExpectation {
+            relay_pubkey: &wrong_relay_pubkey,
+            ..expected
+        };
+        assert!(!discovery_event_matches_channel(&regular, &wrong_signer));
+        for (name, channel_type, visibility, archived) in [
+            ("Renamed", "stream", "open", false),
+            ("General", "forum", "open", false),
+            ("General", "stream", "private", false),
+            ("General", "stream", "open", true),
+        ] {
+            let stale = ChannelDiscoveryExpectation {
+                channel_id,
+                channel_name: name,
+                channel_type,
+                visibility,
+                archived,
+                description: None,
+                topic: None,
+                purpose: None,
+                ttl_seconds: None,
+                ttl_deadline: None,
+                relay_pubkey: &relay_pubkey,
+                members: &[],
+            };
+            assert!(!discovery_event_matches_channel(&regular, &stale));
+        }
+        let stale_optional_state = ChannelDiscoveryExpectation {
+            topic: Some("new topic"),
+            ..expected
+        };
+        assert!(
+            !discovery_event_matches_channel(&regular, &stale_optional_state),
+            "DB-backed optional metadata drift must trigger reconciliation"
+        );
+    }
 
     #[test]
     fn delete_tombstone_omits_absent_moderation_metadata() {

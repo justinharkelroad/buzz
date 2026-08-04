@@ -21,6 +21,10 @@ import {
   useRelayAgentsQuery,
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
+import {
+  canDirectMessageAgent,
+  isAgentClassificationUnavailable,
+} from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useIsManagedAgent } from "@/features/agent-memory/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
@@ -230,10 +234,12 @@ export function UserProfilePopover({
   const isAgentClassificationPending =
     open &&
     role !== "bot" &&
-    (profileQuery.isPending ||
-      relayAgentsQuery.isPending ||
-      managedAgentsQuery.isPending ||
-      usersBatchQuery.isPending);
+    isAgentClassificationUnavailable(
+      profileQuery.data,
+      relayAgentsQuery.data,
+      managedAgentsQuery.data,
+      usersBatchQuery.data,
+    );
   const displayName = profile?.displayName ?? truncatePubkey(pubkey);
   // Owner signal mirrors UserProfilePanel: a declared NIP-OA owner whose agent
   // runs elsewhere holds no local seckey, so key custody (`isOwner`) alone
@@ -269,7 +275,12 @@ export function UserProfilePopover({
   const showMessageAction =
     showProfileActions &&
     !isAgentClassificationPending &&
-    (!isBotProfile || viewerIsOwner);
+    (!isBotProfile ||
+      canDirectMessageAgent({
+        currentPubkey,
+        isOwned: viewerIsOwner,
+        relayAgent,
+      }));
   const showAnyProfileActions =
     showHumanProfileActions || showMessageAction || showHuddleAction;
   const canViewActivity =

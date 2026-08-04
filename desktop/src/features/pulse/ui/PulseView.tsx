@@ -5,6 +5,7 @@ import {
   useManagedAgentsQuery,
   useRelayAgentsQuery,
 } from "@/features/agents/hooks";
+import { isAgentClassificationUnavailable } from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   useContactListQuery,
   useUsersBatchQuery,
@@ -19,6 +20,7 @@ import {
   useTimelineQuery,
 } from "@/features/pulse/hooks";
 import { groupAgentNotes } from "@/features/pulse/lib/groupAgentNotes";
+import { canStartPulseNoteDm } from "@/features/pulse/lib/pulseDmPolicy";
 import { usePulseNoteActions } from "@/features/pulse/lib/useNoteActions";
 import { AgentActivityCard } from "@/features/pulse/ui/AgentActivityCard";
 import { ForumComposer } from "@/features/forum/ui/ForumComposer";
@@ -30,7 +32,8 @@ import { Input } from "@/shared/ui/input";
 import { Skeleton } from "@/shared/ui/skeleton";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { VirtualizedList } from "@/shared/ui/VirtualizedList";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 
 export type PulseTab =
   | "search"
@@ -113,18 +116,37 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
               : "offline",
           respondTo: agent.respondTo,
           respondToAllowlist: agent.respondToAllowlist,
+          invocationPolicyKnown: true,
+          ownerPubkey: currentPubkey ?? null,
+          ownerPubkeyVerified: currentPubkey != null,
         });
       }
     }
     return [...agentsByPubkey.values()];
-  }, [managedAgentsQuery.data, relayAgentsQuery.data]);
+  }, [currentPubkey, managedAgentsQuery.data, relayAgentsQuery.data]);
   const agentPubkeys = React.useMemo(
     () => relayAgents.map((a) => a.pubkey),
     [relayAgents],
   );
   const agentPubkeySet = React.useMemo(
-    () => new Set(agentPubkeys),
+    () => new Set(agentPubkeys.map(normalizePubkey)),
     [agentPubkeys],
+  );
+  const managedAgentPubkeySet = React.useMemo(
+    () =>
+      new Set(
+        (managedAgentsQuery.data ?? []).map((agent) =>
+          normalizePubkey(agent.pubkey),
+        ),
+      ),
+    [managedAgentsQuery.data],
+  );
+  const relayAgentsByPubkey = React.useMemo(
+    () =>
+      new Map(
+        relayAgents.map((agent) => [normalizePubkey(agent.pubkey), agent]),
+      ),
+    [relayAgents],
   );
   const agentStatusMap = React.useMemo(() => {
     const map: Record<string, "online" | "away" | "offline"> = {};
@@ -194,12 +216,6 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
     () => pulseQueryKeys.reactions(visibleNoteIds),
     [visibleNoteIds],
   );
-  const noteActions = usePulseNoteActions({
-    currentPubkey,
-    reactionQueryKey,
-    reactions: reactionsQuery.data ?? new Map(),
-  });
-
   const agentNoteGroups = React.useMemo(
     () => (activeTab === "agents" ? groupAgentNotes(visibleNotes) : []),
     [activeTab, visibleNotes],
@@ -214,6 +230,44 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
   });
   const profiles: Record<string, UserProfileSummary> =
     profilesQuery.data?.profiles ?? {};
+  const isAgentClassificationPending = isAgentClassificationUnavailable(
+    relayAgentsQuery.data,
+    managedAgentsQuery.data,
+    profilesQuery.data,
+  );
+  const canStartDm = React.useCallback(
+    (pubkey: string) => {
+      const normalizedPubkey = normalizePubkey(pubkey);
+      const profile = profiles[normalizedPubkey];
+      const relayAgent = relayAgentsByPubkey.get(normalizedPubkey);
+      const isAgent =
+        agentPubkeySet.has(normalizedPubkey) || profile?.isAgent === true;
+      return canStartPulseNoteDm({
+        candidatePubkey: normalizedPubkey,
+        currentPubkey,
+        isAgent,
+        isClassificationPending: isAgentClassificationPending,
+        isOwnedAgent:
+          managedAgentPubkeySet.has(normalizedPubkey) ||
+          ownsAuthorAgent(profile, currentPubkey),
+        relayAgent,
+      });
+    },
+    [
+      agentPubkeySet,
+      currentPubkey,
+      isAgentClassificationPending,
+      managedAgentPubkeySet,
+      profiles,
+      relayAgentsByPubkey,
+    ],
+  );
+  const noteActions = usePulseNoteActions({
+    canStartDm,
+    currentPubkey,
+    reactionQueryKey,
+    reactions: reactionsQuery.data ?? new Map(),
+  });
 
   const mentionProfilesQuery = useUsersBatchQuery(mentionPubkeys, {
     enabled: mentionPubkeys.length > 0,
@@ -307,6 +361,7 @@ export function PulseView({ currentPubkey }: PulseViewProps) {
                 toggleUpvote: noteActions.toggleUpvote,
               }}
               composerProfiles={mentionProfiles}
+              canStartDm={canStartDm(note.pubkey)}
               currentUserDisplayName={currentDisplayName}
               currentUserProfile={currentProfile}
               isAgent={agentPubkeySet.has(note.pubkey)}

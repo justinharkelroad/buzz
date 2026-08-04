@@ -1,0 +1,12 @@
+{
+  "environment": "personal-staging",
+  "approved_origin": "https://CHANGE_ME_STAGING_RELAY_HOST",
+  "expected_relay_pubkey": "CHANGE_ME_64_CHARACTER_LOWERCASE_HEX_PUBLIC_KEY",
+  "forbidden_origins": [
+    "https://CHANGE_ME_HOSTED_BUZZ_HOST",
+    "https://CHANGE_ME_PERSONAL_PRODUCTION_HOST"
+  ],
+  "approved_by": "justinharkelroad",
+  "approved_at": "CHANGE_ME_ISO_8601_TIMESTAMP",
+  "evidence_reference": "CHANGE_ME_AUTHORIZATION_OR_TICKET_REFERENCE"
+}

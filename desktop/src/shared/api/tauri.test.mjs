@@ -54,7 +54,9 @@ const { isRateLimited, resetRateLimitGate } = await import(
 
 // Import the production classifier from tauri.ts — tests must exercise the
 // real function, not a local copy, so a logic change is always caught here.
-const { applyTauriRateLimitIfNeeded } = await import("./tauri.ts");
+const { applyTauriRateLimitIfNeeded, fromRawRelayAgent } = await import(
+  "./tauri.ts"
+);
 
 function resetGate(startMs = 0) {
   pendingTimers.clear();
@@ -110,6 +112,49 @@ test("relay rate-limited: prefix check is case-sensitive (Rust always emits lowe
     false,
     "uppercase prefix must not activate gate (relay emits lowercase only)",
   );
+});
+
+// ── fromRawRelayAgent: authenticated policy/owner provenance ────────────────
+
+function rawRelayAgent(overrides = {}) {
+  return {
+    pubkey: "1".repeat(64),
+    name: "Scout",
+    agent_type: "agent",
+    channels: [],
+    channel_ids: [],
+    capabilities: [],
+    status: "online",
+    ...overrides,
+  };
+}
+
+test("fromRawRelayAgent never infers authenticated policy or owner provenance from legacy fields", () => {
+  const mapped = fromRawRelayAgent(
+    rawRelayAgent({
+      owner_pubkey: "a".repeat(64),
+      respond_to: "allowlist",
+      respond_to_allowlist: ["b".repeat(64)],
+    }),
+  );
+
+  assert.equal(mapped.invocationPolicyKnown, false);
+  assert.equal(mapped.ownerPubkeyVerified, false);
+});
+
+test("fromRawRelayAgent preserves explicit Tauri verification markers", () => {
+  const mapped = fromRawRelayAgent(
+    rawRelayAgent({
+      invocation_policy_known: true,
+      owner_pubkey: "a".repeat(64),
+      owner_pubkey_verified: true,
+      respond_to: "allowlist",
+      respond_to_allowlist: ["b".repeat(64)],
+    }),
+  );
+
+  assert.equal(mapped.invocationPolicyKnown, true);
+  assert.equal(mapped.ownerPubkeyVerified, true);
 });
 
 // ── fromRawAcpRuntimeCatalogEntry: custom row API-boundary (B-2) ─────────────

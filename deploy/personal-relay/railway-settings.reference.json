@@ -1,0 +1,11 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "preDeployCommand": ["/usr/local/bin/personal-relay-migrate"],
+    "numReplicas": 1,
+    "requiredMountPath": "/data/git",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10,
+    "drainingSeconds": 60
+  }
+}

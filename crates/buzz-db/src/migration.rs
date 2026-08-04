@@ -561,7 +561,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -919,6 +919,114 @@ mod tests {
         assert!(heartbeat.contains("epoch"));
         assert!(heartbeat.contains("INSERT INTO replica_heartbeat (id) VALUES (1)"));
         assert!(heartbeat.contains("_operator_global_tables"));
+
+        assert_eq!(migrations[26].version, 27);
+        let webhook_idempotency = migrations[26].sql.as_str();
+        assert!(webhook_idempotency.contains("webhook_idempotency_key"));
+        assert!(webhook_idempotency.contains("webhook_payload_hash"));
+        assert!(webhook_idempotency.contains("webhook_execution_lease_id"));
+
+        assert_eq!(migrations[27].version, 28);
+        let immutable_dms = migrations[27].sql.as_str();
+        assert!(immutable_dms.contains("immutable DM migration blocked"));
+        assert!(immutable_dms.contains("chk_channels_active_dm_shape"));
+        assert!(immutable_dms.contains("guard_immutable_dm_channel_shape"));
+        assert!(immutable_dms.contains("DEFERRABLE INITIALLY DEFERRED"));
+        assert!(immutable_dms.contains("assert_immutable_dm_participant_set"));
+    }
+
+    #[test]
+    fn immutable_dm_migration_contract_is_embedded() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 28)
+            .expect("migration 0028");
+        let sql = migration.sql.as_str();
+
+        for required in [
+            "LOCK TABLE channels IN SHARE ROW EXCLUSIVE MODE",
+            "pg_catalog.sha256(",
+            "members.member_count NOT BETWEEN 2 AND 9",
+            "NOT members.roles_valid",
+            "members.active_hash IS DISTINCT FROM c.participant_hash",
+            "DM channel visibility is immutable and must be private",
+            "channels.participant_hash is immutable after insert",
+            "channels cannot transition into or out of DM type",
+            "trg_channels_verify_immutable_dm_participants",
+            "trg_channel_members_verify_immutable_dm_participants",
+        ] {
+            assert!(sql.contains(required), "migration 0028 missing {required}");
+        }
+        assert_eq!(
+            sql.matches("pg_catalog.sha256(").count(),
+            2,
+            "migration 0028 must use the search-path-independent core SHA-256 function for both participant-set checks",
+        );
+        assert!(
+            !sql.contains("digest("),
+            "migration 0028 must not depend on the pgcrypto extension schema"
+        );
+
+        let desired = include_str!("../../../schema/schema.sql");
+        for required in [
+            "chk_channels_active_dm_shape",
+            "guard_immutable_dm_channel_shape",
+            "assert_immutable_dm_participant_set",
+            "BOOL_AND(role = 'member')",
+            "trg_channel_members_verify_immutable_dm_participants",
+        ] {
+            assert!(
+                desired.contains(required),
+                "desired schema missing {required}"
+            );
+        }
+
+        let dm_participant_assertion = split_sql_statements(desired)
+            .into_iter()
+            .find(|statement| {
+                normalize_sql(statement)
+                    .starts_with("create function assert_immutable_dm_participant_set(")
+            })
+            .expect("desired schema immutable-DM participant assertion function");
+        assert!(
+            dm_participant_assertion.contains("pg_catalog.sha256("),
+            "desired schema immutable-DM participant assertion must use the search-path-independent core SHA-256 function",
+        );
+        assert!(
+            !dm_participant_assertion.contains("digest("),
+            "desired schema must not depend on the pgcrypto extension schema for DM participant hashes"
+        );
+    }
+
+    #[test]
+    fn desktop_seed_obeys_immutable_dm_insert_contract() {
+        let seed = include_str!("../../../scripts/setup-desktop-test-data.sh");
+
+        assert!(
+            seed.contains("BEGIN;") && seed.contains("COMMIT;"),
+            "desktop channel/member fixtures must share one transaction so deferred DM checks see the complete participant set",
+        );
+        assert!(
+            seed.contains("topic_required, participant_hash"),
+            "desktop channel fixtures must explicitly populate participant_hash",
+        );
+        assert_eq!(
+            seed.matches("pg_catalog.sha256(").count(),
+            3,
+            "each seeded DM must have one core SHA-256 participant hash",
+        );
+        assert!(
+            seed.contains("${ALICE_PUBKEY}${TYLER_PUBKEY}"),
+            "alice/tyler fixture hash must cover both participants in bytewise order",
+        );
+        assert!(
+            seed.contains("${BOB_PUBKEY}${TYLER_PUBKEY}"),
+            "bob/tyler fixture hash must cover both participants in bytewise order",
+        );
+        assert!(
+            seed.contains("${CHARLIE_PUBKEY}${BOB_PUBKEY}${TYLER_PUBKEY}"),
+            "group-DM fixture hash must cover all participants in bytewise order",
+        );
     }
 
     #[test]
@@ -1161,7 +1269,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(26));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

@@ -129,33 +129,322 @@ use uuid::Uuid;
 use crate::config::ChannelFilter;
 
 /// Metadata about a channel, populated at discovery time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelClassification {
+    /// Metadata is missing, malformed, untrusted, or unverifiable.
+    Unknown,
+    /// Canonical relay-authored non-DM metadata.
+    Regular,
+    /// Canonical relay-authored immutable DM metadata.
+    Dm,
+}
+
+/// Metadata about a channel, populated at discovery time.
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     pub name: String,
     pub channel_type: String,
+    pub classification: ChannelClassification,
+    /// Canonical participant pubkeys from relay-authored DM metadata.
+    /// `None` means non-DM metadata or malformed DM participant tags.
+    pub participant_pubkeys: Option<Vec<String>>,
 }
 
-pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
-    let mut is_hidden = false;
-    let mut is_private = false;
-    let mut declared_type = None;
-    for tag in tags {
-        if let Some(arr) = tag.as_array() {
-            match arr.first().and_then(|v| v.as_str()) {
-                Some("hidden") => is_hidden = true,
-                Some("private") => is_private = true,
-                Some("t") => declared_type = arr.get(1).and_then(|v| v.as_str()),
-                _ => {}
-            }
+fn verified_channel_info(
+    event: &Event,
+    channel_id: Uuid,
+    trusted_relay_pubkey: &nostr::PublicKey,
+) -> Option<ChannelInfo> {
+    let metadata = buzz_core::dm::verify_relay_channel_metadata(
+        event,
+        &channel_id.to_string(),
+        trusted_relay_pubkey,
+    )
+    .ok()?;
+    if metadata.archived {
+        return None;
+    }
+    let classification = match metadata.kind {
+        buzz_core::dm::VerifiedChannelKind::Regular => ChannelClassification::Regular,
+        buzz_core::dm::VerifiedChannelKind::Dm => ChannelClassification::Dm,
+    };
+    Some(ChannelInfo {
+        name: metadata.name,
+        channel_type: metadata.channel_type,
+        classification,
+        participant_pubkeys: (classification == ChannelClassification::Dm)
+            .then_some(metadata.participant_pubkeys),
+    })
+}
+
+/// Select and verify the canonical signer-pinned kind:39000 coordinate head.
+///
+/// Selection deliberately happens before strict verification. A newer event
+/// made by the trusted relay key but carrying malformed metadata therefore
+/// shadows an older valid event and fails the coordinate closed. Wrong-signer
+/// siblings never participate in the trusted coordinate.
+pub(crate) fn current_verified_channel_info(
+    channel_id: Uuid,
+    meta_events: &serde_json::Value,
+    trusted_relay_pubkey: &nostr::PublicKey,
+) -> Option<ChannelInfo> {
+    let events = meta_events.as_array()?;
+    let d = channel_id.to_string();
+    let head = events
+        .iter()
+        .filter_map(|value| serde_json::from_value::<Event>(value.clone()).ok())
+        .filter(|event| {
+            event.pubkey == *trusted_relay_pubkey
+                && event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP29_GROUP_METADATA
+                && event_coordinate_d(event) == Some(d.as_str())
+        })
+        .min_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        })?;
+    verified_channel_info(&head, channel_id, trusted_relay_pubkey)
+}
+
+/// Validate the broad `#p` membership query and return only relay-authenticated
+/// channel coordinates that actually contain the target exactly once.
+fn verified_membership_candidate_ids(
+    member_events: &serde_json::Value,
+    target: &nostr::PublicKey,
+    trusted_relay_pubkey: &nostr::PublicKey,
+) -> Vec<Uuid> {
+    let target_hex = target.to_hex();
+    let mut candidates = member_events
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| serde_json::from_value::<Event>(value.clone()).ok())
+        .filter_map(|event| {
+            buzz_core::dm::verify_relay_group_members(&event, trusted_relay_pubkey).ok()
+        })
+        .filter(|snapshot| {
+            snapshot
+                .roles
+                .iter()
+                .filter(|entry| entry.pubkey == target_hex)
+                .count()
+                == 1
+        })
+        .map(|snapshot| snapshot.channel_id)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+/// Return the NIP-33 coordinate value: the second field of the first `d` tag.
+/// Strict shape validation happens after head selection so malformed newer
+/// events shadow older authorization snapshots and fail the coordinate closed.
+fn event_coordinate_d(event: &Event) -> Option<&str> {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some("d"))
+            .then(|| parts.get(1).map(String::as_str))
+            .flatten()
+    })
+}
+
+/// Authoritative result of a signer-pinned current kind:39002 lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentMembershipState {
+    Member,
+    NonMember,
+    Unknown,
+}
+
+/// Subscription mutation required by an authoritative current kind:39002 head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipSubscriptionDecision {
+    EnsureSubscribed,
+    EnsureUnsubscribed,
+    Retry,
+}
+
+/// Convert trusted current membership into an idempotent subscription action.
+///
+/// `outer_tracks_channel` is deliberately non-authoritative. The main/setup
+/// loop can retain a stale channel id after a relay CLOSED already removed the
+/// real background WebSocket subscription. A verified `Member` must therefore
+/// always enqueue an ensure-subscribe command, including when the outer set is
+/// still `true`.
+pub(crate) fn membership_subscription_decision(
+    current: CurrentMembershipState,
+    outer_tracks_channel: bool,
+) -> MembershipSubscriptionDecision {
+    match (current, outer_tracks_channel) {
+        (CurrentMembershipState::Member, _) => MembershipSubscriptionDecision::EnsureSubscribed,
+        (CurrentMembershipState::NonMember, _) => {
+            MembershipSubscriptionDecision::EnsureUnsubscribed
+        }
+        (CurrentMembershipState::Unknown, _) => MembershipSubscriptionDecision::Retry,
+    }
+}
+
+const MEMBERSHIP_TRIGGER_GENERATION_LIMIT: usize = 1_000;
+const MEMBERSHIP_TRIGGER_MAX_REPLAYS: u8 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipRetryDisposition {
+    ScheduleReplay,
+    Consume,
+}
+
+/// Terminal action after a membership trigger's bounded current-head retries.
+///
+/// A relay-authenticated REMOVE must fail closed because a legitimately
+/// removed user may no longer be allowed to read the channel-scoped 39002
+/// proof. ADD remains fail closed in the other direction: it cannot grant a
+/// subscription without a current membership proof, and a later distinct ADD
+/// or reconciliation notification remains processable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipRetryAction {
+    ScheduleReplay,
+    EnsureUnsubscribed,
+    Consume,
+}
+
+pub(crate) fn membership_retry_action(
+    trigger_kind: u32,
+    disposition: MembershipRetryDisposition,
+) -> MembershipRetryAction {
+    match (trigger_kind, disposition) {
+        (_, MembershipRetryDisposition::ScheduleReplay) => MembershipRetryAction::ScheduleReplay,
+        (KIND_MEMBER_REMOVED_NOTIFICATION, MembershipRetryDisposition::Consume) => {
+            MembershipRetryAction::EnsureUnsubscribed
+        }
+        (_, MembershipRetryDisposition::Consume) => MembershipRetryAction::Consume,
+    }
+}
+
+/// Bounded main-loop dedup and retry accounting for membership triggers.
+///
+/// The background subscription has its own dedup. This tracker prevents a
+/// legitimate removal that cannot read channel-scoped 39002 from creating an
+/// endless inclusive replay loop. Fresh re-add and repair notifications have
+/// distinct event IDs and remain processable.
+#[derive(Debug, Default)]
+pub(crate) struct MembershipTriggerTracker {
+    seen_current: HashSet<String>,
+    seen_previous: HashSet<String>,
+    retry_counts: HashMap<String, u8>,
+}
+
+impl MembershipTriggerTracker {
+    pub(crate) fn accept(&mut self, event_id: &str) -> bool {
+        if self.seen_current.contains(event_id) || self.seen_previous.contains(event_id) {
+            return false;
+        }
+        self.seen_current.insert(event_id.to_string());
+        if self.seen_current.len() >= MEMBERSHIP_TRIGGER_GENERATION_LIMIT {
+            self.seen_previous = std::mem::take(&mut self.seen_current);
+        }
+        true
+    }
+
+    pub(crate) fn retry_or_consume(&mut self, event_id: &str) -> MembershipRetryDisposition {
+        if !self.retry_counts.contains_key(event_id)
+            && self.retry_counts.len() >= MEMBERSHIP_TRIGGER_GENERATION_LIMIT
+        {
+            return MembershipRetryDisposition::Consume;
+        }
+        let retries = self.retry_counts.entry(event_id.to_string()).or_default();
+        if *retries < MEMBERSHIP_TRIGGER_MAX_REPLAYS {
+            *retries += 1;
+            self.seen_current.remove(event_id);
+            self.seen_previous.remove(event_id);
+            MembershipRetryDisposition::ScheduleReplay
+        } else {
+            self.retry_counts.remove(event_id);
+            MembershipRetryDisposition::Consume
         }
     }
-    if declared_type == Some("dm") || is_hidden {
-        "dm".to_string()
-    } else if declared_type == Some("private") || is_private {
-        "private".to_string()
-    } else {
-        "stream".to_string()
+
+    pub(crate) fn resolved(&mut self, event_id: &str) {
+        self.retry_counts.remove(event_id);
     }
+}
+
+fn current_verified_membership_state(
+    candidate: Uuid,
+    current_events: &serde_json::Value,
+    target: &nostr::PublicKey,
+    trusted_relay_pubkey: &nostr::PublicKey,
+) -> CurrentMembershipState {
+    let Some(events) = current_events.as_array() else {
+        return CurrentMembershipState::Unknown;
+    };
+    let d = candidate.to_string();
+    let head = events
+        .iter()
+        .filter_map(|value| serde_json::from_value::<Event>(value.clone()).ok())
+        .filter(|event| {
+            event.pubkey == *trusted_relay_pubkey
+                && event.kind.as_u16() as u32 == buzz_core::kind::KIND_NIP29_GROUP_MEMBERS
+                && event_coordinate_d(event) == Some(d.as_str())
+        })
+        .min_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
+        });
+    let Some(head) = head else {
+        return CurrentMembershipState::Unknown;
+    };
+    let Ok(snapshot) = buzz_core::dm::verify_relay_group_members(&head, trusted_relay_pubkey)
+    else {
+        return CurrentMembershipState::Unknown;
+    };
+    if snapshot.channel_id != candidate {
+        return CurrentMembershipState::Unknown;
+    }
+    let target_hex = target.to_hex();
+    if snapshot
+        .roles
+        .iter()
+        .filter(|entry| entry.pubkey == target_hex)
+        .count()
+        == 1
+    {
+        CurrentMembershipState::Member
+    } else {
+        CurrentMembershipState::NonMember
+    }
+}
+
+/// Select the canonical NIP-33 head for every candidate coordinate and then
+/// verify it. Selecting before signature/tag validation is deliberate: a newer
+/// malformed relay-key event must fail the coordinate closed instead of making
+/// an older, formerly valid membership snapshot authoritative again.
+fn current_verified_membership_ids(
+    candidate_ids: &[Uuid],
+    current_events: &serde_json::Value,
+    target: &nostr::PublicKey,
+    trusted_relay_pubkey: &nostr::PublicKey,
+) -> Vec<Uuid> {
+    let mut authoritative = Vec::new();
+
+    for candidate in candidate_ids {
+        if current_verified_membership_state(
+            *candidate,
+            current_events,
+            target,
+            trusted_relay_pubkey,
+        ) == CurrentMembershipState::Member
+        {
+            authoritative.push(*candidate);
+        }
+    }
+
+    authoritative.sort_unstable();
+    authoritative.dedup();
+    authoritative
 }
 
 /// Build the discovered-channel subscribe set from the membership UUIDs and the
@@ -166,58 +455,21 @@ pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
 /// re-form the reconnect loop. Dropping them here is the defense-in-depth
 /// backstop to the relay-side live-subscription eviction — it covers a client
 /// that was offline when the channel was reaped and so missed the CLOSED.
-/// A channel with no metadata event is preserved as `unknown`; security
-/// consumers must lazy-resolve it or fail closed rather than assuming stream.
+/// Missing, malformed, stale-shadowed, or wrong-signer metadata fails closed:
+/// the channel is omitted from the cold-start subscription set.
 pub(crate) fn merge_discovered_channels(
     channel_uuids: Vec<Uuid>,
     meta_events: &serde_json::Value,
+    trusted_relay_pubkey: Option<&nostr::PublicKey>,
 ) -> HashMap<Uuid, ChannelInfo> {
-    let mut meta_map: HashMap<Uuid, (String, String)> = HashMap::new();
-    let mut archived: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    if let Some(arr) = meta_events.as_array() {
-        for ev in arr {
-            let tags = match ev.get("tags").and_then(|t| t.as_array()) {
-                Some(t) => t,
-                None => continue,
-            };
-            let mut d_val = None;
-            let mut name = None;
-            let mut is_archived = false;
-            for tag in tags {
-                if let Some(arr) = tag.as_array() {
-                    match arr.first().and_then(|v| v.as_str()) {
-                        Some("d") => d_val = arr.get(1).and_then(|v| v.as_str()),
-                        Some("name") => name = arr.get(1).and_then(|v| v.as_str()),
-                        Some("archived") => {
-                            is_archived = arr.get(1).and_then(|v| v.as_str()) == Some("true")
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let Some(d) = d_val {
-                if let Ok(uuid) = d.parse::<Uuid>() {
-                    if is_archived {
-                        archived.insert(uuid);
-                        continue;
-                    }
-                    let ch_name = name.unwrap_or("unknown").to_string();
-                    let ch_type = channel_type_from_tags(tags);
-                    meta_map.insert(uuid, (ch_name, ch_type));
-                }
-            }
-        }
-    }
-
+    let Some(trusted_relay_pubkey) = trusted_relay_pubkey else {
+        return HashMap::new();
+    };
     let mut map = HashMap::with_capacity(channel_uuids.len());
     for uuid in channel_uuids {
-        if archived.contains(&uuid) {
-            continue;
+        if let Some(info) = current_verified_channel_info(uuid, meta_events, trusted_relay_pubkey) {
+            map.insert(uuid, info);
         }
-        let (name, channel_type) = meta_map
-            .remove(&uuid)
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-        map.insert(uuid, ChannelInfo { name, channel_type });
     }
     map
 }
@@ -405,6 +657,39 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// Re-read one signer-pinned current kind:39002 coordinate.
+    ///
+    /// Live 44100/44101 events are notification triggers only; this method is
+    /// the authoritative add/remove decision and makes stale replay harmless.
+    pub(crate) async fn current_channel_membership(
+        &self,
+        channel_id: Uuid,
+        target: &nostr::PublicKey,
+        trusted_relay_pubkey: &nostr::PublicKey,
+    ) -> Result<CurrentMembershipState, RelayError> {
+        use nostr::{Alphabet, SingleLetterTag};
+
+        let filter = nostr::Filter::new()
+            .kind(Kind::Custom(
+                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+            ))
+            .author(*trusted_relay_pubkey)
+            .custom_tags(
+                SingleLetterTag::lowercase(Alphabet::D),
+                [channel_id.to_string()],
+            );
+        let events = self.query(&[filter]).await?;
+        events.as_array().ok_or_else(|| {
+            RelayError::Http("expected JSON array from /query (current members)".into())
+        })?;
+        Ok(current_verified_membership_state(
+            channel_id,
+            &events,
+            target,
+            trusted_relay_pubkey,
+        ))
+    }
+
     /// Count events via the HTTP bridge: `POST /count` with NIP-98 auth.
     ///
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
@@ -434,6 +719,69 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+}
+
+fn parse_nip11_relay_pubkey(value: &Value) -> Option<nostr::PublicKey> {
+    value
+        .get("self")
+        .and_then(Value::as_str)
+        .and_then(|value| nostr::PublicKey::from_hex(value).ok())
+}
+
+async fn fetch_relay_signing_pubkey(
+    http: &reqwest::Client,
+    relay_url: &str,
+) -> Option<nostr::PublicKey> {
+    let url = format!("{}/", relay_ws_to_http(relay_url));
+    let response = match http
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/nostr+json")
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            warn!(status = %response.status(), "NIP-11 relay identity lookup failed");
+            return None;
+        }
+        Err(error) => {
+            warn!(%error, "NIP-11 relay identity lookup failed");
+            return None;
+        }
+    };
+    let value = match response.json::<Value>().await {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "NIP-11 relay identity response was invalid");
+            return None;
+        }
+    };
+    let relay_pubkey = parse_nip11_relay_pubkey(&value);
+    if relay_pubkey.is_none() {
+        warn!("NIP-11 response omitted a valid relay signing identity");
+    }
+    relay_pubkey
+}
+
+const NIP11_IDENTITY_ATTEMPTS: usize = 3;
+const NIP11_IDENTITY_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+async fn retry_nip11_relay_identity<Lookup, LookupFuture>(
+    mut lookup: Lookup,
+) -> Option<nostr::PublicKey>
+where
+    Lookup: FnMut() -> LookupFuture,
+    LookupFuture: std::future::Future<Output = Option<nostr::PublicKey>>,
+{
+    for attempt in 0..NIP11_IDENTITY_ATTEMPTS {
+        if let Some(pubkey) = lookup().await {
+            return Some(pubkey);
+        }
+        if attempt + 1 < NIP11_IDENTITY_ATTEMPTS {
+            tokio::time::sleep(NIP11_IDENTITY_RETRY_DELAY).await;
+        }
+    }
+    None
 }
 
 /// Events the harness cares about.
@@ -559,6 +907,10 @@ pub struct HarnessRelay {
     keys: Keys,
     /// Optional NIP-OA auth tag for relay membership delegation.
     auth_tag: Option<nostr::Tag>,
+    /// Relay signing identity advertised by NIP-11 `self`.
+    ///
+    /// `None` fails closed for relay-attributed workflow authorization.
+    relay_pubkey: Option<nostr::PublicKey>,
     /// Handle to the background task (for clean shutdown).
     /// Wrapped in `Option` so `shutdown()` can take ownership without conflicting
     /// with `Drop` (which only has `&mut self`).
@@ -602,6 +954,42 @@ impl RelayEventPublisher {
 }
 
 impl HarnessRelay {
+    /// Test-only control pair that records queued channel unsubscriptions.
+    #[cfg(test)]
+    pub(crate) fn test_unsubscribe_pair() -> (Self, mpsc::Receiver<Uuid>) {
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (unsubscribe_tx, unsubscribe_rx) = mpsc::channel(8);
+        let bg_handle = tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                match command {
+                    RelayCommand::Unsubscribe { channel_id } => {
+                        match unsubscribe_tx.send(channel_id).await {
+                            Ok(()) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    RelayCommand::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+        (
+            Self {
+                event_rx,
+                observer_control_rx: None,
+                cmd_tx,
+                http: reqwest::Client::new(),
+                relay_url: "ws://localhost:3000".to_string(),
+                keys: Keys::generate(),
+                auth_tag: None,
+                relay_pubkey: None,
+                bg_handle: Some(bg_handle),
+            },
+            unsubscribe_rx,
+        )
+    }
+
     /// Connect to relay and authenticate via NIP-42.
     ///
     /// `auth_tag` is an optional NIP-OA owner attestation included in the AUTH
@@ -620,6 +1008,22 @@ impl HarnessRelay {
         let (ws, handshake_buffer) =
             retry_initial_connect(|| do_connect(relay_url, keys, auth_tag.as_ref())).await?;
 
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| RelayError::Http(format!("failed to build HTTP client: {e}")))?;
+        let relay_pubkey = retry_nip11_relay_identity(|| {
+            fetch_relay_signing_pubkey(&http, relay_url)
+        })
+        .await
+        .ok_or_else(|| {
+            RelayError::Http(
+                "NIP-11 relay identity unavailable after bounded retries; refusing untrusted connection"
+                    .to_string(),
+            )
+        })?;
+
         let (event_tx, event_rx) = mpsc::channel::<Option<BuzzEvent>>(event_channel_capacity());
         let (observer_control_tx, observer_control_rx) =
             mpsc::channel::<Event>(event_channel_capacity());
@@ -629,6 +1033,7 @@ impl HarnessRelay {
         let bg_relay_url = relay_url.to_string();
         let bg_agent_pubkey_hex = agent_pubkey_hex.to_string();
         let bg_auth_tag = auth_tag.clone();
+        let bg_relay_pubkey = relay_pubkey;
 
         let bg_handle = tokio::spawn(async move {
             run_background_task(
@@ -641,6 +1046,7 @@ impl HarnessRelay {
                 bg_relay_url,
                 bg_agent_pubkey_hex,
                 bg_auth_tag,
+                bg_relay_pubkey,
             )
             .await;
         });
@@ -649,16 +1055,21 @@ impl HarnessRelay {
             event_rx,
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| RelayError::Http(format!("failed to build HTTP client: {e}")))?,
+            http,
             relay_url: relay_url.to_string(),
             keys: keys.clone(),
             auth_tag,
+            relay_pubkey: Some(relay_pubkey),
             bg_handle: Some(bg_handle),
         })
+    }
+
+    /// Return the relay signing identity advertised by NIP-11.
+    ///
+    /// The harness uses this only to authenticate relay-signed workflow
+    /// attribution. Missing or invalid NIP-11 metadata fails closed.
+    pub fn relay_signing_pubkey(&self) -> Option<&nostr::PublicKey> {
+        self.relay_pubkey.as_ref()
     }
 
     /// Discover channels the agent is a member of.
@@ -670,7 +1081,13 @@ impl HarnessRelay {
         use nostr::{Alphabet, SingleLetterTag};
 
         let rest = self.rest_client();
-        let pk_hex = self.keys.public_key().to_hex();
+        let agent_pubkey = self.keys.public_key();
+        let pk_hex = agent_pubkey.to_hex();
+        let trusted_relay_pubkey = self.relay_pubkey.as_ref().ok_or_else(|| {
+            RelayError::AuthFailed(
+                "NIP-11 relay identity is required for channel discovery".to_string(),
+            )
+        })?;
 
         // Step 1: Find all channels where agent is a member (kind:39002 with #p tag).
         let p_tag = SingleLetterTag::lowercase(Alphabet::P);
@@ -681,45 +1098,56 @@ impl HarnessRelay {
             .custom_tags(p_tag, [pk_hex.as_str()]);
         let member_events = rest.query(&[member_filter]).await?;
 
-        let member_arr = member_events
+        member_events
             .as_array()
             .ok_or_else(|| RelayError::Http("expected JSON array from /query (members)".into()))?;
+        let candidate_uuids =
+            verified_membership_candidate_ids(&member_events, &agent_pubkey, trusted_relay_pubkey);
 
-        // Extract channel UUIDs from #d tags.
-        let mut channel_uuids: Vec<Uuid> = Vec::new();
-        for ev in member_arr {
-            if let Some(tags) = ev.get("tags").and_then(|t| t.as_array()) {
-                for tag in tags {
-                    if let Some(arr) = tag.as_array() {
-                        if arr.first().and_then(|v| v.as_str()) == Some("d") {
-                            if let Some(d_val) = arr.get(1).and_then(|v| v.as_str()) {
-                                if let Ok(uuid) = d_val.parse::<Uuid>() {
-                                    channel_uuids.push(uuid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if channel_uuids.is_empty() {
+        if candidate_uuids.is_empty() {
             debug!("discovered 0 channel(s)");
             return Ok(HashMap::new());
         }
 
-        // Step 2: Fetch metadata (kind:39000) for discovered channels.
+        // Step 2: Re-read every candidate coordinate without `#p`, pinned to
+        // the NIP-11 relay identity. This prevents a stale historical snapshot
+        // that still names the agent from granting current membership.
         let d_tag = SingleLetterTag::lowercase(Alphabet::D);
-        let d_values: Vec<String> = channel_uuids.iter().map(|u| u.to_string()).collect();
+        let d_values: Vec<String> = candidate_uuids.iter().map(Uuid::to_string).collect();
+        let current_member_filter = nostr::Filter::new()
+            .kind(Kind::Custom(
+                buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
+            ))
+            .author(*trusted_relay_pubkey)
+            .custom_tags(d_tag, d_values.clone());
+        let current_member_events = rest.query(&[current_member_filter]).await?;
+        current_member_events.as_array().ok_or_else(|| {
+            RelayError::Http("expected JSON array from /query (current members)".into())
+        })?;
+        let channel_uuids = current_verified_membership_ids(
+            &candidate_uuids,
+            &current_member_events,
+            &agent_pubkey,
+            trusted_relay_pubkey,
+        );
+        if channel_uuids.is_empty() {
+            debug!("discovered 0 current channel(s)");
+            return Ok(HashMap::new());
+        }
+
+        // Step 3: Fetch metadata (kind:39000) for current memberships.
+        let d_values: Vec<String> = channel_uuids.iter().map(Uuid::to_string).collect();
         let meta_filter = nostr::Filter::new()
             .kind(Kind::Custom(
                 buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16,
             ))
+            .author(*trusted_relay_pubkey)
             .custom_tags(d_tag, d_values);
         let meta_events = rest.query(&[meta_filter]).await?;
 
-        // Step 3: Build the final subscribe set, skipping archived channels.
-        let map = merge_discovered_channels(channel_uuids, &meta_events);
+        // Step 4: Build the final subscribe set, skipping archived channels.
+        let map =
+            merge_discovered_channels(channel_uuids, &meta_events, self.relay_pubkey.as_ref());
 
         debug!("discovered {} channel(s)", map.len());
         Ok(map)
@@ -784,6 +1212,17 @@ impl HarnessRelay {
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
         Ok(())
+    }
+
+    /// Schedule a membership-notification replay after a failed/unknown
+    /// authoritative membership lookup. The explicit subscribe command clears
+    /// only membership-trigger dedup and reuses the existing replay watermark.
+    pub fn schedule_membership_recheck(&self, delay: Duration) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = cmd_tx.send(RelayCommand::SubscribeMembership).await;
+        });
     }
 
     /// Subscribe to encrypted observer control frames addressed to this agent.
@@ -987,12 +1426,18 @@ impl TwoGenDedup {
 
 /// State maintained by the background WebSocket task.
 struct BgState {
+    /// Relay signing identity fetched from mandatory NIP-11 metadata.
+    trusted_relay_pubkey: Option<nostr::PublicKey>,
     /// Active subscriptions: channel_id → subscription_id string.
     active_subscriptions: HashMap<Uuid, String>,
     /// Most recent `created_at` timestamp seen per channel (for `since` filter).
     last_seen: HashMap<Uuid, u64>,
     /// Two-generation dedup set of event IDs seen.
     seen_ids: TwoGenDedup,
+    /// Membership-notification dedup, separate so a failed authoritative
+    /// recheck can deliberately replay its trigger without forgetting channel
+    /// events.
+    membership_seen_ids: TwoGenDedup,
     /// Per-channel filter used on subscribe (for resubscribe after reconnect).
     active_filters: HashMap<Uuid, ChannelFilter>,
     /// Oldest timestamp of a membership notification that was dropped due to
@@ -1075,9 +1520,11 @@ struct BgState {
 impl BgState {
     fn new() -> Self {
         Self {
+            trusted_relay_pubkey: None,
             active_subscriptions: HashMap::new(),
             last_seen: HashMap::new(),
             seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
+            membership_seen_ids: TwoGenDedup::new(SEEN_ID_LIMIT),
             active_filters: HashMap::new(),
             membership_dropped_since: None,
             membership_last_seen: None,
@@ -1280,6 +1727,7 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
+            state.membership_seen_ids = TwoGenDedup::new(SEEN_ID_LIMIT);
         }
         RelayCommand::SubscribeObserverControls => {
             state.observer_control_sub_active = true;
@@ -1441,6 +1889,7 @@ async fn execute_connected_command(
         }
         RelayCommand::SubscribeMembership => {
             state.membership_sub_active = true;
+            state.membership_seen_ids = TwoGenDedup::new(SEEN_ID_LIMIT);
             if state.check_rate_gate().is_some() {
                 debug!("rate-gated: deferring membership subscription");
                 state.membership_resub_needed = true;
@@ -1554,8 +2003,10 @@ async fn run_background_task(
     relay_url: String,
     agent_pubkey_hex: String,
     auth_tag: Option<nostr::Tag>,
+    trusted_relay_pubkey: nostr::PublicKey,
 ) {
     let mut state = BgState::new();
+    state.trusted_relay_pubkey = Some(trusted_relay_pubkey);
 
     let handshake_ok = process_handshake_buffer(
         &mut ws,
@@ -2088,14 +2539,25 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if subscription_id == MEMBERSHIP_NOTIF_SUB_ID {
-                        // Membership notification — extract channel UUID from h tag.
-                        let channel_uuid = match extract_h_tag_uuid(&event) {
-                            Some(uuid) => uuid,
-                            None => {
-                                warn!("membership notification missing h tag — dropping");
+                        // Membership notifications are untrusted triggers until
+                        // their id/signature, NIP-11 signer, exact kind, target,
+                        // channel coordinate, and content all verify.
+                        let Some(trusted_relay_pubkey) = state.trusted_relay_pubkey.as_ref() else {
+                            warn!("membership notification received without a trusted NIP-11 relay identity; dropping");
+                            return true;
+                        };
+                        let verified = match buzz_core::dm::verify_relay_membership_notification(
+                            &event,
+                            trusted_relay_pubkey,
+                            &keys.public_key(),
+                        ) {
+                            Ok(verified) => verified,
+                            Err(error) => {
+                                warn!(%error, "untrusted membership notification; dropping");
                                 return true;
                             }
                         };
+                        let channel_uuid = verified.channel_id;
                         // Dedup membership notifications through TwoGenDedup.
                         // We use seen_ids directly instead of record_event()
                         // because record_event() also updates last_seen, which
@@ -2103,7 +2565,7 @@ async fn handle_ws_message(
                         // membership-event timestamps and cause channel event
                         // loss on reconnect.
                         let event_id_hex = event.id.to_hex();
-                        if !state.seen_ids.insert(event_id_hex.clone()) {
+                        if !state.membership_seen_ids.insert(event_id_hex.clone()) {
                             debug!(
                                 channel_id = %channel_uuid,
                                 event_id = %event_id_hex,
@@ -2134,7 +2596,7 @@ async fn handle_ws_message(
                                 // Remove from dedup so reconnect replay can
                                 // re-deliver this event (it was never forwarded
                                 // to the harness).
-                                state.seen_ids.remove(&event_id_hex);
+                                state.membership_seen_ids.remove(&event_id_hex);
                                 // Track the oldest dropped timestamp so reconnect
                                 // replay starts early enough to re-deliver it.
                                 state.membership_dropped_since =
@@ -3427,18 +3889,6 @@ async fn dns_flat_sleep(
     }
 }
 
-/// Extract a channel UUID from the h tag of a Nostr event.
-fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
-    event.tags.iter().find_map(|tag| {
-        let tag_vec = tag.as_slice();
-        if tag_vec.len() >= 2 && tag_vec[0] == "h" {
-            tag_vec[1].parse::<Uuid>().ok()
-        } else {
-            None
-        }
-    })
-}
-
 /// Build and send a NIP-42 AUTH response event.
 ///
 /// If `auth_tag` is provided (NIP-OA owner attestation), it is included in the
@@ -4009,6 +4459,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_valid_nip11_relay_identity() {
+        let relay = nostr::Keys::generate();
+        let value = serde_json::json!({ "self": relay.public_key().to_hex() });
+
+        assert_eq!(parse_nip11_relay_pubkey(&value), Some(relay.public_key()));
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_nip11_relay_identity() {
+        assert!(parse_nip11_relay_pubkey(&serde_json::json!({})).is_none());
+        assert!(parse_nip11_relay_pubkey(&serde_json::json!({ "self": "not-a-pubkey" })).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nip11_identity_lookup_retries_boundedly_and_recovers() {
+        let relay = nostr::Keys::generate().public_key();
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_for_lookup = std::sync::Arc::clone(&attempts);
+        let resolved = retry_nip11_relay_identity(move || {
+            let current = attempts_for_lookup.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { (current == 2).then_some(relay) }
+        })
+        .await;
+
+        assert_eq!(resolved, Some(relay));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let exhausted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exhausted_for_lookup = std::sync::Arc::clone(&exhausted);
+        assert!(retry_nip11_relay_identity(move || {
+            exhausted_for_lookup.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { None }
+        })
+        .await
+        .is_none());
+        assert_eq!(
+            exhausted.load(std::sync::atomic::Ordering::SeqCst),
+            NIP11_IDENTITY_ATTEMPTS
+        );
+    }
+
+    #[test]
     fn relay_ws_to_http_plain() {
         assert_eq!(
             relay_ws_to_http("ws://localhost:3000"),
@@ -4080,47 +4572,395 @@ mod tests {
         assert!(channel_id_from_sub_id("").is_none());
     }
 
-    fn meta_event(uuid: Uuid, name: &str, extra: &[&str]) -> serde_json::Value {
+    fn regular_meta_event(
+        keys: &nostr::Keys,
+        uuid: Uuid,
+        name: &str,
+        archived: Option<&str>,
+    ) -> serde_json::Value {
         let mut tags = vec![
-            serde_json::json!(["d", uuid.to_string()]),
-            serde_json::json!(["name", name]),
+            Tag::parse(["d", &uuid.to_string()]).unwrap(),
+            Tag::parse(["name", name]).unwrap(),
+            Tag::parse(["public"]).unwrap(),
+            Tag::parse(["closed"]).unwrap(),
+            Tag::parse(["t", "stream"]).unwrap(),
         ];
-        // `extra` is a flat list of single-value tag names (e.g. archived=true).
-        for pair in extra.chunks(2) {
-            match pair {
-                [k, v] => tags.push(serde_json::json!([k, v])),
-                [k] => tags.push(serde_json::json!([k])),
-                _ => {}
-            }
+        if let Some(value) = archived {
+            tags.push(Tag::parse(["archived", value]).unwrap());
         }
-        serde_json::json!({ "tags": tags })
+        serde_json::to_value(
+            EventBuilder::new(Kind::Custom(39000), "")
+                .tags(tags)
+                .sign_with_keys(keys)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn dm_meta_event(keys: &nostr::Keys, uuid: Uuid) -> serde_json::Value {
+        let mut participants = [
+            nostr::Keys::generate().public_key(),
+            nostr::Keys::generate().public_key(),
+        ];
+        participants.sort_by_key(nostr::PublicKey::to_hex);
+        let bytes = participants
+            .iter()
+            .map(|participant| participant.to_bytes())
+            .collect::<Vec<_>>();
+        let commitment = buzz_core::dm::dm_participant_commitment_hex(&bytes).unwrap();
+        let mut tags = vec![
+            Tag::parse(["d", &uuid.to_string()]).unwrap(),
+            Tag::parse(["name", "dm"]).unwrap(),
+            Tag::parse(["private"]).unwrap(),
+            Tag::parse(["closed"]).unwrap(),
+            Tag::parse(["hidden"]).unwrap(),
+            Tag::parse(["t", "dm"]).unwrap(),
+        ];
+        tags.extend(
+            participants
+                .iter()
+                .map(|participant| Tag::parse(["p", &participant.to_hex()]).unwrap()),
+        );
+        tags.push(
+            Tag::parse([
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_TAG,
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_VERSION,
+                &commitment,
+            ])
+            .unwrap(),
+        );
+        serde_json::to_value(
+            EventBuilder::new(Kind::Custom(39000), "")
+                .tags(tags)
+                .sign_with_keys(keys)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn member_snapshot_event(
+        keys: &nostr::Keys,
+        uuid: Uuid,
+        members: &[(String, &str)],
+        timestamp: u64,
+    ) -> Event {
+        let mut tags = vec![Tag::parse(["d", &uuid.to_string()]).unwrap()];
+        tags.extend(
+            members
+                .iter()
+                .map(|(pubkey, role)| Tag::parse(["p", pubkey.as_str(), "", *role]).unwrap()),
+        );
+        EventBuilder::new(Kind::Custom(39002), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(timestamp))
+            .sign_with_keys(keys)
+            .unwrap()
     }
 
     #[test]
-    fn merge_discovered_channels_preserves_missing_metadata_as_unknown() {
-        let channel = Uuid::new_v4();
-        let map = merge_discovered_channels(vec![channel], &serde_json::json!([]));
-        assert_eq!(map[&channel].channel_type, "unknown");
+    fn membership_discovery_rejects_forged_invalid_or_stale_snapshots() {
+        let relay = nostr::Keys::generate();
+        let wrong_signer = nostr::Keys::generate();
+        let target = nostr::Keys::generate().public_key();
+        let other = nostr::Keys::generate().public_key();
+        let target_hex = target.to_hex();
+        let other_hex = other.to_hex();
+        let accepted = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let malformed_head = Uuid::new_v4();
+        let missing_head = Uuid::new_v4();
+        let forged = Uuid::new_v4();
+
+        let accepted_old =
+            member_snapshot_event(&relay, accepted, &[(target_hex.clone(), "member")], 100);
+        let stale_old =
+            member_snapshot_event(&relay, stale, &[(target_hex.clone(), "member")], 100);
+        let malformed_old = member_snapshot_event(
+            &relay,
+            malformed_head,
+            &[(target_hex.clone(), "member")],
+            100,
+        );
+        let missing =
+            member_snapshot_event(&relay, missing_head, &[(target_hex.clone(), "member")], 100);
+        let forged_event = member_snapshot_event(
+            &wrong_signer,
+            forged,
+            &[(target_hex.clone(), "member")],
+            100,
+        );
+        let mut tampered_candidate = member_snapshot_event(
+            &relay,
+            Uuid::new_v4(),
+            &[(target_hex.clone(), "member")],
+            100,
+        );
+        tampered_candidate.content = "tampered".to_string();
+
+        let candidate_response = serde_json::json!([
+            accepted_old,
+            stale_old,
+            malformed_old,
+            missing,
+            forged_event,
+            tampered_candidate,
+        ]);
+        let candidates =
+            verified_membership_candidate_ids(&candidate_response, &target, &relay.public_key());
+        assert_eq!(
+            candidates.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([accepted, stale, malformed_head, missing_head]),
+            "wrong-signer and invalid-signature candidate events must be ignored"
+        );
+
+        let accepted_current =
+            member_snapshot_event(&relay, accepted, &[(target_hex.clone(), "member")], 200);
+        let stale_current =
+            member_snapshot_event(&relay, stale, &[(other_hex.clone(), "member")], 200);
+        let malformed_valid_old = member_snapshot_event(
+            &relay,
+            malformed_head,
+            &[(target_hex.clone(), "member")],
+            150,
+        );
+        let malformed_current = EventBuilder::new(Kind::Custom(39002), "")
+            .tags(vec![
+                Tag::parse(["d", &malformed_head.to_string(), "extra"]).unwrap(),
+                Tag::parse(["p", &target_hex, "", "member"]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(200))
+            .sign_with_keys(&relay)
+            .unwrap();
+
+        let current_response = serde_json::json!([
+            accepted_current,
+            stale_current,
+            malformed_valid_old,
+            malformed_current,
+        ]);
+        assert_eq!(
+            current_verified_membership_ids(
+                &candidates,
+                &current_response,
+                &target,
+                &relay.public_key(),
+            ),
+            vec![accepted],
+            "only a valid current relay-signed head that still contains the target is authoritative"
+        );
     }
 
     #[test]
-    fn merge_discovered_channels_uses_declared_dm_type_without_hidden_hint() {
+    fn current_membership_state_is_tri_state_and_stale_notification_safe() {
+        let relay = nostr::Keys::generate();
+        let target = nostr::Keys::generate().public_key();
+        let other = nostr::Keys::generate().public_key();
         let channel = Uuid::new_v4();
-        let meta = serde_json::json!([meta_event(channel, "dm", &["t", "dm"])]);
-        let map = merge_discovered_channels(vec![channel], &meta);
+        let member_head = member_snapshot_event(&relay, channel, &[(target.to_hex(), "bot")], 100);
+        assert_eq!(
+            current_verified_membership_state(
+                channel,
+                &serde_json::json!([member_head]),
+                &target,
+                &relay.public_key(),
+            ),
+            CurrentMembershipState::Member
+        );
+
+        let removed_head =
+            member_snapshot_event(&relay, channel, &[(other.to_hex(), "member")], 200);
+        assert_eq!(
+            current_verified_membership_state(
+                channel,
+                &serde_json::json!([removed_head]),
+                &target,
+                &relay.public_key(),
+            ),
+            CurrentMembershipState::NonMember,
+            "a stale valid add trigger cannot override the current removal head"
+        );
+        assert_eq!(
+            current_verified_membership_state(
+                channel,
+                &serde_json::json!([]),
+                &target,
+                &relay.public_key(),
+            ),
+            CurrentMembershipState::Unknown,
+            "missing state must not be conflated with a verified removal"
+        );
+    }
+
+    #[test]
+    fn verified_member_requires_ensure_subscribe_despite_stale_outer_tracking() {
+        assert_eq!(
+            membership_subscription_decision(CurrentMembershipState::Member, true),
+            MembershipSubscriptionDecision::EnsureSubscribed,
+            "outer tracking cannot suppress the command that repairs a CLOSED-dropped WS subscription"
+        );
+        assert_eq!(
+            membership_subscription_decision(CurrentMembershipState::Member, false),
+            MembershipSubscriptionDecision::EnsureSubscribed
+        );
+        assert_eq!(
+            membership_subscription_decision(CurrentMembershipState::Unknown, true),
+            MembershipSubscriptionDecision::Retry
+        );
+    }
+
+    #[test]
+    fn membership_unknown_retry_is_bounded_and_distinct_readd_remains_processable() {
+        let mut tracker = MembershipTriggerTracker::default();
+        let removed = "removed-event";
+        for _ in 0..MEMBERSHIP_TRIGGER_MAX_REPLAYS {
+            assert!(tracker.accept(removed));
+            assert_eq!(
+                tracker.retry_or_consume(removed),
+                MembershipRetryDisposition::ScheduleReplay
+            );
+        }
+        assert!(tracker.accept(removed));
+        assert_eq!(
+            tracker.retry_or_consume(removed),
+            MembershipRetryDisposition::Consume,
+            "Unknown must be consumed after the bounded replay budget"
+        );
+        assert!(
+            !tracker.accept(removed),
+            "an exhausted removal must remain deduplicated"
+        );
+
+        let recovered = "transient-unknown";
+        assert!(tracker.accept(recovered));
+        assert_eq!(
+            tracker.retry_or_consume(recovered),
+            MembershipRetryDisposition::ScheduleReplay
+        );
+        assert!(tracker.accept(recovered));
+        tracker.resolved(recovered);
+        assert!(!tracker.accept(recovered));
+
+        let distinct_readd = "fresh-add-event";
+        assert!(
+            tracker.accept(distinct_readd),
+            "a later distinct ADD must remain processable"
+        );
+        tracker.resolved(distinct_readd);
+    }
+
+    #[test]
+    fn exhausted_remove_fails_closed_but_add_waits_for_distinct_repair() {
+        assert_eq!(
+            membership_retry_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                MembershipRetryDisposition::ScheduleReplay,
+            ),
+            MembershipRetryAction::ScheduleReplay
+        );
+        assert_eq!(
+            membership_retry_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                MembershipRetryDisposition::Consume,
+            ),
+            MembershipRetryAction::EnsureUnsubscribed,
+            "an exhausted authenticated REMOVE must fail closed"
+        );
+        assert_eq!(
+            membership_retry_action(
+                KIND_MEMBER_ADDED_NOTIFICATION,
+                MembershipRetryDisposition::Consume,
+            ),
+            MembershipRetryAction::Consume,
+            "an exhausted ADD cannot grant a subscription without current proof"
+        );
+    }
+
+    #[test]
+    fn merge_discovered_channels_omits_missing_wrong_signer_and_malformed_metadata() {
+        let missing = Uuid::new_v4();
+        let wrong_signer_channel = Uuid::new_v4();
+        let malformed = Uuid::new_v4();
+        let relay = nostr::Keys::generate();
+        let wrong_signer = nostr::Keys::generate();
+        let mut malformed_event = regular_meta_event(&relay, malformed, "bad", None);
+        malformed_event["content"] = serde_json::json!("tampered after signing");
+        let meta = serde_json::json!([
+            regular_meta_event(&wrong_signer, wrong_signer_channel, "forged", None),
+            malformed_event,
+        ]);
+        let map = merge_discovered_channels(
+            vec![missing, wrong_signer_channel, malformed],
+            &meta,
+            Some(&relay.public_key()),
+        );
+        assert!(
+            map.is_empty(),
+            "cold-start must not subscribe channels without current verified metadata"
+        );
+    }
+
+    #[test]
+    fn merge_discovered_channels_newer_malformed_coordinate_shadows_older_valid_metadata() {
+        let channel = Uuid::new_v4();
+        let relay = nostr::Keys::generate();
+        let old = EventBuilder::new(Kind::Custom(39000), "")
+            .tags(vec![
+                Tag::parse(["d", &channel.to_string()]).unwrap(),
+                Tag::parse(["name", "old valid"]).unwrap(),
+                Tag::parse(["public"]).unwrap(),
+                Tag::parse(["closed"]).unwrap(),
+                Tag::parse(["t", "stream"]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(100))
+            .sign_with_keys(&relay)
+            .unwrap();
+        let malformed_new = EventBuilder::new(Kind::Custom(39000), "")
+            .tags(vec![
+                Tag::parse(["d", &channel.to_string(), "extra"]).unwrap(),
+                Tag::parse(["name", "new malformed"]).unwrap(),
+                Tag::parse(["public"]).unwrap(),
+                Tag::parse(["closed"]).unwrap(),
+                Tag::parse(["t", "stream"]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(200))
+            .sign_with_keys(&relay)
+            .unwrap();
+
+        let map = merge_discovered_channels(
+            vec![channel],
+            &serde_json::json!([old, malformed_new]),
+            Some(&relay.public_key()),
+        );
+        assert!(
+            map.is_empty(),
+            "a malformed newer coordinate must not expose an older valid subscription grant"
+        );
+    }
+
+    #[test]
+    fn merge_discovered_channels_accepts_only_fully_verified_dm_metadata() {
+        let relay = nostr::Keys::generate();
+        let channel = Uuid::new_v4();
+        let meta = serde_json::json!([dm_meta_event(&relay, channel)]);
+        let map = merge_discovered_channels(vec![channel], &meta, Some(&relay.public_key()));
         assert_eq!(map[&channel].channel_type, "dm");
+        assert_eq!(map[&channel].classification, ChannelClassification::Dm);
+
+        let no_nip11 = merge_discovered_channels(vec![channel], &meta, None);
+        assert!(no_nip11.is_empty());
     }
 
     #[test]
     fn merge_discovered_channels_skips_archived_metadata() {
         let live = Uuid::new_v4();
         let archived = Uuid::new_v4();
+        let relay = nostr::Keys::generate();
         let meta = serde_json::json!([
-            meta_event(live, "live", &[]),
-            meta_event(archived, "dead", &["archived", "true"]),
+            regular_meta_event(&relay, live, "live", None),
+            regular_meta_event(&relay, archived, "dead", Some("true")),
         ]);
 
-        let map = merge_discovered_channels(vec![live, archived], &meta);
+        let map = merge_discovered_channels(vec![live, archived], &meta, Some(&relay.public_key()));
 
         assert!(map.contains_key(&live), "non-archived channel is kept");
         assert!(
@@ -4139,9 +4979,10 @@ mod tests {
         // client skip re-subscribing on reconnect — proving (b) closes the loop
         // independently of the relay-side eviction.
         let reaped = Uuid::new_v4();
-        let meta = serde_json::json!([meta_event(reaped, "reaped", &["archived", "true"])]);
+        let relay = nostr::Keys::generate();
+        let meta = serde_json::json!([regular_meta_event(&relay, reaped, "reaped", Some("true"))]);
 
-        let map = merge_discovered_channels(vec![reaped], &meta);
+        let map = merge_discovered_channels(vec![reaped], &meta, Some(&relay.public_key()));
 
         assert!(
             map.is_empty(),
@@ -4150,14 +4991,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_discovered_channels_archived_false_is_kept() {
-        // An explicit archived=false (e.g. after unarchive) must NOT be skipped.
+    fn merge_discovered_channels_malformed_archived_false_is_omitted() {
         let ch = Uuid::new_v4();
-        let meta = serde_json::json!([meta_event(ch, "back", &["archived", "false"])]);
+        let relay = nostr::Keys::generate();
+        let meta = serde_json::json!([regular_meta_event(&relay, ch, "back", Some("false"))]);
 
-        let map = merge_discovered_channels(vec![ch], &meta);
+        let map = merge_discovered_channels(vec![ch], &meta, Some(&relay.public_key()));
 
-        assert!(map.contains_key(&ch), "archived=false is treated as live");
+        assert!(map.is_empty());
     }
 
     #[test]
@@ -4880,7 +5721,7 @@ mod tests {
     /// Using `record_event()` for membership notifications would update
     /// `last_seen[channel_uuid]`, causing channel resubscribe to use a
     /// membership timestamp as the `since` filter — skipping channel events.
-    /// The fix uses `seen_ids.insert()` directly.
+    /// The fix uses the dedicated membership dedup directly.
     #[test]
     fn membership_dedup_does_not_touch_last_seen() {
         let mut state = BgState::new();
@@ -4893,11 +5734,11 @@ mod tests {
         assert_eq!(state.last_seen.get(&channel_id).copied(), Some(1_000));
 
         // Simulate: a membership notification for the same channel at ts=2000.
-        // This should go through seen_ids only, NOT update last_seen.
+        // This should go through membership_seen_ids only, NOT update last_seen.
         let membership_event = make_test_event(&keys, 2_000);
         let membership_id = membership_event.id.to_hex();
         assert!(
-            state.seen_ids.insert(membership_id),
+            state.membership_seen_ids.insert(membership_id),
             "membership event should be accepted by dedup"
         );
         // last_seen must still be 1000, not 2000.
@@ -4909,7 +5750,7 @@ mod tests {
     }
 
     /// On membership backpressure (TrySendError::Full), the dedup ID must
-    /// be removed from seen_ids so reconnect replay can re-deliver the event.
+    /// be removed from membership_seen_ids so replay can re-deliver the event.
     /// Without this, a dropped membership notification would be permanently
     /// rejected as a duplicate on replay.
     #[test]
@@ -4921,17 +5762,46 @@ mod tests {
         let event_id_hex = event.id.to_hex();
 
         // Insert into dedup (simulating the pre-try_send path).
-        assert!(state.seen_ids.insert(event_id_hex.clone()));
-        assert!(state.seen_ids.contains(&event_id_hex));
+        assert!(state.membership_seen_ids.insert(event_id_hex.clone()));
+        assert!(state.membership_seen_ids.contains(&event_id_hex));
 
         // Simulate backpressure: remove the ID (matching the production code).
-        state.seen_ids.remove(&event_id_hex);
+        state.membership_seen_ids.remove(&event_id_hex);
 
         // The ID should now be accepted again on replay.
         assert!(
-            state.seen_ids.insert(event_id_hex),
+            state.membership_seen_ids.insert(event_id_hex),
             "after backpressure removal, replay must be accepted"
         );
+    }
+
+    #[test]
+    fn membership_recheck_command_reopens_trigger_dedup_without_losing_replay_floor() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let ordinary_id = "ordinary-event".to_string();
+        let membership_id = "membership-trigger".to_string();
+        assert!(state.seen_ids.insert(ordinary_id.clone()));
+        assert!(state.membership_seen_ids.insert(membership_id.clone()));
+        state.membership_last_seen = Some(4_200);
+        state.last_seen.insert(channel_id, 4_100);
+
+        apply_command_to_state(&mut state, RelayCommand::SubscribeMembership);
+
+        assert!(
+            state.seen_ids.contains(&ordinary_id),
+            "membership retry must not reopen ordinary channel-event dedup"
+        );
+        assert!(
+            !state.membership_seen_ids.contains(&membership_id),
+            "unknown/error current-head decisions must be able to replay the same trigger"
+        );
+        assert_eq!(
+            state.membership_last_seen,
+            Some(4_200),
+            "membership replay must retain its inclusive since watermark"
+        );
+        assert_eq!(state.last_seen.get(&channel_id), Some(&4_100));
     }
 
     /// Subscribe a channel via the production command path so the test exercises
@@ -4971,6 +5841,41 @@ mod tests {
             !state.active_filters.contains_key(&channel_id),
             "channel state must be cleared (Unsubscribe cleanup)"
         );
+    }
+
+    #[test]
+    fn readd_ensure_subscribe_repairs_closed_drop_despite_stale_outer_tracking() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        subscribe_channel(&mut state, channel_id);
+        let outer_tracking_still_contains_channel = true;
+
+        assert!(drop_channel_on_access_denied(
+            &mut state,
+            &channel_sub_id(channel_id),
+            "restricted: channel access revoked",
+        ));
+        assert!(outer_tracking_still_contains_channel);
+        assert!(!state.active_subscriptions.contains_key(&channel_id));
+
+        // Both normal and setup membership handlers must enqueue this
+        // idempotent ensure-subscribe for every verified current Member state;
+        // they must not use the stale outer set as an early-return guard.
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::Subscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: true,
+                },
+                replay_since: Some(2_000),
+            },
+        );
+
+        assert!(state.active_subscriptions.contains_key(&channel_id));
+        assert!(state.active_filters.contains_key(&channel_id));
+        assert_eq!(state.subscribe_since.get(&channel_id), Some(&2_000));
     }
 
     #[test]

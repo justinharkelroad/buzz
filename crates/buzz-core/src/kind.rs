@@ -816,7 +816,12 @@ pub const fn is_command_kind(kind: u32) -> bool {
 pub const fn is_relay_only_kind(kind: u32) -> bool {
     matches!(
         kind,
-        KIND_NIP43_MEMBERSHIP_LIST
+        KIND_MEMBER_ADDED_NOTIFICATION
+            | KIND_MEMBER_REMOVED_NOTIFICATION
+            | KIND_NIP29_GROUP_METADATA
+            | KIND_NIP29_GROUP_ADMINS
+            | KIND_NIP29_GROUP_MEMBERS
+            | KIND_NIP43_MEMBERSHIP_LIST
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
             | KIND_DM_VISIBILITY
@@ -896,6 +901,19 @@ mod tests {
     fn nip43_membership_snapshot_is_relay_only() {
         assert!(is_relay_only_kind(KIND_NIP43_MEMBERSHIP_LIST));
         assert!(!is_relay_only_kind(KIND_NIP43_LEAVE_REQUEST));
+    }
+
+    #[test]
+    fn nip29_relay_authored_discovery_snapshots_are_relay_only() {
+        assert!(is_relay_only_kind(KIND_MEMBER_ADDED_NOTIFICATION));
+        assert!(is_relay_only_kind(KIND_MEMBER_REMOVED_NOTIFICATION));
+        assert!(is_relay_only_kind(KIND_NIP29_GROUP_METADATA));
+        assert!(is_relay_only_kind(KIND_NIP29_GROUP_ADMINS));
+        assert!(is_relay_only_kind(KIND_NIP29_GROUP_MEMBERS));
+        assert!(
+            !is_relay_only_kind(KIND_NIP29_GROUP_ROLES),
+            "kind 39003 has no relay-authored Buzz emission contract"
+        );
     }
 
     #[test]

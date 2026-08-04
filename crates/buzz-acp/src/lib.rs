@@ -215,35 +215,85 @@ async fn is_owner_or_sibling(
     is_sibling
 }
 
+/// Channel facts used by the inbound author gate.
+///
+/// Unknown metadata fails closed as a DM without a verified 1:1 participant
+/// set. The second bit is meaningful only for DMs and is derived from the
+/// relay-authored kind:39000 participant tags, never from sender-controlled
+/// message `p` tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorGateChannel {
+    Unknown,
+    Regular,
+    Dm { exact_two_party_dm: bool },
+}
+
+impl AuthorGateChannel {
+    const fn regular() -> Self {
+        Self::Regular
+    }
+
+    const fn dm(exact_two_party_dm: bool) -> Self {
+        Self::Dm { exact_two_party_dm }
+    }
+
+    const fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    const fn is_dm(self) -> bool {
+        matches!(self, Self::Dm { .. })
+    }
+
+    const fn exact_two_party_dm(self) -> bool {
+        matches!(
+            self,
+            Self::Dm {
+                exact_two_party_dm: true
+            }
+        )
+    }
+}
+
 /// Inbound author gate decision: does this author's event fire a turn?
 ///
 /// Coarse security policy applied before subscription rules. Both `OwnerOnly`
 /// and `Allowlist` accept the owner and same-owner siblings; `Allowlist`
 /// additionally accepts the explicit external pubkey list.
 ///
-/// # DM hardening (`is_dm`)
+/// # DM hardening (`channel`)
 ///
 /// Clients auto-p-tag every DM participant, so in a DM *any* participant's
 /// message looks like a mention and would fire a turn. Combined with
 /// agent-initiated DMs (the agent can be asked to DM a third party), that
-/// turns `anyone`/`allowlist` modes into transitive access grants: whoever
-/// lands in a DM with the agent can prompt it. To close that hole, when
-/// `is_dm` is true only the owner and cryptographically verified same-owner
-/// siblings may fire a turn — the explicit allowlist and `anyone` mode do
-/// NOT apply inside DMs. `Nobody` still drops everything. Callers must
-/// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
+/// turns an unrestricted `anyone` mode into a transitive access grant: whoever
+/// lands in a DM with the agent can prompt it. To close that hole, `anyone`
+/// remains owner/sibling-only inside DMs. `Allowlist`, however, is an explicit
+/// identity grant: an exact allowlisted pubkey may fire a DM turn in addition
+/// to the owner and cryptographically verified same-owner siblings. `Nobody`
+/// still drops everything. External allowlist grants additionally require
+/// relay-authored metadata proving the DM has exactly two participants: this
+/// agent and the event author. This prevents a third participant from planting
+/// hidden prompt context or observing the delegated agent response. Callers
+/// must resolve unknown channel metadata as a non-eligible DM.
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
     author: &str,
-    is_dm: bool,
+    channel: AuthorGateChannel,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
-    if is_dm {
+    if channel != AuthorGateChannel::Regular {
         return match respond_to {
             RespondTo::Nobody => false,
-            _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            RespondTo::Allowlist => {
+                (channel.exact_two_party_dm() && allowlist.contains(author))
+                    || is_owner_or_sibling(author, owner_cache, rest_client).await
+            }
+            RespondTo::Anyone | RespondTo::OwnerOnly => {
+                is_owner_or_sibling(author, owner_cache, rest_client).await
+            }
         };
     }
     match respond_to {
@@ -257,31 +307,90 @@ async fn author_allowed(
     }
 }
 
-/// Resolve whether `channel_id` is a DM, for the inbound author gate.
+/// Resolve the sender used by the agent instruction gate.
 ///
-/// Resolution order:
-/// 1. Startup discovery metadata (`startup_info`) — covers channels known at
-///    process start.
-/// 2. Per-loop resolution cache (`cache`) — covers channels resolved since.
-/// 3. Lazy REST fetch of the channel's kind:39000 metadata — covers channels
-///    the agent was added to *after* startup (the exploit path: an
-///    agent-initiated DM is exactly such a channel).
+/// Workflow messages are signed by the relay and carry their workflow owner in
+/// the `actor` tag. Trust that attribution only when the event signer matches
+/// the relay's NIP-11 `self` identity and the event is explicitly marked as a
+/// workflow side effect. Missing or malformed metadata fails closed to the
+/// event's actual signer.
+pub(crate) fn effective_instruction_author(
+    event: &nostr::Event,
+    trusted_relay_pubkey: Option<&nostr::PublicKey>,
+) -> String {
+    let signer = event.pubkey.to_hex();
+    if trusted_relay_pubkey != Some(&event.pubkey)
+        || event.kind.as_u16() as u32 != KIND_STREAM_MESSAGE
+        || event.verify().is_err()
+    {
+        return signer;
+    }
+
+    let workflow_tags: Vec<&[String]> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("buzz:workflow"))
+        .map(nostr::Tag::as_slice)
+        .collect();
+    if workflow_tags.len() != 1
+        || workflow_tags[0].len() != 2
+        || workflow_tags[0].get(1).map(String::as_str) != Some("true")
+    {
+        return signer;
+    }
+
+    let actor_tags: Vec<&[String]> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("actor"))
+        .map(nostr::Tag::as_slice)
+        .collect();
+    if actor_tags.len() != 1 || actor_tags[0].len() != 2 {
+        return signer;
+    }
+
+    actor_tags[0]
+        .get(1)
+        .and_then(|value| nostr::PublicKey::from_hex(value).ok())
+        .map(|pubkey| pubkey.to_hex())
+        .unwrap_or(signer)
+}
+
+/// Resolve channel metadata for the inbound author gate.
 ///
-/// Fail-closed: if the fetch fails or times out, the channel is treated as a
-/// DM for this event and the result is NOT cached, so a later event retries
-/// the fetch instead of pinning a mis-classification.
-pub(crate) async fn is_dm_channel(
+/// Startup and lazy metadata are cached only after full verification against
+/// the relay identity advertised through NIP-11. The DM participant set and
+/// security-relevant shape are immutable in the relay and database, so verified
+/// metadata is safe to reuse without a per-event network refresh.
+///
+/// An external allowlisted author is eligible in a DM only when authoritative
+/// metadata proves the current 1:1 participant set is exactly the author and
+/// this agent. Group DMs, malformed participant tags, and failed/unknown
+/// metadata all deny that external grant. Missing or malformed metadata is not
+/// cached and is retried on a later resolution attempt.
+pub(crate) async fn resolve_author_gate_channel(
     channel_id: Uuid,
+    agent_pubkey: &str,
+    author: &str,
     channel_info: &pool::ChannelInfoResolver,
-) -> bool {
-    match channel_info.resolve(channel_id).await {
-        Some(info) => info.channel_type == "dm",
-        None => {
+) -> AuthorGateChannel {
+    match channel_info.resolve_for_author_gate(channel_id).await {
+        Some(info) if info.classification == relay::ChannelClassification::Dm => {
+            let mut expected = vec![agent_pubkey.to_string(), author.to_string()];
+            expected.sort();
+            let exact_two_party_dm = agent_pubkey != author
+                && info.participant_pubkeys.as_deref() == Some(expected.as_slice());
+            AuthorGateChannel::dm(exact_two_party_dm)
+        }
+        Some(info) if info.classification == relay::ChannelClassification::Regular => {
+            AuthorGateChannel::regular()
+        }
+        Some(_) | None => {
             tracing::warn!(
                 channel_id = %channel_id,
-                "channel type unresolved — treating as DM for author gate (fail closed)"
+                "channel metadata unresolved; denying external DM delegation (fail closed)"
             );
-            true
+            AuthorGateChannel::unknown()
         }
     }
 }
@@ -1228,6 +1337,159 @@ impl Drop for RespawnGuard {
 // sync entry point — `std::env::set_var` is only safe before tokio spawns
 // worker threads (Rust 2024 edition safety requirement).
 
+fn inactivity_expired(
+    last_activity: tokio::time::Instant,
+    now: tokio::time::Instant,
+    bound: Duration,
+    turn_in_flight: bool,
+) -> bool {
+    !bound.is_zero() && !turn_in_flight && now.duration_since(last_activity) >= bound
+}
+
+#[cfg(test)]
+mod inactivity_tests {
+    use super::*;
+
+    #[test]
+    fn zero_disables_expiry_and_in_flight_turns_defer_it() {
+        let started = tokio::time::Instant::now();
+        let after_bound = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::ZERO,
+            false
+        ));
+        assert!(!inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            true
+        ));
+        assert!(inactivity_expired(
+            started,
+            after_bound,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+
+    #[test]
+    fn dispatched_activity_restarts_the_inactivity_bound() {
+        let started = tokio::time::Instant::now();
+        let dispatched = started + Duration::from_secs(50);
+        let checked = started + Duration::from_secs(61);
+
+        assert!(!inactivity_expired(
+            dispatched,
+            checked,
+            Duration::from_secs(60),
+            false
+        ));
+    }
+}
+
+struct MembershipRemovalCleanup {
+    drained_ids: Vec<String>,
+    invalidated: usize,
+}
+
+/// Apply the single fail-closed cleanup path used by both a verified
+/// NonMember head and an authenticated REMOVE whose current-head lookup has
+/// exhausted its bounded retries.
+async fn cleanup_removed_membership<F>(
+    relay: &mut HarnessRelay,
+    channel_id: Uuid,
+    queue: &mut EventQueue,
+    mut invalidate_sessions: F,
+    subscribed_channel_ids: &mut HashSet<Uuid>,
+    removed_channels: &mut HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+) -> MembershipRemovalCleanup
+where
+    F: FnMut(Uuid) -> usize,
+{
+    subscribed_channel_ids.remove(&channel_id);
+    tracing::info!(%channel_id, "membership notification: unsubscribing from channel");
+    if let Err(error) = relay.unsubscribe_channel(channel_id).await {
+        tracing::warn!(%channel_id, %error, "failed to unsubscribe from channel");
+    }
+
+    let drained_ids = queue.drain_channel(channel_id);
+    let invalidated = invalidate_sessions(channel_id);
+    removed_channels.insert(channel_id);
+    typing_channels.remove(&channel_id);
+
+    MembershipRemovalCleanup {
+        drained_ids,
+        invalidated,
+    }
+}
+
+#[cfg(test)]
+mod membership_removal_cleanup_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    #[tokio::test]
+    async fn authoritative_nonmember_and_exhausted_remove_share_full_cleanup_path() {
+        assert_eq!(
+            relay::membership_subscription_decision(relay::CurrentMembershipState::NonMember, true,),
+            relay::MembershipSubscriptionDecision::EnsureUnsubscribed
+        );
+        assert_eq!(
+            relay::membership_retry_action(
+                KIND_MEMBER_REMOVED_NOTIFICATION,
+                relay::MembershipRetryDisposition::Consume,
+            ),
+            relay::MembershipRetryAction::EnsureUnsubscribed
+        );
+
+        let channel_id = Uuid::new_v4();
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "queued")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign queued event");
+        let event_id = event.id.to_hex();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".to_string(),
+        }));
+
+        let (mut relay, mut unsubscribe_rx) = HarnessRelay::test_unsubscribe_pair();
+        let mut invalidated_channels = Vec::new();
+        let mut subscribed_channel_ids = HashSet::from([channel_id]);
+        let mut removed_channels = HashSet::new();
+        let mut typing_channels = HashMap::from([(channel_id, ThreadTags::default())]);
+
+        let cleanup = cleanup_removed_membership(
+            &mut relay,
+            channel_id,
+            &mut queue,
+            |invalidated_channel| {
+                invalidated_channels.push(invalidated_channel);
+                1
+            },
+            &mut subscribed_channel_ids,
+            &mut removed_channels,
+            &mut typing_channels,
+        )
+        .await;
+
+        assert_eq!(unsubscribe_rx.recv().await, Some(channel_id));
+        assert_eq!(cleanup.drained_ids, vec![event_id]);
+        assert_eq!(cleanup.invalidated, 1);
+        assert_eq!(invalidated_channels, vec![channel_id]);
+        assert_eq!(queue.queued_event_count(&channel_id), 0);
+        assert!(!subscribed_channel_ids.contains(&channel_id));
+        assert!(removed_channels.contains(&channel_id));
+        assert!(!typing_channels.contains_key(&channel_id));
+    }
+}
+
 pub fn run() -> Result<()> {
     config::propagate_legacy_env_vars();
     tokio_main()
@@ -1342,6 +1604,7 @@ async fn tokio_main() -> Result<()> {
         HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
             .await
             .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+    let trusted_relay_pubkey = relay.relay_signing_pubkey().cloned();
 
     // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -1548,7 +1811,11 @@ async fn tokio_main() -> Result<()> {
             .to_string_lossy()
             .to_string(),
         rest_client: relay.rest_client(),
-        channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
+        channel_info: pool::ChannelInfoResolver::new(
+            channel_info_map,
+            relay.rest_client(),
+            trusted_relay_pubkey,
+        ),
         context_message_limit: config.context_message_limit,
         max_turns_per_session: config.max_turns_per_session,
         permission_mode: config.permission_mode,
@@ -1601,6 +1868,21 @@ async fn tokio_main() -> Result<()> {
     let mut typing_channels: HashMap<Uuid, ThreadTags> = HashMap::new();
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Independent of pool readiness: a never-mentioned lazy agent must still
+    // self-terminate. The watch interval is capped so small configured bounds
+    // remain reasonably precise without waking long-lived agents frequently.
+    let inactivity_bound = Duration::from_secs(config.exit_after_inactivity_secs);
+    let mut last_activity = tokio::time::Instant::now();
+    let mut inactivity_reaper = if inactivity_bound.is_zero() {
+        None
+    } else {
+        let interval = inactivity_bound.min(Duration::from_secs(30));
+        Some(tokio::time::interval_at(
+            tokio::time::Instant::now() + interval,
+            interval,
+        ))
+    };
+
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
@@ -1647,19 +1929,7 @@ async fn tokio_main() -> Result<()> {
         });
     }
 
-    // Track the newest membership notification timestamp per channel.
-    // On reconnect the relay replays events newest-first, so the first event
-    // per channel is authoritative. Any later event with ts < newest is stale.
-    // Exact duplicates (same event ID) are caught by seen_membership_ids.
-    //
-    // Uses strict `<` (not `<=`) so that legitimate live events at the same
-    // second are both processed. The seen_membership_ids set handles exact
-    // replays that share the same timestamp.
-    let mut membership_newest_ts: HashMap<Uuid, u64> = HashMap::new();
-    // Two-generation dedup for membership event replays (bounded, no amnesia).
-    // Rotates at 1000 entries instead of clearing the entire set at 2000.
-    let mut seen_membership_current: HashSet<String> = HashSet::new();
-    let mut seen_membership_previous: HashSet<String> = HashSet::new();
+    let mut membership_triggers = relay::MembershipTriggerTracker::default();
 
     // Channels the agent has been removed from. When a checked-out agent is
     // returned to the pool, its sessions for these channels are stripped, and
@@ -1774,7 +2044,9 @@ async fn tokio_main() -> Result<()> {
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -1810,7 +2082,9 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+            for (channel_id, thread_tags) in
+                dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+            {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
@@ -1914,24 +2188,11 @@ async fn tokio_main() -> Result<()> {
                                 let ts = buzz_event.event.created_at.as_secs();
                                 let eid = buzz_event.event.id.to_hex();
 
-                                // Two-layer membership dedup:
-                                //
-                                // 1. Exact duplicate rejection (seen_membership_ids):
-                                //    Catches the same event replayed on reconnect.
-                                //
-                                // 2. Timestamp watermark (membership_newest_ts):
-                                //    Uses strict `<` so that older events from reconnect
-                                //    replay are dropped, but legitimate live events at the
-                                //    same second are both processed. This is safe because
-                                //    exact duplicates are already caught by layer 1.
-                                //
-                                // Why not `<=`? That would suppress legitimate live
-                                // add→remove (or remove→add) sequences in the same second,
-                                // leaving the harness in the wrong membership state.
-                                // Two-generation dedup: check both sets before inserting.
-                                if seen_membership_current.contains(&eid)
-                                    || seen_membership_previous.contains(&eid)
-                                {
+                                // Exact duplicate rejection prevents repeated network work.
+                                // Notification order is never used for authority: after this
+                                // trigger is authenticated by relay.rs, the current kind:39002
+                                // coordinate below decides add versus remove.
+                                if !membership_triggers.accept(&eid) {
                                     tracing::debug!(
                                         channel_id = %ch,
                                         kind = kind_u32,
@@ -1939,37 +2200,86 @@ async fn tokio_main() -> Result<()> {
                                     );
                                     continue;
                                 }
-                                seen_membership_current.insert(eid);
-                                // Rotate at 1000: current → previous, no amnesia window.
-                                if seen_membership_current.len() >= 1000 {
-                                    seen_membership_previous =
-                                        std::mem::take(&mut seen_membership_current);
-                                }
-                                if let Some(&newest) = membership_newest_ts.get(&ch) {
-                                    if ts < newest {
-                                        tracing::debug!(
-                                            channel_id = %ch,
-                                            kind = kind_u32,
-                                            ts,
-                                            newest,
-                                            "skipping stale membership notification (older than newest)"
-                                        );
-                                        continue;
+                                let membership_state = if let Some(relay_pubkey) =
+                                    trusted_relay_pubkey.as_ref()
+                                {
+                                    match ctx
+                                        .rest_client
+                                        .current_channel_membership(
+                                            ch,
+                                            &config.keys.public_key(),
+                                            relay_pubkey,
+                                        )
+                                        .await
+                                    {
+                                        Ok(current) => current,
+                                        Err(error) => {
+                                            tracing::warn!(channel_id = %ch, %error, "membership trigger current-head lookup failed; retry requested");
+                                            relay::CurrentMembershipState::Unknown
+                                        }
                                     }
-                                }
-                                membership_newest_ts.insert(ch, ts);
+                                } else {
+                                    tracing::warn!(channel_id = %ch, "membership trigger has no trusted NIP-11 identity; retry requested");
+                                    relay::CurrentMembershipState::Unknown
+                                };
+                                let membership_decision = relay::membership_subscription_decision(
+                                    membership_state,
+                                    subscribed_channel_ids.contains(&ch),
+                                );
+                                let membership_decision = if membership_decision
+                                    == relay::MembershipSubscriptionDecision::Retry
+                                {
+                                    tracing::warn!(channel_id = %ch, "membership trigger has no valid current kind:39002 head; retry requested");
+                                    match relay::membership_retry_action(
+                                        kind_u32,
+                                        membership_triggers.retry_or_consume(&eid),
+                                    ) {
+                                        relay::MembershipRetryAction::ScheduleReplay => {
+                                            relay.schedule_membership_recheck(Duration::from_secs(5));
+                                            continue;
+                                        }
+                                        relay::MembershipRetryAction::EnsureUnsubscribed => {
+                                            tracing::warn!(channel_id = %ch, event_id = %eid, "authenticated REMOVE retry budget exhausted; failing closed through channel cleanup");
+                                            relay::MembershipSubscriptionDecision::EnsureUnsubscribed
+                                        }
+                                        relay::MembershipRetryAction::Consume => {
+                                            tracing::warn!(channel_id = %ch, event_id = %eid, "membership trigger retry budget exhausted; consuming event without granting access");
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    membership_triggers.resolved(&eid);
+                                    membership_decision
+                                };
 
-                                if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION {
+                                if membership_decision
+                                    == relay::MembershipSubscriptionDecision::EnsureSubscribed
+                                {
                                     // Clear removal tracking so sessions are not
                                     // stripped for a legitimately re-added channel.
                                     removed_channels.remove(&ch);
 
-                                    if subscribed_channel_ids.contains(&ch) {
-                                        tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
-                                    } else if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
-                                        tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
+                                    if let Some(filter) = config::resolve_dynamic_channel_filter(&config, ch, &rules) {
+                                        // Fetch and verify relay-signed metadata before
+                                        // installing the replaying subscription. Messages
+                                        // published during this bounded lookup are replayed
+                                        // from `ts`, so a valid newly joined DM reaches the
+                                        // author gate with its participant set already cached.
+                                        // A failed fetch remains Unknown and fails closed.
+                                        if ctx.channel_info.prefetch_for_subscription(ch).await.is_none() {
+                                            tracing::warn!(
+                                                channel_id = %ch,
+                                                "membership notification: metadata unavailable; subscribing only after current membership proof while author gate remains fail-closed"
+                                            );
+                                        }
+                                        // Always issue an idempotent ensure-subscribe, even
+                                        // when outer tracking says this channel is present.
+                                        // A prior relay CLOSED can drop BgState's real WS
+                                        // subscription without updating this outer set; the
+                                        // next valid re-add must repair that desynchronization.
+                                        tracing::info!(channel_id = %ch, already_tracked = subscribed_channel_ids.contains(&ch), "membership notification: ensuring current member channel subscription with replay");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
-                                            tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                            tracing::warn!("failed to ensure subscription for current member channel {ch}: {e}");
                                         } else {
                                             subscribed_channel_ids.insert(ch);
                                         }
@@ -1977,45 +2287,46 @@ async fn tokio_main() -> Result<()> {
                                         tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
                                     }
                                 } else {
-                                    subscribed_channel_ids.remove(&ch);
-                                    tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
-                                    if let Err(e) = relay.unsubscribe_channel(ch).await {
-                                        tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
-                                    }
                                     // Drain queued events and invalidate sessions for the
                                     // removed channel. Events already in-flight will
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
-                                    let drained_ids = queue.drain_channel(ch);
-                                    let invalidated = if pool_ready {
-                                        pool.invalidate_channel_sessions(ch)
-                                    } else {
-                                        0
-                                    };
-                                    // Track removed channels so checked-out agents get
-                                    // their sessions stripped when they return to the pool.
-                                    removed_channels.insert(ch);
-                                    typing_channels.remove(&ch);
+                                    let cleanup = cleanup_removed_membership(
+                                        &mut relay,
+                                        ch,
+                                        &mut queue,
+                                        |channel_id| {
+                                            if pool_ready {
+                                                pool.invalidate_channel_sessions(channel_id)
+                                            } else {
+                                                0
+                                            }
+                                        },
+                                        &mut subscribed_channel_ids,
+                                        &mut removed_channels,
+                                        &mut typing_channels,
+                                    )
+                                    .await;
                                     // Best-effort: clean up 👀 on drained events.
                                     // Note: the relay revokes membership before
                                     // emitting the notification, so this DELETE may
                                     // 403 on non-open channels. Stale 👀 in that
                                     // case is a known limitation — fix belongs in
                                     // the relay (clean up bot reactions on removal).
-                                    if !drained_ids.is_empty() {
+                                    if !cleanup.drained_ids.is_empty() {
                                         let rc = ctx.rest_client.clone();
-                                        let ids = drained_ids.clone();
+                                        let ids = cleanup.drained_ids.clone();
                                         tokio::spawn(async move {
                                             for eid in &ids {
                                                 pool::reaction_remove(&rc, eid, "👀").await;
                                             }
                                         });
                                     }
-                                    if !drained_ids.is_empty() || invalidated > 0 {
+                                    if !cleanup.drained_ids.is_empty() || cleanup.invalidated > 0 {
                                         tracing::info!(
                                             channel_id = %ch,
-                                            drained = drained_ids.len(),
-                                            invalidated,
+                                            drained = cleanup.drained_ids.len(),
+                                            invalidated = cleanup.invalidated,
                                             "cleaned up after membership removal"
                                         );
                                     }
@@ -2143,17 +2454,26 @@ async fn tokio_main() -> Result<()> {
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
                             {
-                                let author = buzz_event.event.pubkey.to_hex();
+                                let author = effective_instruction_author(
+                                    &buzz_event.event,
+                                    trusted_relay_pubkey.as_ref(),
+                                );
                                 // DM hardening: resolve channel type (fail-closed
-                                // to DM) so allowlist/anyone modes cannot be
-                                // exercised by non-owner authors inside DMs.
-                                let is_dm =
-                                    is_dm_channel(buzz_event.channel_id, &ctx.channel_info).await;
+                                // to DM) so unrestricted `anyone` access cannot be
+                                // exercised by non-owner authors inside DMs. An
+                                // exact explicit allowlist match remains eligible.
+                                let channel = resolve_author_gate_channel(
+                                    buzz_event.channel_id,
+                                    &pubkey_hex,
+                                    &author,
+                                    &ctx.channel_info,
+                                )
+                                .await;
                                 let allowed = author_allowed(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
                                     &author,
-                                    is_dm,
+                                    channel,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
@@ -2163,7 +2483,8 @@ async fn tokio_main() -> Result<()> {
                                         channel_id = %buzz_event.channel_id,
                                         author = %buzz_event.event.pubkey.to_hex(),
                                         mode = %config.respond_to,
-                                        is_dm,
+                                        is_dm = channel.is_dm(),
+                                        exact_two_party_dm = channel.exact_two_party_dm(),
                                         "inbound author gate — dropping event"
                                     );
                                     continue;
@@ -2258,7 +2579,7 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (channel_id, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx)
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                                 {
                                     typing_channels.insert(channel_id, thread_tags);
                                 }
@@ -2276,6 +2597,27 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = async {
+                    match inactivity_reaper.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    if inactivity_expired(
+                        last_activity,
+                        tokio::time::Instant::now(),
+                        inactivity_bound,
+                        queue.has_in_flight() || heartbeat_in_flight,
+                    ) {
+                        tracing::info!(
+                            inactivity_seconds = config.exit_after_inactivity_secs,
+                            "inactivity bound reached — exiting gracefully"
+                        );
+                        let _ = shutdown_tx.send(());
+                    }
+                    None
+                }
+                _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
                         None => std::future::pending().await,
@@ -2287,7 +2629,7 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -2385,7 +2727,9 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2408,7 +2752,9 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2550,7 +2896,9 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2577,7 +2925,7 @@ async fn tokio_main() -> Result<()> {
                             None,
                         );
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
@@ -2911,6 +3259,7 @@ fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     loop {
@@ -2990,6 +3339,7 @@ fn dispatch_pending(
             },
         );
         dispatched_channels.push((channel_id, typing_scope));
+        *last_activity = tokio::time::Instant::now();
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
@@ -4419,6 +4769,144 @@ mod owner_cache_tests {
 #[cfg(test)]
 mod author_gate_tests {
     use super::*;
+    use nostr::Keys;
+
+    fn workflow_event_with(
+        signer: &nostr::Keys,
+        actor: &nostr::PublicKey,
+        include_workflow_marker: bool,
+        kind: u32,
+        extra_tags: Vec<nostr::Tag>,
+    ) -> nostr::Event {
+        let mut tags =
+            vec![nostr::Tag::parse(["actor", &actor.to_hex()]).expect("valid actor tag")];
+        if include_workflow_marker {
+            tags.push(nostr::Tag::parse(["buzz:workflow", "true"]).expect("valid workflow marker"));
+        }
+        tags.extend(extra_tags);
+        nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), "test")
+            .tags(tags)
+            .sign_with_keys(signer)
+            .expect("event signs")
+    }
+
+    fn workflow_event(
+        signer: &nostr::Keys,
+        actor: &nostr::PublicKey,
+        include_workflow_marker: bool,
+    ) -> nostr::Event {
+        workflow_event_with(
+            signer,
+            actor,
+            include_workflow_marker,
+            KIND_STREAM_MESSAGE,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn trusted_relay_workflow_uses_attributed_owner_for_author_gate() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), true);
+
+        assert_eq!(
+            effective_instruction_author(&event, Some(&relay.public_key())),
+            owner.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn forged_workflow_marker_cannot_replace_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let attacker = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event = workflow_event(&attacker, &owner.public_key(), true);
+
+        assert_eq!(
+            effective_instruction_author(&event, Some(&relay.public_key())),
+            attacker.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn relay_signed_non_workflow_event_cannot_replace_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), false);
+
+        assert_eq!(
+            effective_instruction_author(&event, Some(&relay.public_key())),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn missing_trusted_relay_identity_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), true);
+
+        assert_eq!(
+            effective_instruction_author(&event, None),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn invalid_signature_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let mut event = workflow_event(&relay, &owner.public_key(), true);
+        event.content = "tampered".into();
+
+        assert_eq!(
+            effective_instruction_author(&event, Some(&relay.public_key())),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn wrong_kind_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event = workflow_event_with(&relay, &owner.public_key(), true, 1, vec![]);
+
+        assert_eq!(
+            effective_instruction_author(&event, Some(&relay.public_key())),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let duplicate_actor = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            true,
+            KIND_STREAM_MESSAGE,
+            vec![nostr::Tag::parse(["actor", &owner.public_key().to_hex()])
+                .expect("duplicate actor tag")],
+        );
+        let duplicate_workflow = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            true,
+            KIND_STREAM_MESSAGE,
+            vec![nostr::Tag::parse(["buzz:workflow", "true"]).expect("duplicate workflow marker")],
+        );
+
+        assert_eq!(
+            effective_instruction_author(&duplicate_actor, Some(&relay.public_key())),
+            relay.public_key().to_hex()
+        );
+        assert_eq!(
+            effective_instruction_author(&duplicate_workflow, Some(&relay.public_key())),
+            relay.public_key().to_hex()
+        );
+    }
 
     /// A `RestClient` for tests. The author-gate decisions exercised here all
     /// resolve from the owner pubkey or sibling cache before any HTTP call, so
@@ -4455,7 +4943,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 SIBLING,
-                false,
+                AuthorGateChannel::regular(),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4473,7 +4961,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
-                false,
+                AuthorGateChannel::regular(),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4491,7 +4979,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 STRANGER,
-                false,
+                AuthorGateChannel::regular(),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4509,7 +4997,7 @@ mod author_gate_tests {
                 &RespondTo::Allowlist,
                 &allowlist,
                 OWNER,
-                false,
+                AuthorGateChannel::regular(),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4530,7 +5018,7 @@ mod author_gate_tests {
                 &RespondTo::OwnerOnly,
                 &HashSet::new(),
                 STRANGER,
-                false,
+                AuthorGateChannel::regular(),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4548,7 +5036,7 @@ mod author_gate_tests {
                     &RespondTo::OwnerOnly,
                     &HashSet::new(),
                     who,
-                    false,
+                    AuthorGateChannel::regular(),
                     &cache,
                     &dummy_rest_client()
                 )
@@ -4561,25 +5049,112 @@ mod author_gate_tests {
     // ── DM hardening ──────────────────────────────────────────────────────
     //
     // In a DM, clients auto-p-tag every participant, and an agent can be
-    // asked to open a DM with a third party. The gate must therefore ignore
-    // the allowlist and `anyone` mode inside DMs: only owner + verified
-    // siblings fire turns.
+    // asked to open a DM with a third party. The gate must therefore keep
+    // `anyone` owner/sibling-only. An explicit allowlist entry is a deliberate
+    // identity grant and remains eligible only in a relay-verified 1:1 DM.
 
     #[tokio::test]
-    async fn test_dm_rejects_allowlisted_external_pubkey() {
+    async fn test_dm_accepts_explicit_allowlisted_external_pubkey() {
+        use std::sync::atomic::Ordering;
+
+        let agent = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let (response, relay_pubkey) = dm_metadata_response(channel_id, &[&agent, &external]);
+        let (resolver, requests, server) =
+            resolver_with_response(HashMap::new(), response, Some(relay_pubkey)).await;
+        assert_eq!(
+            resolve_author_gate_channel(channel_id, &agent, &external, &resolver).await,
+            AuthorGateChannel::unknown(),
+            "an uncached author decision must fail closed without blocking"
+        );
+        wait_for_background_channel_resolution(&resolver, channel_id).await;
+        let channel = resolve_author_gate_channel(channel_id, &agent, &external, &resolver).await;
+        let cache = OwnerCache::new(Some(owner));
+        cache.cache_sibling(external.clone(), false);
+        let allowlist = HashSet::from([external.clone()]);
+
+        assert_eq!(channel, AuthorGateChannel::dm(true));
+        assert!(
+            author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                &external,
+                channel,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "an explicitly allowlisted external pubkey must fire a turn inside a DM"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the first author-gate decision must use relay metadata"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dm_rejects_allowlisted_external_pubkey_in_group() {
+        use std::sync::atomic::Ordering;
+
+        let agent = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let third_party = Keys::generate().public_key().to_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let channel_id = Uuid::new_v4();
+        let (response, relay_pubkey) =
+            dm_metadata_response(channel_id, &[&agent, &external, &third_party]);
+        let (resolver, requests, server) =
+            resolver_with_response(HashMap::new(), response, Some(relay_pubkey)).await;
+        assert_eq!(
+            resolve_author_gate_channel(channel_id, &agent, &external, &resolver).await,
+            AuthorGateChannel::unknown()
+        );
+        wait_for_background_channel_resolution(&resolver, channel_id).await;
+        let channel = resolve_author_gate_channel(channel_id, &agent, &external, &resolver).await;
+        let cache = OwnerCache::new(Some(owner));
+        cache.cache_sibling(external.clone(), false);
+        let allowlist = HashSet::from([external.clone()]);
+
+        assert_eq!(channel, AuthorGateChannel::dm(false));
+        assert!(
+            !author_allowed(
+                &RespondTo::Allowlist,
+                &allowlist,
+                &external,
+                channel,
+                &cache,
+                &dummy_rest_client()
+            )
+            .await,
+            "an allowlisted external pubkey must not fire a turn in a group DM"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "uncached group DM metadata must be verified before authorizing"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dm_rejects_external_pubkey_absent_from_allowlist() {
         let cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
-                EXTERNAL,
-                true,
+                STRANGER,
+                AuthorGateChannel::dm(true),
                 &cache,
                 &dummy_rest_client()
             )
             .await,
-            "an allowlisted external pubkey must NOT fire a turn inside a DM"
+            "a non-owner external pubkey absent from the allowlist must not fire a DM turn"
         );
     }
 
@@ -4591,7 +5166,7 @@ mod author_gate_tests {
                 &RespondTo::Anyone,
                 &HashSet::new(),
                 STRANGER,
-                true,
+                AuthorGateChannel::dm(true),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4614,7 +5189,7 @@ mod author_gate_tests {
                         &mode,
                         &HashSet::new(),
                         who,
-                        true,
+                        AuthorGateChannel::dm(false),
                         &cache,
                         &dummy_rest_client()
                     )
@@ -4633,7 +5208,7 @@ mod author_gate_tests {
                 &RespondTo::Nobody,
                 &HashSet::new(),
                 OWNER,
-                true,
+                AuthorGateChannel::dm(false),
                 &cache,
                 &dummy_rest_client()
             )
@@ -4642,55 +5217,121 @@ mod author_gate_tests {
         );
     }
 
-    // ── is_dm_channel resolution ──────────────────────────────────────────
+    // ── author-gate channel resolution ────────────────────────────────────
 
     fn resolver(startup: HashMap<Uuid, relay::ChannelInfo>) -> pool::ChannelInfoResolver {
-        pool::ChannelInfoResolver::new(startup, dummy_rest_client())
+        pool::ChannelInfoResolver::new(startup, dummy_rest_client(), None)
+    }
+
+    async fn wait_for_background_channel_resolution(
+        resolver: &pool::ChannelInfoResolver,
+        channel_id: Uuid,
+    ) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if resolver.resolve_for_author_gate(channel_id).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background channel metadata resolution");
     }
 
     #[tokio::test]
-    async fn test_is_dm_channel_uses_definitive_startup_metadata() {
-        let dm_id = Uuid::new_v4();
+    async fn test_author_gate_resolver_uses_cached_regular_metadata() {
         let stream_id = Uuid::new_v4();
-        let startup = HashMap::from([
-            (
-                dm_id,
-                relay::ChannelInfo {
-                    name: "dm".into(),
-                    channel_type: "dm".into(),
-                },
-            ),
-            (
-                stream_id,
-                relay::ChannelInfo {
-                    name: "stream".into(),
-                    channel_type: "stream".into(),
-                },
-            ),
-        ]);
+        let startup = HashMap::from([(
+            stream_id,
+            relay::ChannelInfo {
+                name: "stream".into(),
+                channel_type: "stream".into(),
+                classification: relay::ChannelClassification::Regular,
+                participant_pubkeys: None,
+            },
+        )]);
         let resolver = resolver(startup);
-        assert!(is_dm_channel(dm_id, &resolver).await);
-        assert!(!is_dm_channel(stream_id, &resolver).await);
+        assert_eq!(
+            resolve_author_gate_channel(stream_id, OWNER, EXTERNAL, &resolver).await,
+            AuthorGateChannel::regular()
+        );
     }
 
     #[tokio::test]
-    async fn test_is_dm_channel_fails_closed_for_unknown_startup_metadata() {
+    async fn test_author_gate_resolver_fails_closed_for_unknown_startup_metadata() {
+        use std::sync::atomic::Ordering;
+
         let id = Uuid::new_v4();
         let startup = HashMap::from([(
             id,
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                classification: relay::ChannelClassification::Unknown,
+                participant_pubkeys: None,
             },
         )]);
-        assert!(
-            is_dm_channel(id, &resolver(startup)).await,
-            "missing startup metadata must not be trusted as a stream"
+        let (resolver, requests, server) =
+            resolver_with_response(startup, serde_json::json!([]), None).await;
+        assert_eq!(
+            resolve_author_gate_channel(id, OWNER, EXTERNAL, &resolver).await,
+            AuthorGateChannel::unknown(),
+            "unknown startup metadata must not be trusted as a regular channel"
         );
+        assert!(
+            requests.load(Ordering::SeqCst) <= 1,
+            "unknown metadata must return before a retry sequence can block the gate"
+        );
+        server.abort();
     }
 
-    async fn lazy_resolver_with_response(
+    #[tokio::test]
+    async fn test_author_gate_unknown_metadata_is_immediate_singleflight_and_backed_off() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let relay_pubkey = nostr::Keys::generate().public_key();
+        let (resolver, requests, server) =
+            resolver_with_response(HashMap::new(), serde_json::json!([]), Some(relay_pubkey)).await;
+
+        for _ in 0..8 {
+            let resolved = tokio::time::timeout(
+                Duration::from_millis(50),
+                resolver.resolve_for_author_gate(id),
+            )
+            .await
+            .expect("unknown author-gate lookup must return immediately");
+            assert!(resolved.is_none());
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if requests.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("single background retry sequence");
+
+        for _ in 0..8 {
+            assert!(resolver.resolve_for_author_gate(id).await.is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "negative backoff must suppress per-event retry storms"
+        );
+        server.abort();
+    }
+
+    async fn resolver_with_response(
+        startup: HashMap<Uuid, relay::ChannelInfo>,
         response: serde_json::Value,
+        trusted_relay_pubkey: Option<nostr::PublicKey>,
     ) -> (
         pool::ChannelInfoResolver,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -4729,62 +5370,223 @@ mod author_gate_tests {
             auth_tag_json: None,
         };
         (
-            pool::ChannelInfoResolver::new(HashMap::new(), rest),
+            pool::ChannelInfoResolver::new(startup, rest, trusted_relay_pubkey),
             requests,
             server,
         )
     }
 
+    fn dm_metadata_response(
+        channel_id: Uuid,
+        participants: &[&str],
+    ) -> (serde_json::Value, nostr::PublicKey) {
+        let relay = nostr::Keys::generate();
+        let mut participants = participants
+            .iter()
+            .map(|participant| nostr::PublicKey::from_hex(participant).unwrap())
+            .collect::<Vec<_>>();
+        participants.sort_by_key(|participant| participant.to_hex());
+        let participant_bytes = participants
+            .iter()
+            .map(|participant| participant.to_bytes())
+            .collect::<Vec<_>>();
+        let commitment = buzz_core::dm::dm_participant_commitment_hex(&participant_bytes).unwrap();
+        let mut tags = vec![
+            nostr::Tag::parse(["d", &channel_id.to_string()]).unwrap(),
+            nostr::Tag::parse(["name", "DM"]).unwrap(),
+            nostr::Tag::parse(["private"]).unwrap(),
+            nostr::Tag::parse(["closed"]).unwrap(),
+            nostr::Tag::parse(["hidden"]).unwrap(),
+            nostr::Tag::parse(["t", "dm"]).unwrap(),
+        ];
+        tags.extend(
+            participants
+                .iter()
+                .map(|participant| nostr::Tag::parse(["p", &participant.to_hex()]).unwrap()),
+        );
+        tags.push(
+            nostr::Tag::parse([
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_TAG,
+                buzz_core::dm::DM_PARTICIPANT_COMMITMENT_VERSION,
+                &commitment,
+            ])
+            .unwrap(),
+        );
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(39000), "")
+            .tags(tags)
+            .sign_with_keys(&relay)
+            .unwrap();
+        (serde_json::json!([event]), relay.public_key())
+    }
+
     #[tokio::test]
-    async fn test_is_dm_channel_lazy_resolves_declared_dm_and_caches_it() {
+    async fn test_author_gate_resolver_caches_verified_immutable_dm_metadata() {
         use std::sync::atomic::Ordering;
 
         let id = Uuid::new_v4();
-        let response = serde_json::json!([{
-            "tags": [["d", id.to_string()], ["name", "DM"], ["t", "dm"]]
-        }]);
-        let (resolver, requests, server) = lazy_resolver_with_response(response).await;
+        let agent = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let (response, relay_pubkey) = dm_metadata_response(id, &[&agent, &external]);
+        let (resolver, requests, server) =
+            resolver_with_response(HashMap::new(), response, Some(relay_pubkey)).await;
 
-        assert!(is_dm_channel(id, &resolver).await);
-        assert!(is_dm_channel(id, &resolver).await);
+        assert_eq!(
+            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            AuthorGateChannel::unknown()
+        );
+        wait_for_background_channel_resolution(&resolver, id).await;
+        assert_eq!(
+            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            AuthorGateChannel::dm(true)
+        );
+        assert_eq!(
+            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            AuthorGateChannel::dm(true)
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
             1,
-            "second resolution uses cache"
+            "verified immutable DM metadata is fetched once and then cached"
+        );
+        assert_eq!(resolver.resolve(id).await.unwrap().channel_type, "dm");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "all consumers reuse the verified immutable DM metadata"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_dm_prefetch_accepts_first_replayed_allowlisted_message() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let agent = Keys::generate().public_key().to_hex();
+        let mary = Keys::generate().public_key().to_hex();
+        let (response, relay_pubkey) = dm_metadata_response(id, &[&agent, &mary]);
+        let (resolver, requests, server) =
+            resolver_with_response(HashMap::new(), response, Some(relay_pubkey)).await;
+
+        let prefetched = resolver
+            .prefetch_for_subscription(id)
+            .await
+            .expect("valid relay-signed DM metadata must be ready before replay subscription");
+        assert_eq!(prefetched.classification, relay::ChannelClassification::Dm);
+
+        let channel = resolve_author_gate_channel(id, &agent, &mary, &resolver).await;
+        assert_eq!(
+            channel,
+            AuthorGateChannel::dm(true),
+            "the first replayed message must not observe an intermediate Unknown classification"
+        );
+        assert!(
+            author_allowed(
+                &RespondTo::Allowlist,
+                &HashSet::from([mary.clone()]),
+                &mary,
+                channel,
+                &cache_with_sibling(),
+                &dummy_rest_client(),
+            )
+            .await,
+            "Mary's first replayed message must be accepted without a resend"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "membership prefetch and the first author decision share one verified lookup"
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn test_discovery_without_metadata_stays_fail_closed_at_author_gate() {
+        use std::sync::atomic::Ordering;
+
         let id = Uuid::new_v4();
-        let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]));
-        let channel_info = resolver(discovered);
+        let discovered = relay::merge_discovered_channels(vec![id], &serde_json::json!([]), None);
+        let (channel_info, requests, server) =
+            resolver_with_response(discovered, serde_json::json!([]), None).await;
         let owner_cache = cache_with_sibling();
         let allowlist = HashSet::from([EXTERNAL.to_string()]);
 
-        let is_dm = is_dm_channel(id, &channel_info).await;
-        assert!(is_dm, "unknown startup metadata must fail closed as DM");
+        let channel = resolve_author_gate_channel(id, OWNER, EXTERNAL, &channel_info).await;
+        assert_eq!(channel, AuthorGateChannel::unknown());
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
                 &allowlist,
                 EXTERNAL,
-                is_dm,
+                channel,
                 &owner_cache,
                 &dummy_rest_client(),
             )
             .await,
             "an external author must not pass when startup discovery omitted metadata"
         );
+        assert!(requests.load(Ordering::SeqCst) <= 1);
+        server.abort();
     }
 
     #[tokio::test]
-    async fn test_is_dm_channel_fails_closed_when_lazy_resolution_fails() {
-        assert!(
-            is_dm_channel(Uuid::new_v4(), &resolver(HashMap::new())).await,
-            "an unresolvable channel type must be treated as a DM"
+    async fn test_author_gate_resolver_reuses_verified_startup_dm_without_refresh() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let agent = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let mut cached_pair = vec![agent.clone(), external.clone()];
+        cached_pair.sort();
+        let startup = HashMap::from([(
+            id,
+            relay::ChannelInfo {
+                name: "DM".into(),
+                channel_type: "dm".into(),
+                classification: relay::ChannelClassification::Dm,
+                participant_pubkeys: Some(cached_pair.clone()),
+            },
+        )]);
+        let (resolver, requests, server) =
+            resolver_with_response(startup, serde_json::json!([]), None).await;
+
+        assert_eq!(
+            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            AuthorGateChannel::dm(true),
+            "DB-enforced immutable startup metadata is safe to cache"
         );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            resolver.resolve(id).await.unwrap().participant_pubkeys,
+            Some(cached_pair),
+            "failed refreshes must not overwrite the last successful cache entry"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_author_gate_resolver_rejects_malformed_dm_participants() {
+        let id = Uuid::new_v4();
+        let agent = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let response = serde_json::json!([{
+            "tags": [
+                ["d", id.to_string()],
+                ["name", "DM"],
+                ["t", "dm"],
+                ["p", &agent],
+                ["p", &external],
+                ["p", &external]
+            ]
+        }]);
+        let (resolver, _requests, server) =
+            resolver_with_response(HashMap::new(), response, None).await;
+
+        assert_eq!(
+            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            AuthorGateChannel::unknown()
+        );
+        server.abort();
     }
 }
 
@@ -5031,6 +5833,7 @@ mod build_mcp_servers_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
             lazy_pool: false,
             agent_owner: None,
             no_base_prompt: false,
@@ -5252,6 +6055,7 @@ mod error_outcome_emission_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            exit_after_inactivity_secs: 0,
             lazy_pool: false,
             agent_owner: None,
             no_base_prompt: false,

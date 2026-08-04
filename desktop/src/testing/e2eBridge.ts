@@ -105,6 +105,9 @@ type MockRelayAgentSeed = {
   capabilities?: string[];
   respondTo?: RawRelayAgent["respond_to"];
   respondToAllowlist?: string[];
+  invocationPolicyKnown?: boolean;
+  ownerPubkey?: string | null;
+  ownerPubkeyVerified?: boolean;
   channelNames?: string[];
   channelIds?: string[];
   status?: PresenceStatus;
@@ -507,6 +510,11 @@ type E2eConfig = {
      * returning a catalog.
      */
     discoverAgentModelsError?: string;
+    // Backend provider mocks for the create-agent "Run on" section. See
+    // tests/helpers/bridge.ts:MockBridgeOptions for semantics.
+    backendProviders?: Array<{ id: string; binaryPath: string }>;
+    backendProviderProbeResult?: Record<string, unknown>;
+    backendProviderProbeDelayMs?: number;
   };
   relayHttpUrl?: string;
   relayWsUrl?: string;
@@ -770,6 +778,9 @@ type RawRelayAgent = {
   status: PresenceStatus;
   respond_to?: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist?: string[];
+  invocation_policy_known?: boolean;
+  owner_pubkey?: string | null;
+  owner_pubkey_verified?: boolean;
 };
 
 type RawManagedAgent = {
@@ -1046,7 +1057,8 @@ declare global {
     }>;
     __BUZZ_E2E_WEBVIEW_ZOOM__?: number;
     __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-      channelName: string;
+      channelId?: string;
+      channelName?: string;
       kind?: number;
     }) => boolean;
     __BUZZ_E2E_HAS_MOCK_OWNER_KIND_SUBSCRIPTION__?: (input: {
@@ -1054,7 +1066,8 @@ declare global {
       kind: number;
     }) => boolean;
     __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
-      channelName: string;
+      channelId?: string;
+      channelName?: string;
       content: string;
       parentEventId?: string | null;
       pubkey?: string;
@@ -1363,9 +1376,12 @@ const mockDisplayNames = new Map<string, string>([
   [OUTSIDER_PUBKEY, "outsider"],
   [DEFAULT_REAL_IDENTITY.pubkey, DEFAULT_REAL_IDENTITY.username],
 ]);
+// Alice and Charlie are the bridge's ordinary human fixtures. Agent-specific
+// specs opt them into agent state explicitly through `relayAgents`,
+// `managedAgents`, or an agent search profile. Keeping them out of this base
+// set prevents the shared user directory from silently reclassifying normal
+// New Message recipients as foreign agents.
 const mockAgentPubkeys = new Set([
-  ALICE_PUBKEY,
-  CHARLIE_PUBKEY,
   PROFILE_ONLY_AGENT_PUBKEY,
   OWNED_RELAY_AGENT_PUBKEY,
 ]);
@@ -1540,6 +1556,7 @@ function cloneRelayAgent(agent: RawRelayAgent): RawRelayAgent {
     channels: [...agent.channels],
     channel_ids: [...agent.channel_ids],
     capabilities: [...agent.capabilities],
+    respond_to_allowlist: [...(agent.respond_to_allowlist ?? [])],
   };
 }
 
@@ -2133,6 +2150,7 @@ function resetMockRelayAgents(config?: E2eConfig) {
   }));
 
   for (const seed of config?.mock?.relayAgents ?? []) {
+    mockAgentPubkeys.add(normalizePubkey(seed.pubkey));
     const channels = mockChannels.filter((channel) => {
       return (
         seed.channelIds?.includes(channel.id) ||
@@ -2147,8 +2165,16 @@ function resetMockRelayAgents(config?: E2eConfig) {
       channel_ids: channels.map((channel) => channel.id),
       capabilities: seed.capabilities ?? ["messages", "channels", "mcp"],
       status: seed.status ?? "online",
-      respond_to: seed.respondTo ?? "owner-only",
+      respond_to:
+        (seed.invocationPolicyKnown ?? seed.respondTo !== undefined)
+          ? (seed.respondTo ?? "owner-only")
+          : undefined,
       respond_to_allowlist: seed.respondToAllowlist ?? [],
+      invocation_policy_known:
+        seed.invocationPolicyKnown ?? seed.respondTo !== undefined,
+      owner_pubkey: seed.ownerPubkey ?? null,
+      owner_pubkey_verified:
+        seed.ownerPubkeyVerified ?? seed.ownerPubkey != null,
     });
   }
 }
@@ -3045,33 +3071,10 @@ function initializeMockHuddle(seed: MockHuddleSeed | undefined) {
   persistMockHuddle();
 }
 const openedExternalUrls: string[] = [];
-const defaultMockRelayAgents: RawRelayAgent[] = [
-  {
-    pubkey: ALICE_PUBKEY,
-    name: "alice",
-    agent_type: "goose",
-    channels: ["general", "agents"],
-    channel_ids: [
-      "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
-      "94a444a4-c0a3-5966-ab05-530c6ddc2301",
-    ],
-    capabilities: ["search", "summaries", "workflows"],
-    status: "online",
-    respond_to: "anyone",
-    respond_to_allowlist: [],
-  },
-  {
-    pubkey: CHARLIE_PUBKEY,
-    name: "charlie",
-    agent_type: "codex",
-    channels: ["general"],
-    channel_ids: ["9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50"],
-    capabilities: ["code", "reviews"],
-    status: "away",
-    respond_to: "anyone",
-    respond_to_allowlist: [],
-  },
-];
+// Keep the base relay-agent registry disjoint from the named human fixtures.
+// Tests that exercise agents seed the exact identity, ownership, and audience
+// policy they need instead of inheriting an ambiguous Alice/Charlie default.
+const defaultMockRelayAgents: RawRelayAgent[] = [];
 let mockRelayAgents: RawRelayAgent[] = defaultMockRelayAgents.map((agent) => ({
   ...agent,
   channels: [...agent.channels],
@@ -3321,10 +3324,11 @@ const mockProfiles = new Map<string, RawProfile>([
     },
   ],
   // alice, bob, and charlie are intentionally NOT seeded here — they are
-  // covered by mockDisplayNames + mockAgentPubkeys and synthesised on demand
-  // by getMockProfileByPubkey. Static seeds would cause ensureMockProfile to
-  // return has_profile_event:true when alice/bob/charlie are used as the
-  // active first-run identity, incorrectly skipping onboarding page 1.
+  // covered by mockDisplayNames and synthesised on demand by
+  // getMockProfileByPubkey. Agent-specific tests opt their pubkeys into
+  // mockAgentPubkeys through explicit seeds. Static profiles would cause
+  // ensureMockProfile to return has_profile_event:true when alice/bob/charlie
+  // are used as the active first-run identity, incorrectly skipping page 1.
   [
     PROFILE_ONLY_AGENT_PUBKEY,
     {
@@ -3394,6 +3398,9 @@ function syncMockRelayAgentsFromManagedAgents() {
             : "offline",
         respond_to: agent.respond_to,
         respond_to_allowlist: [...agent.respond_to_allowlist],
+        invocation_policy_known: true,
+        owner_pubkey: MOCK_IDENTITY_PUBKEY,
+        owner_pubkey_verified: true,
       };
     },
   );
@@ -9645,6 +9652,7 @@ export function maybeInstallE2eTauriMocks() {
     await emitMockHuddleState();
   };
   window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__ = ({
+    channelId,
     channelName,
     content,
     parentEventId,
@@ -9656,11 +9664,11 @@ export function maybeInstallE2eTauriMocks() {
     pending,
     id,
   }) => {
-    const channel = mockChannels.find(
-      (candidate) => candidate.name === channelName,
+    const channel = mockChannels.find((candidate) =>
+      channelId ? candidate.id === channelId : candidate.name === channelName,
     );
     if (!channel) {
-      throw new Error(`Mock channel ${channelName} not found.`);
+      throw new Error(`Mock channel ${channelId ?? channelName} not found.`);
     }
 
     return emitMockChannelMessage(
@@ -9697,12 +9705,16 @@ export function maybeInstallE2eTauriMocks() {
       createdAt,
     );
   };
-  window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({ channelName, kind }) => {
-    const channel = mockChannels.find(
-      (candidate) => candidate.name === channelName,
+  window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({
+    channelId,
+    channelName,
+    kind,
+  }) => {
+    const channel = mockChannels.find((candidate) =>
+      channelId ? candidate.id === channelId : candidate.name === channelName,
     );
     if (!channel) {
-      throw new Error(`Mock channel ${channelName} not found.`);
+      throw new Error(`Mock channel ${channelId ?? channelName} not found.`);
     }
 
     return hasMockLiveSubscription(channel.id, kind);
@@ -11064,9 +11076,22 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "discover_backend_providers":
-        return [];
-      case "probe_backend_provider":
-        return { ok: false, error: "mock: no providers available" };
+        return activeConfig?.mock?.backendProviders ?? [];
+      case "probe_backend_provider": {
+        const probeDelayMs =
+          activeConfig?.mock?.backendProviderProbeDelayMs ?? 0;
+        if (probeDelayMs > 0) {
+          await new Promise((resolve) =>
+            window.setTimeout(resolve, probeDelayMs),
+          );
+        }
+        return (
+          activeConfig?.mock?.backendProviderProbeResult ?? {
+            ok: false,
+            error: "mock: no providers available",
+          }
+        );
+      }
       case "discover_managed_agent_prereqs":
         return handleDiscoverManagedAgentPrereqs(
           payload as Parameters<typeof handleDiscoverManagedAgentPrereqs>[0],
@@ -11183,6 +11208,50 @@ export function maybeInstallE2eTauriMocks() {
           created_at: template.createdAt,
           updated_at: template.updatedAt,
         }));
+      case "create_channel_template": {
+        const { input } = payload as {
+          input: {
+            name: string;
+            description?: string;
+            channelType?: "stream" | "forum";
+            visibility?: "open" | "private";
+            canvasTemplate?: string;
+            agents?: ChannelTemplate["agents"];
+          };
+        };
+        const timestamp = new Date().toISOString();
+        const created: ChannelTemplate = {
+          id: `template-${Date.now()}`,
+          name: input.name,
+          description: input.description ?? null,
+          channelType: input.channelType ?? "stream",
+          visibility: input.visibility ?? "open",
+          canvasTemplate: input.canvasTemplate ?? null,
+          agents: input.agents ?? { personas: [], teams: [] },
+          isBuiltin: false,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        if (activeConfig) {
+          activeConfig.mock ??= {};
+          activeConfig.mock.channelTemplates = [
+            ...(activeConfig.mock.channelTemplates ?? []),
+            created,
+          ];
+        }
+        return {
+          id: created.id,
+          name: created.name,
+          description: created.description,
+          channel_type: created.channelType,
+          visibility: created.visibility,
+          canvas_template: created.canvasTemplate,
+          agents: created.agents,
+          is_builtin: created.isBuiltin,
+          created_at: created.createdAt,
+          updated_at: created.updatedAt,
+        };
+      }
       case "create_team":
         return handleCreateTeam(
           payload as Parameters<typeof handleCreateTeam>[0],
@@ -11834,8 +11903,9 @@ export function maybeInstallE2eTauriMocks() {
         // command was invoked via `__BUZZ_E2E_COMMANDS__`, not the dialog.
         return true;
       case "card_mint_key_status":
-        // Cards: pretend a key is configured so the mint form renders.
-        return true;
+        // Cards: pretend a key is configured in global defaults so the mint
+        // form renders and the key-status row is shown.
+        return "global";
       case "list_agent_cards":
         // Cards archive starts empty in E2E; specs exercising the gallery
         // can extend this with a seeded config knob when needed.

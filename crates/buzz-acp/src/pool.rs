@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
+    SystemPromptTransport,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -171,6 +172,13 @@ pub struct OwnedAgent {
     pub protocol_version: u32,
 }
 
+/// Package name reported by `claude-agent-acp` in its `initialize` response.
+/// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
+/// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
+/// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
+/// rename, so the new name is a reliable capability gate.
+const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+
 fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
@@ -178,20 +186,25 @@ fn has_system_prompt_support(
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+        true
     } else {
         protocol_version >= 2
     }
 }
 
-fn session_new_system_prompt(
+fn session_new_system_prompt<'a>(
     is_goose: bool,
     protocol_version: u32,
-    prompt: Option<&str>,
-) -> Option<&str> {
-    if is_goose || protocol_version < 2 {
+    agent_name: &str,
+    prompt: Option<&'a str>,
+) -> Option<SystemPromptTransport<'a>> {
+    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
         None
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+        prompt.map(SystemPromptTransport::ClaudeMeta)
     } else {
-        prompt
+        prompt.map(SystemPromptTransport::Field)
     }
 }
 
@@ -451,25 +464,46 @@ pub enum PromptOutcome {
 /// Successful lazy lookups are cached for every consumer (author gate, prompt
 /// context, canvas, and setup mode). Unknown metadata is never cached as a
 /// non-DM: callers can fail closed and a later event retries resolution.
+const CHANNEL_METADATA_NEGATIVE_BACKOFF: Duration = Duration::from_secs(5);
+const CHANNEL_METADATA_PREFETCH_WAIT: Duration = Duration::from_secs(7);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelResolutionReservation {
+    Reserved,
+    InFlight,
+    NegativeBackoff,
+}
+
+#[derive(Debug, Default)]
+struct ChannelResolutionState {
+    negative_until: std::collections::HashMap<Uuid, tokio::time::Instant>,
+    in_flight: std::collections::HashSet<Uuid>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
     rest_client: RestClient,
+    trusted_relay_pubkey: Option<nostr::PublicKey>,
+    resolution_state: std::sync::Arc<std::sync::Mutex<ChannelResolutionState>>,
 }
 
 impl ChannelInfoResolver {
     pub fn new(
         startup: std::collections::HashMap<Uuid, ChannelInfo>,
         rest_client: RestClient,
+        trusted_relay_pubkey: Option<nostr::PublicKey>,
     ) -> Self {
         let cache = startup
             .into_iter()
             .filter_map(|(id, info)| {
-                (info.channel_type != "unknown").then_some((
+                (info.classification != crate::relay::ChannelClassification::Unknown).then_some((
                     id,
                     PromptChannelInfo {
                         name: info.name,
                         channel_type: info.channel_type,
+                        classification: info.classification,
+                        participant_pubkeys: info.participant_pubkeys,
                     },
                 ))
             })
@@ -477,6 +511,10 @@ impl ChannelInfoResolver {
         Self {
             cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
             rest_client,
+            trusted_relay_pubkey,
+            resolution_state: std::sync::Arc::new(std::sync::Mutex::new(
+                ChannelResolutionState::default(),
+            )),
         }
     }
 
@@ -490,11 +528,124 @@ impl ChannelInfoResolver {
             return Some(info);
         }
 
-        let info = fetch_channel_info(channel_id, &self.rest_client).await?;
+        match self.reserve_resolution(channel_id) {
+            ChannelResolutionReservation::Reserved => self.fetch_reserved(channel_id).await,
+            ChannelResolutionReservation::InFlight
+            | ChannelResolutionReservation::NegativeBackoff => None,
+        }
+    }
+
+    /// Warm verified metadata before installing a dynamic channel subscription.
+    ///
+    /// Membership subscriptions replay from the membership event timestamp, so
+    /// waiting here cannot lose messages published while metadata is fetched.
+    /// A valid newly joined DM is therefore classified before its first replayed
+    /// message reaches the author gate. If another lookup is already running,
+    /// wait for that bounded lookup instead of subscribing with an `Unknown`
+    /// classification; persistent failures still fail closed.
+    pub async fn prefetch_for_subscription(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
+        let deadline = tokio::time::Instant::now() + CHANNEL_METADATA_PREFETCH_WAIT;
+        loop {
+            if let Some(info) = self
+                .cache
+                .read()
+                .ok()
+                .and_then(|cache| cache.get(&channel_id).cloned())
+            {
+                return Some(info);
+            }
+            match self.reserve_resolution(channel_id) {
+                ChannelResolutionReservation::Reserved => {
+                    return self.fetch_reserved(channel_id).await;
+                }
+                ChannelResolutionReservation::NegativeBackoff => return None,
+                ChannelResolutionReservation::InFlight => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return None;
+                    }
+                    tokio::time::sleep(
+                        Duration::from_millis(10).min(deadline.saturating_duration_since(now)),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Resolve metadata for an inbound author-gate decision.
+    ///
+    /// Verified relay metadata is immutable for the security-relevant DM
+    /// shape and participant set, so author decisions use the same cache as
+    /// prompt formatting. Unknown/malformed metadata returns immediately while
+    /// one background lookup runs; failures are negatively cached briefly so
+    /// a degraded relay cannot stall or fan out work from the main event loop.
+    pub async fn resolve_for_author_gate(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
+        if let Some(info) = self
+            .cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&channel_id).cloned())
+        {
+            return Some(info);
+        }
+        if self.reserve_resolution(channel_id) == ChannelResolutionReservation::Reserved {
+            let resolver = self.clone();
+            tokio::spawn(async move {
+                let _ = resolver.fetch_reserved(channel_id).await;
+            });
+        }
+        None
+    }
+
+    fn reserve_resolution(&self, channel_id: Uuid) -> ChannelResolutionReservation {
+        let Ok(mut state) = self.resolution_state.lock() else {
+            return ChannelResolutionReservation::NegativeBackoff;
+        };
+        if state.in_flight.contains(&channel_id) {
+            return ChannelResolutionReservation::InFlight;
+        }
+        let now = tokio::time::Instant::now();
+        if state
+            .negative_until
+            .get(&channel_id)
+            .is_some_and(|until| *until > now)
+        {
+            return ChannelResolutionReservation::NegativeBackoff;
+        }
+        state.negative_until.remove(&channel_id);
+        state.in_flight.insert(channel_id);
+        ChannelResolutionReservation::Reserved
+    }
+
+    async fn fetch_reserved(&self, channel_id: Uuid) -> Option<PromptChannelInfo> {
+        let info = match self.trusted_relay_pubkey.as_ref() {
+            Some(trusted_relay_pubkey) => {
+                fetch_channel_info(channel_id, &self.rest_client, trusted_relay_pubkey).await
+            }
+            None => None,
+        };
+        if let Some(ref info) = info {
+            self.cache(channel_id, info);
+        }
+        if let Ok(mut state) = self.resolution_state.lock() {
+            state.in_flight.remove(&channel_id);
+            if info.is_some() {
+                state.negative_until.remove(&channel_id);
+            } else {
+                state.negative_until.insert(
+                    channel_id,
+                    tokio::time::Instant::now() + CHANNEL_METADATA_NEGATIVE_BACKOFF,
+                );
+            }
+        }
+        info
+    }
+
+    fn cache(&self, channel_id: Uuid, info: &PromptChannelInfo) {
         if let Ok(mut cache) = self.cache.write() {
             cache.insert(channel_id, info.clone());
         }
-        Some(info)
     }
 }
 
@@ -907,6 +1058,7 @@ async fn create_session_and_apply_model(
             session_new_system_prompt(
                 is_goose,
                 agent.protocol_version,
+                &agent.agent_name,
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
@@ -2330,6 +2482,7 @@ where
 pub(crate) async fn fetch_channel_info(
     channel_id: Uuid,
     rest: &RestClient,
+    trusted_relay_pubkey: &nostr::PublicKey,
 ) -> Option<PromptChannelInfo> {
     use nostr::{Alphabet, SingleLetterTag};
 
@@ -2338,6 +2491,7 @@ pub(crate) async fn fetch_channel_info(
         .kind(nostr::Kind::Custom(
             buzz_core::kind::KIND_NIP29_GROUP_METADATA as u16,
         ))
+        .author(*trusted_relay_pubkey)
         .custom_tags(d_tag, [channel_id.to_string()]);
 
     fetch_with_retry(|| async {
@@ -2348,21 +2502,16 @@ pub(crate) async fn fetch_channel_info(
         .await
         {
             Ok(Ok(json)) => {
-                let events = json.as_array()?;
-                let ev = events.first()?;
-                let tags = ev.get("tags")?.as_array()?;
-                let mut name = None;
-                for tag in tags {
-                    if let Some(arr) = tag.as_array() {
-                        if arr.first().and_then(|v| v.as_str()) == Some("name") {
-                            name = arr.get(1).and_then(|v| v.as_str());
-                        }
-                    }
-                }
-                let channel_type = crate::relay::channel_type_from_tags(tags);
+                let info = crate::relay::current_verified_channel_info(
+                    channel_id,
+                    &json,
+                    trusted_relay_pubkey,
+                )?;
                 Some(PromptChannelInfo {
-                    name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
-                    channel_type,
+                    name: info.name,
+                    channel_type: info.channel_type,
+                    classification: info.classification,
+                    participant_pubkeys: info.participant_pubkeys,
                 })
             }
             Ok(Err(e)) => {
@@ -4003,18 +4152,48 @@ mod tests {
         assert!(has_system_prompt_support(2, "goose", Some(true)));
         assert!(has_system_prompt_support(1, "goose", Some(true)));
         assert!(has_system_prompt_support(2, "buzz-agent", None));
+        // Goose never receives system prompt via session/new (uses post-hoc method).
         assert_eq!(
-            session_new_system_prompt(true, 2, Some("instructions")),
+            session_new_system_prompt(true, 2, "goose", Some("instructions")),
             None
         );
+        // Protocol-v2 non-goose gets Field transport.
         assert_eq!(
-            session_new_system_prompt(false, 2, Some("instructions")),
-            Some("instructions")
+            session_new_system_prompt(false, 2, "buzz-agent", Some("instructions")),
+            Some(SystemPromptTransport::Field("instructions"))
         );
+        // Protocol-v1 non-goose, non-claude gets None (legacy user-message framing).
         assert_eq!(
-            session_new_system_prompt(false, 1, Some("instructions")),
+            session_new_system_prompt(false, 1, "codex", Some("instructions")),
             None
         );
+        // claude-agent-acp gets ClaudeMeta transport regardless of protocol version.
+        assert_eq!(
+            session_new_system_prompt(false, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            Some(SystemPromptTransport::ClaudeMeta("instructions"))
+        );
+        assert_eq!(
+            session_new_system_prompt(true, 1, CLAUDE_AGENT_ACP_NAME, Some("instructions")),
+            None,
+            "goose path must never produce a transport even when agent_name matches"
+        );
+    }
+
+    #[test]
+    fn claude_agent_acp_has_system_prompt_support_regardless_of_protocol_version() {
+        // claude-agent-acp declares protocolVersion:1 but supports _meta.systemPrompt;
+        // has_system_prompt_support must return true so user-message framing is suppressed.
+        assert!(has_system_prompt_support(1, CLAUDE_AGENT_ACP_NAME, None));
+        assert!(has_system_prompt_support(2, CLAUDE_AGENT_ACP_NAME, None));
+    }
+
+    #[test]
+    fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
+        // The renamed @zed-industries package predates the _meta.systemPrompt support,
+        // so it must not be treated as capable and stays on legacy user-message framing.
+        let old_name = "@zed-industries/claude-code-acp";
+        assert!(!has_system_prompt_support(1, old_name, None));
+        assert!(has_system_prompt_support(2, old_name, None));
     }
 
     #[test]
@@ -6404,6 +6583,7 @@ mod tests {
                     keys: agent_keys.clone(),
                     auth_tag_json: None,
                 },
+                None,
             ),
             context_message_limit: 0,
             max_turns_per_session: 0,
@@ -6732,6 +6912,7 @@ mod tests {
     /// cannot see duplicated I/O.
     async fn counting_resolver(
         response: serde_json::Value,
+        trusted_relay_pubkey: Option<nostr::PublicKey>,
     ) -> (
         ChannelInfoResolver,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -6767,16 +6948,84 @@ mod tests {
             auth_tag_json: None,
         };
         (
-            ChannelInfoResolver::new(std::collections::HashMap::new(), rest),
+            ChannelInfoResolver::new(std::collections::HashMap::new(), rest, trusted_relay_pubkey),
             requests,
             server,
         )
     }
 
-    fn channel_metadata_response(id: Uuid, tags: &[[&str; 2]]) -> serde_json::Value {
-        let mut event_tags = vec![json!(["d", id.to_string()])];
-        event_tags.extend(tags.iter().map(|[k, v]| json!([k, v])));
-        json!([{ "tags": event_tags }])
+    fn channel_metadata_response(
+        id: Uuid,
+        tags: &[[&str; 2]],
+    ) -> (serde_json::Value, nostr::PublicKey) {
+        let relay = nostr::Keys::generate();
+        let is_dm = tags.iter().any(|tag| tag == &["t", "dm"]);
+        let mut event_tags = vec![nostr::Tag::parse(["d", &id.to_string()]).unwrap()];
+        event_tags.extend(
+            tags.iter()
+                .map(|[key, value]| nostr::Tag::parse([*key, *value]).unwrap()),
+        );
+        if is_dm {
+            event_tags.extend([
+                nostr::Tag::parse(["private"]).unwrap(),
+                nostr::Tag::parse(["closed"]).unwrap(),
+                nostr::Tag::parse(["hidden"]).unwrap(),
+            ]);
+            let mut participants = [
+                nostr::Keys::generate().public_key(),
+                nostr::Keys::generate().public_key(),
+            ];
+            participants.sort_by_key(|participant| participant.to_hex());
+            let participant_bytes = participants
+                .iter()
+                .map(|participant| participant.to_bytes())
+                .collect::<Vec<_>>();
+            event_tags.extend(
+                participants
+                    .iter()
+                    .map(|participant| nostr::Tag::parse(["p", &participant.to_hex()]).unwrap()),
+            );
+            event_tags.push(
+                nostr::Tag::parse([
+                    buzz_core::dm::DM_PARTICIPANT_COMMITMENT_TAG,
+                    buzz_core::dm::DM_PARTICIPANT_COMMITMENT_VERSION,
+                    &buzz_core::dm::dm_participant_commitment_hex(&participant_bytes).unwrap(),
+                ])
+                .unwrap(),
+            );
+        } else {
+            event_tags.extend([
+                nostr::Tag::parse(["public"]).unwrap(),
+                nostr::Tag::parse(["closed"]).unwrap(),
+            ]);
+        }
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(39000), "")
+            .tags(event_tags)
+            .sign_with_keys(&relay)
+            .unwrap();
+        (json!([event]), relay.public_key())
+    }
+
+    fn regular_channel_metadata_event(
+        id: Uuid,
+        relay: &nostr::Keys,
+        name: &str,
+        created_at: u64,
+        extra_tags: Vec<nostr::Tag>,
+    ) -> nostr::Event {
+        let mut tags = vec![
+            nostr::Tag::parse(["d", &id.to_string()]).unwrap(),
+            nostr::Tag::parse(["name", name]).unwrap(),
+            nostr::Tag::parse(["t", "stream"]).unwrap(),
+            nostr::Tag::parse(["public"]).unwrap(),
+            nostr::Tag::parse(["closed"]).unwrap(),
+        ];
+        tags.extend(extra_tags);
+        nostr::EventBuilder::new(nostr::Kind::Custom(39000), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(relay)
+            .unwrap()
     }
 
     /// A normal channel yields a non-DM (canvas allowed) and its name for the
@@ -6786,8 +7035,9 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let id = Uuid::new_v4();
-        let response = channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
-        let (resolver, requests, server) = counting_resolver(response).await;
+        let (response, relay_pubkey) =
+            channel_metadata_response(id, &[["name", "buzz-dev"], ["t", "stream"]]);
+        let (resolver, requests, server) = counting_resolver(response, Some(relay_pubkey)).await;
 
         let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
         assert!(!is_dm, "a stream channel is not a DM");
@@ -6809,8 +7059,9 @@ mod tests {
     #[tokio::test]
     async fn test_new_session_channel_context_leaves_a_dm_unqualified() {
         let id = Uuid::new_v4();
-        let response = channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
-        let (resolver, _requests, server) = counting_resolver(response).await;
+        let (response, relay_pubkey) =
+            channel_metadata_response(id, &[["name", "DM"], ["t", "dm"]]);
+        let (resolver, _requests, server) = counting_resolver(response, Some(relay_pubkey)).await;
 
         let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
         assert!(is_dm);
@@ -6827,11 +7078,11 @@ mod tests {
     #[tokio::test]
     async fn test_new_session_channel_context_treats_the_unknown_name_as_absent() {
         let id = Uuid::new_v4();
-        let response = channel_metadata_response(id, &[["t", "stream"]]);
-        let (resolver, _requests, server) = counting_resolver(response).await;
+        let (response, relay_pubkey) = channel_metadata_response(id, &[["t", "stream"]]);
+        let (resolver, _requests, server) = counting_resolver(response, Some(relay_pubkey)).await;
 
         let (is_dm, title_channel) = resolve_new_session_channel_context(&resolver, id).await;
-        assert!(!is_dm, "a nameless stream channel is still not a DM");
+        assert!(is_dm, "malformed nameless metadata must fail closed");
         assert_eq!(
             title_channel, None,
             "the `unknown` placeholder must yield a bare title"
@@ -6848,7 +7099,7 @@ mod tests {
     async fn test_new_session_channel_context_attempts_an_unresolved_channel_once() {
         use std::sync::atomic::Ordering;
 
-        let (resolver, requests, server) = counting_resolver(json!([])).await;
+        let (resolver, requests, server) = counting_resolver(json!([]), None).await;
 
         let (is_dm, title_channel) =
             resolve_new_session_channel_context(&resolver, Uuid::new_v4()).await;
@@ -6856,8 +7107,68 @@ mod tests {
         assert_eq!(title_channel, None, "unresolved channels get a bare title");
         assert_eq!(
             requests.load(Ordering::SeqCst),
+            0,
+            "without a trusted NIP-11 identity no metadata query may be issued"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lazy_metadata_lookup_ignores_newer_wrong_signer_sibling() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let trusted = nostr::Keys::generate();
+        let attacker = nostr::Keys::generate();
+        let trusted_head = regular_channel_metadata_event(id, &trusted, "trusted", 100, vec![]);
+        let forged_newer = regular_channel_metadata_event(id, &attacker, "forged", 200, vec![]);
+        let (resolver, requests, server) = counting_resolver(
+            json!([forged_newer, trusted_head]),
+            Some(trusted.public_key()),
+        )
+        .await;
+
+        let info = resolver
+            .resolve(id)
+            .await
+            .expect("trusted head should resolve");
+        assert_eq!(info.name, "trusted");
+        assert_eq!(
+            info.classification,
+            crate::relay::ChannelClassification::Regular
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lazy_metadata_lookup_newer_malformed_trusted_head_shadows_older_valid() {
+        use std::sync::atomic::Ordering;
+
+        let id = Uuid::new_v4();
+        let trusted = nostr::Keys::generate();
+        let old_valid = regular_channel_metadata_event(id, &trusted, "old-valid", 100, vec![]);
+        let malformed_newer = regular_channel_metadata_event(
+            id,
+            &trusted,
+            "malformed-newer",
+            200,
+            vec![nostr::Tag::parse(["unexpected", "field"]).unwrap()],
+        );
+        let (resolver, requests, server) = counting_resolver(
+            json!([old_valid, malformed_newer]),
+            Some(trusted.public_key()),
+        )
+        .await;
+
+        assert!(
+            resolver.resolve(id).await.is_none(),
+            "a malformed newer trusted coordinate must shadow the old valid event"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
             2,
-            "one fetch_channel_info sequence (initial attempt + single retry)"
+            "strict verification failure should use the one bounded retry sequence"
         );
         server.abort();
     }

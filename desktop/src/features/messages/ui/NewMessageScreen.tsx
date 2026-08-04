@@ -17,6 +17,10 @@ import { Skeleton } from "@/shared/ui/skeleton";
 import { MessageComposer } from "./MessageComposer";
 import { NewMessageResultRow } from "./NewMessageResultRow";
 import {
+  DELEGATED_AGENT_DM_CONFLICT_MESSAGE,
+  hasDelegatedAgentRecipientConflict,
+} from "../lib/newMessageRecipientPolicy";
+import {
   formatRecipientName,
   useNewMessageRecipients,
 } from "./useNewMessageRecipients";
@@ -59,7 +63,9 @@ export function NewMessageScreen() {
     handleDirectoryScroll,
     hasReachedRecipientLimit,
     isDirectoryLoading,
+    managedAgentPubkeys,
     ownerProfiles,
+    relayAgents,
     removeUser,
     searchError,
     searchQuery,
@@ -176,6 +182,18 @@ export function NewMessageScreen() {
           ].map(normalizePubkey),
         ),
       ].filter(Boolean);
+      if (
+        hasDelegatedAgentRecipientConflict({
+          currentPubkey,
+          managedAgentPubkeys,
+          relayAgents,
+          requestedPubkeys,
+          selectedRecipients: selectedUsers,
+        })
+      ) {
+        setSubmitErrorMessage(DELEGATED_AGENT_DM_CONFLICT_MESSAGE);
+        return null;
+      }
       const preparedDirectMessage = preparedDirectMessageRef.current;
       const currentNormalizedPubkey = currentPubkey
         ? normalizePubkey(currentPubkey)
@@ -222,8 +240,10 @@ export function NewMessageScreen() {
     },
     [
       currentPubkey,
+      managedAgentPubkeys,
       openDmMutation.isPending,
       openDmMutation.mutateAsync,
+      relayAgents,
       selectedUsers,
       sendMessageMutation.isPending,
     ],

@@ -3779,6 +3779,25 @@ impl Db {
         .await
     }
 
+    /// Atomically claim or resolve a webhook workflow run idempotency key.
+    pub async fn claim_webhook_workflow_run(
+        &self,
+        request: workflow::WebhookWorkflowRunClaimRequest<'_>,
+    ) -> Result<workflow::WebhookWorkflowRunClaim> {
+        workflow::claim_webhook_workflow_run(&self.pool, request).await
+    }
+
+    /// Fetch one webhook run by its community-scoped durable key.
+    pub async fn get_webhook_workflow_run(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<workflow::WebhookWorkflowRunRecord>> {
+        workflow::get_webhook_workflow_run(&self.pool, community_id, workflow_id, idempotency_key)
+            .await
+    }
+
     /// Fetch a single workflow run, scoped to its community.
     pub async fn get_workflow_run(
         &self,
@@ -3818,6 +3837,33 @@ impl Db {
             error,
         )
         .await
+    }
+
+    /// Claim a fenced, expiring lease to start a pending webhook run.
+    pub async fn claim_webhook_workflow_run_execution(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        lease_seconds: i64,
+    ) -> Result<Option<workflow::WebhookWorkflowRunExecutionLease>> {
+        workflow::claim_webhook_workflow_run_execution(
+            &self.pool,
+            community_id,
+            run_id,
+            lease_seconds,
+        )
+        .await
+    }
+
+    /// Consume a current webhook execution lease and fence the run start.
+    pub async fn start_webhook_workflow_run_execution(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        lease_id: Uuid,
+    ) -> Result<bool> {
+        workflow::start_webhook_workflow_run_execution(&self.pool, community_id, run_id, lease_id)
+            .await
     }
 
     /// Create an approval request.

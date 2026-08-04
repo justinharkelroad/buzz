@@ -7,6 +7,10 @@ import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
+import {
+  fromRawRelayAgent,
+  type RawRelayAgent,
+} from "@/shared/api/relayAgentMapping";
 import type {
   AddChannelMembersInput,
   AddChannelMembersResult,
@@ -43,6 +47,7 @@ import type {
 } from "@/shared/api/types";
 
 export * from "@/shared/api/tauriChannels";
+export { fromRawRelayAgent } from "@/shared/api/relayAgentMapping";
 
 type RawPresenceLookup = Record<string, PresenceStatus>;
 
@@ -107,17 +112,6 @@ type RawSendChannelMessageResult = {
   created_at: number;
 };
 
-type RawRelayAgent = {
-  pubkey: string;
-  name: string;
-  agent_type: string;
-  channels: string[];
-  channel_ids: string[];
-  capabilities: string[];
-  status: RelayAgent["status"];
-  respond_to?: RelayAgent["respondTo"];
-  respond_to_allowlist?: string[];
-};
 export type RawManagedAgent = {
   pubkey: string;
   name: string;
@@ -670,20 +664,6 @@ export async function createAuthEvent(input: {
 }): Promise<RelayEvent> {
   const eventJson = await invokeTauri<string>("create_auth_event", input);
   return JSON.parse(eventJson) as RelayEvent;
-}
-
-function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
-  return {
-    pubkey: agent.pubkey,
-    name: agent.name,
-    agentType: agent.agent_type,
-    channels: agent.channels,
-    channelIds: agent.channel_ids ?? [],
-    capabilities: agent.capabilities,
-    status: agent.status,
-    respondTo: agent.respond_to ?? null,
-    respondToAllowlist: agent.respond_to_allowlist ?? [],
-  };
 }
 
 export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {

@@ -12,6 +12,8 @@ use axum::{
 };
 use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use buzz_auth::{LimitType, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS};
 use buzz_core::TenantContext;
@@ -250,6 +252,195 @@ fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
 
 const BRIDGE_FEED_MAX_LIMIT: i64 = 100;
 const BRIDGE_THREAD_MAX_LIMIT: u32 = 500;
+const WEBHOOK_EXECUTION_LEASE_SECS: i64 = 30;
+const WEBHOOK_REPLAY_CREDENTIAL_DOMAIN: &[u8] = b"buzz:webhook-replay:v1\0";
+const WORKFLOW_RUN_TENANT_HOST_TAG: &str = "tenant_host";
+const WORKFLOW_RUN_STATUS_KINDS: [u32; 4] = [
+    buzz_core::kind::KIND_WORKFLOW_TRIGGERED,
+    buzz_core::kind::KIND_WORKFLOW_COMPLETED,
+    buzz_core::kind::KIND_WORKFLOW_FAILED,
+    buzz_core::kind::KIND_WORKFLOW_CANCELLED,
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorkflowRunStatusSelector {
+    workflow_id: uuid::Uuid,
+    idempotency_key: String,
+    kinds: Vec<u32>,
+}
+
+fn valid_webhook_idempotency_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-'))
+}
+
+fn webhook_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+    let mut values = headers.get_all("x-idempotency-key").iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("X-Idempotency-Key must appear exactly once");
+    }
+    let value = first
+        .to_str()
+        .map_err(|_| "X-Idempotency-Key must be valid ASCII")?;
+    if !valid_webhook_idempotency_key(value) {
+        return Err(
+            "X-Idempotency-Key must be 1-256 ASCII letters, digits, colons, underscores, or hyphens",
+        );
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn webhook_replay_credential_hash(secret: &str, salt: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(WEBHOOK_REPLAY_CREDENTIAL_DOMAIN);
+    hasher.update(salt);
+    hasher.update(secret.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn verify_webhook_replay_credential(secret: &str, salt: &[u8], expected_hash: &[u8]) -> bool {
+    salt.len() == 16
+        && expected_hash.len() == 32
+        && webhook_replay_credential_hash(secret, salt)
+            .as_slice()
+            .ct_eq(expected_hash)
+            .into()
+}
+
+fn webhook_execution_snapshot(
+    definition: &Value,
+) -> Result<(Value, Vec<u8>, buzz_workflow::WorkflowDef), &'static str> {
+    let stripped = crate::webhook_secret::strip_secret(definition);
+    let execution_def: buzz_workflow::WorkflowDef =
+        serde_json::from_value(stripped).map_err(|_| "workflow definition is invalid")?;
+    if execution_def.requires_elevated_authority() {
+        // CallWebhook may carry credentials in headers, URL, or body. The
+        // current schema has no encrypted secret-reference type, so copying a
+        // recoverable snapshot cannot be done safely. Fail closed for keyed
+        // runs while preserving the legacy non-keyed execution path.
+        return Err("keyed webhook runs cannot snapshot call_webhook actions");
+    }
+    let snapshot =
+        serde_json::to_value(&execution_def).map_err(|_| "workflow definition snapshot failed")?;
+    let encoded =
+        serde_json::to_vec(&snapshot).map_err(|_| "workflow definition snapshot failed")?;
+    let definition_hash = Sha256::digest(encoded).to_vec();
+    Ok((snapshot, definition_hash, execution_def))
+}
+
+fn verified_webhook_execution_definition(
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+) -> Result<buzz_workflow::WorkflowDef, &'static str> {
+    let encoded = serde_json::to_vec(&record.definition)
+        .map_err(|_| "workflow definition snapshot failed")?;
+    let actual_hash = Sha256::digest(encoded);
+    if record.definition_hash.len() != 32
+        || !bool::from(actual_hash.as_slice().ct_eq(&record.definition_hash))
+    {
+        return Err("workflow definition snapshot hash mismatch");
+    }
+    let execution_def: buzz_workflow::WorkflowDef =
+        serde_json::from_value(record.definition.clone())
+            .map_err(|_| "workflow definition snapshot is invalid")?;
+    if execution_def.requires_elevated_authority() {
+        return Err("workflow definition snapshot contains a forbidden outbound webhook");
+    }
+    Ok(execution_def)
+}
+
+fn workflow_status_selector_candidate(raw: &Value) -> bool {
+    let Some(object) = raw.as_object() else {
+        return false;
+    };
+    if !object.contains_key("#d") || !object.contains_key("#i") {
+        return false;
+    }
+    object
+        .get("kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|kinds| {
+            kinds.iter().any(|kind| {
+                kind.as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .is_some_and(|value| WORKFLOW_RUN_STATUS_KINDS.contains(&value))
+            })
+        })
+}
+
+fn extract_single_string_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<&'a str> {
+    let values = object.get(field)?.as_array()?;
+    if values.len() != 1 {
+        return None;
+    }
+    values.first()?.as_str()
+}
+
+fn parse_workflow_run_status_selector(
+    raw_filters: &[Value],
+) -> Result<Option<WorkflowRunStatusSelector>, &'static str> {
+    if !raw_filters.iter().any(workflow_status_selector_candidate) {
+        return Ok(None);
+    }
+    if raw_filters.len() != 1 {
+        return Err("workflow run status queries require exactly one filter");
+    }
+    let object = raw_filters[0]
+        .as_object()
+        .ok_or("workflow run status filter must be an object")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "kinds" | "#d" | "#i" | "limit"))
+    {
+        return Err("workflow run status filter contains unsupported fields");
+    }
+
+    let kind_values = object
+        .get("kinds")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty())
+        .ok_or("workflow run status filter requires lifecycle kinds")?;
+    let mut kinds = Vec::with_capacity(kind_values.len());
+    for kind in kind_values {
+        let kind = kind
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| WORKFLOW_RUN_STATUS_KINDS.contains(value))
+            .ok_or("workflow run status filter contains an unsupported kind")?;
+        if kinds.contains(&kind) {
+            return Err("workflow run status filter contains duplicate kinds");
+        }
+        kinds.push(kind);
+    }
+    if object
+        .get("limit")
+        .is_some_and(|limit| limit.as_u64() != Some(1))
+    {
+        return Err("workflow run status filter limit must be 1");
+    }
+
+    let workflow_id = extract_single_string_array(object, "#d")
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or("workflow run status filter requires one workflow UUID in #d")?;
+    let idempotency_key = extract_single_string_array(object, "#i")
+        .filter(|value| valid_webhook_idempotency_key(value))
+        .ok_or("workflow run status filter requires one valid idempotency key in #i")?
+        .to_owned();
+
+    Ok(Some(WorkflowRunStatusSelector {
+        workflow_id,
+        idempotency_key,
+        kinds,
+    }))
+}
 
 /// The `before_id` extension field, with "present but malformed" kept distinct
 /// from "absent": NIP-CW's cursor grammar says a malformed value MUST reject
@@ -1007,6 +1198,12 @@ async fn query_events_authed(
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
+    if let Some(status_events) =
+        synthesize_webhook_workflow_run_status(state, tenant, &raw_filters, &pubkey_bytes).await?
+    {
+        return Ok(Json(Value::Array(status_events)));
+    }
+
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
             return Err(api_error(
@@ -1319,6 +1516,442 @@ async fn query_events_authed(
     }
 
     Ok(Json(Value::Array(events)))
+}
+
+fn workflow_run_status_kind(status: &buzz_db::workflow::RunStatus) -> u32 {
+    use buzz_db::workflow::RunStatus;
+    match status {
+        RunStatus::Pending | RunStatus::Running | RunStatus::WaitingApproval => {
+            buzz_core::kind::KIND_WORKFLOW_TRIGGERED
+        }
+        RunStatus::Completed => buzz_core::kind::KIND_WORKFLOW_COMPLETED,
+        RunStatus::Failed => buzz_core::kind::KIND_WORKFLOW_FAILED,
+        RunStatus::Cancelled => buzz_core::kind::KIND_WORKFLOW_CANCELLED,
+    }
+}
+
+fn workflow_run_is_terminal(status: &buzz_db::workflow::RunStatus) -> bool {
+    matches!(
+        status,
+        buzz_db::workflow::RunStatus::Completed
+            | buzz_db::workflow::RunStatus::Failed
+            | buzz_db::workflow::RunStatus::Cancelled
+    )
+}
+
+fn keyed_webhook_response(
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+    replayed: bool,
+) -> (StatusCode, Value) {
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    (
+        status,
+        serde_json::json!({
+            "external_run_id": record.run.id.to_string(),
+            "run_id": record.run.id.to_string(),
+            "workflow_id": record.run.workflow_id.to_string(),
+            "idempotency_key": record.idempotency_key,
+            "payload_hash": hex::encode(&record.payload_hash),
+            "status": record.run.status.to_string(),
+            "terminal": workflow_run_is_terminal(&record.run.status),
+            "replayed": replayed,
+        }),
+    )
+}
+
+fn keyed_webhook_payload_conflict(
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+) -> (StatusCode, Json<Value>) {
+    let (_, mut body) = keyed_webhook_response(record, true);
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "error".to_owned(),
+            Value::String("idempotency key is already bound to a different payload".to_owned()),
+        );
+    }
+    (StatusCode::CONFLICT, Json(body))
+}
+
+fn valid_event_id_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn workflow_run_output_event_ids(trace: &Value) -> Result<Vec<String>, &'static str> {
+    let Some(steps) = trace.as_array() else {
+        return Err("workflow execution trace is not an array");
+    };
+    let mut event_ids = Vec::new();
+    for step in steps {
+        let Some(event_id) = step.get("output").and_then(|output| output.get("event_id")) else {
+            continue;
+        };
+        let event_id = event_id
+            .as_str()
+            .filter(|value| valid_event_id_hex(value))
+            .ok_or("workflow execution trace contains an invalid output event id")?;
+        if !event_ids.iter().any(|existing| existing == event_id) {
+            event_ids.push(event_id.to_owned());
+        }
+    }
+    Ok(event_ids)
+}
+
+fn webhook_run_channel_snapshot(
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+) -> Option<uuid::Uuid> {
+    let context_channel = record
+        .run
+        .trigger_context
+        .as_ref()?
+        .get("channel_id")?
+        .as_str()
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())?;
+    (context_channel == record.channel_id).then_some(context_channel)
+}
+
+struct PreparedKeyedWebhookRun {
+    record: buzz_db::workflow::WebhookWorkflowRunRecord,
+    execution: Option<(
+        uuid::Uuid,
+        buzz_workflow::WorkflowDef,
+        buzz_workflow::executor::TriggerContext,
+    )>,
+}
+
+async fn current_workflow_allows_keyed_run_start(
+    state: &AppState,
+    community_id: buzz_core::CommunityId,
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+    execution_def: &buzz_workflow::WorkflowDef,
+) -> bool {
+    let workflow = match state
+        .db
+        .get_workflow(community_id, record.run.workflow_id)
+        .await
+    {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            tracing::warn!(
+                run_id = %record.run.id,
+                "webhook: current workflow unavailable before pending start: {error}"
+            );
+            return false;
+        }
+    };
+    if !workflow.enabled
+        || workflow.status != buzz_db::workflow::WorkflowStatus::Active
+        || workflow.channel_id != Some(record.channel_id)
+    {
+        return false;
+    }
+    let current_def: buzz_workflow::WorkflowDef =
+        match serde_json::from_value(workflow.definition.clone()) {
+            Ok(definition) => definition,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %record.run.id,
+                    "webhook: current workflow definition invalid before pending start: {error}"
+                );
+                return false;
+            }
+        };
+    if !current_def.enabled || !matches!(current_def.trigger, buzz_workflow::TriggerDef::Webhook) {
+        return false;
+    }
+    state
+        .workflow_engine
+        .check_owner_authority(
+            community_id,
+            record.channel_id,
+            &workflow.owner_pubkey,
+            execution_def,
+        )
+        .await
+        .is_ok()
+}
+
+async fn prepare_keyed_webhook_run(
+    state: &Arc<AppState>,
+    community_id: buzz_core::CommunityId,
+    mut record: buzz_db::workflow::WebhookWorkflowRunRecord,
+    provided_secret: &str,
+    payload_hash: &[u8],
+) -> Result<PreparedKeyedWebhookRun, (StatusCode, Json<Value>)> {
+    if !verify_webhook_replay_credential(
+        provided_secret,
+        &record.credential_salt,
+        &record.credential_hash,
+    ) {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "authentication failed"));
+    }
+    if record.payload_hash.as_slice() != payload_hash {
+        return Err(keyed_webhook_payload_conflict(&record));
+    }
+    if record.run.status != buzz_db::workflow::RunStatus::Pending {
+        return Ok(PreparedKeyedWebhookRun {
+            record,
+            execution: None,
+        });
+    }
+
+    let execution_def = verified_webhook_execution_definition(&record);
+    let execution_trigger_ctx = record
+        .run
+        .trigger_context
+        .clone()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let snapshot_is_consistent = webhook_run_channel_snapshot(&record).is_some();
+    let execution_inputs = match (execution_def, execution_trigger_ctx) {
+        (Ok(execution_def), Some(execution_trigger_ctx)) if snapshot_is_consistent => {
+            Some((execution_def, execution_trigger_ctx))
+        }
+        _ => None,
+    };
+    let may_start = match execution_inputs.as_ref() {
+        Some((execution_def, _)) => {
+            current_workflow_allows_keyed_run_start(state, community_id, &record, execution_def)
+                .await
+        }
+        _ => false,
+    };
+    if !may_start {
+        state
+            .db
+            .cancel_pending_webhook_workflow_run_execution(
+                community_id,
+                record.run.id,
+                "current workflow authority denied pending webhook execution",
+            )
+            .await
+            .map_err(|error| internal_error(&format!("webhook run cancellation: {error}")))?;
+        record = state
+            .db
+            .get_webhook_workflow_run(
+                community_id,
+                record.run.workflow_id,
+                &record.idempotency_key,
+            )
+            .await
+            .map_err(|error| internal_error(&format!("webhook run reload: {error}")))?
+            .ok_or_else(|| internal_error("webhook run disappeared after cancellation"))?;
+        return Ok(PreparedKeyedWebhookRun {
+            record,
+            execution: None,
+        });
+    }
+
+    let lease = state
+        .db
+        .claim_webhook_workflow_run_execution(
+            community_id,
+            record.run.id,
+            WEBHOOK_EXECUTION_LEASE_SECS,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("webhook execution lease: {error}")))?;
+    record = state
+        .db
+        .get_webhook_workflow_run(
+            community_id,
+            record.run.workflow_id,
+            &record.idempotency_key,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("webhook run reload: {error}")))?
+        .ok_or_else(|| internal_error("webhook run disappeared after lease claim"))?;
+    let execution = lease.and_then(|lease| {
+        execution_inputs.map(|(execution_def, execution_trigger_ctx)| {
+            (lease.lease_id, execution_def, execution_trigger_ctx)
+        })
+    });
+    Ok(PreparedKeyedWebhookRun { record, execution })
+}
+
+fn spawn_webhook_run(
+    state: &Arc<AppState>,
+    community_id: buzz_core::CommunityId,
+    run_id: uuid::Uuid,
+    def: buzz_workflow::WorkflowDef,
+    trigger_ctx: buzz_workflow::executor::TriggerContext,
+    execution_lease_id: Option<uuid::Uuid>,
+) {
+    let engine = Arc::clone(&state.workflow_engine);
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        if let Some(lease_id) = execution_lease_id {
+            match db
+                .start_webhook_workflow_run_execution(community_id, run_id, lease_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        %run_id,
+                        "webhook: execution lease expired or was superseded before start"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %run_id,
+                        "webhook: failed to consume execution lease: {error}"
+                    );
+                    return;
+                }
+            }
+        }
+        let result = buzz_workflow::executor::execute_from_step(
+            &engine,
+            community_id,
+            run_id,
+            &def,
+            &trigger_ctx,
+            0,
+            None,
+        )
+        .await;
+        engine
+            .finalize_run(community_id, run_id, result, None)
+            .await;
+    });
+}
+
+fn build_webhook_workflow_run_status_event(
+    record: &buzz_db::workflow::WebhookWorkflowRunRecord,
+    selector: &WorkflowRunStatusSelector,
+    tenant: &TenantContext,
+    channel_id: uuid::Uuid,
+    relay_keys: &nostr::Keys,
+) -> Result<nostr::Event, String> {
+    if record.idempotency_key != selector.idempotency_key || record.payload_hash.len() != 32 {
+        return Err("workflow run status identity is inconsistent".to_owned());
+    }
+    let kind = workflow_run_status_kind(&record.run.status);
+    let output_event_ids =
+        workflow_run_output_event_ids(&record.run.execution_trace).map_err(str::to_owned)?;
+    // SendMessage currently emits a top-level channel message. Therefore each
+    // persisted output event id is both a message id and a thread root id.
+    let thread_ids = output_event_ids.clone();
+    let message_ids = output_event_ids.clone();
+    let thread_id = thread_ids.first().cloned();
+    let message_id = message_ids.last().cloned();
+    let status = record.run.status.to_string();
+    // This is the normalized authority that resolved the request to its
+    // community. Keep the exact same scheme-free value in the tag and content;
+    // never rebuild it from relay configuration or untrusted input.
+    let tenant_host = tenant.host();
+    let content = serde_json::to_string(&serde_json::json!({
+        "external_run_id": record.run.id.to_string(),
+        "run_id": record.run.id.to_string(),
+        "workflow_id": record.run.workflow_id.to_string(),
+        "idempotency_key": record.idempotency_key,
+        "payload_hash": hex::encode(&record.payload_hash),
+        "tenant_host": tenant_host,
+        "status": status,
+        "terminal": workflow_run_is_terminal(&record.run.status),
+        "output_event_ids": output_event_ids,
+        "thread_ids": thread_ids,
+        "message_ids": message_ids,
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "created_at": record.run.created_at.to_rfc3339(),
+        "started_at": record.run.started_at.as_ref().map(chrono::DateTime::to_rfc3339),
+        "completed_at": record.run.completed_at.as_ref().map(chrono::DateTime::to_rfc3339),
+    }))
+    .map_err(|error| format!("workflow run status serialize: {error}"))?;
+    let run_id = record.run.id.to_string();
+    let workflow_id = record.run.workflow_id.to_string();
+    let channel_id = channel_id.to_string();
+    let tags = [
+        ["d", workflow_id.as_str()],
+        ["i", selector.idempotency_key.as_str()],
+        ["r", run_id.as_str()],
+        ["h", channel_id.as_str()],
+        [WORKFLOW_RUN_TENANT_HOST_TAG, tenant_host],
+        ["status", status.as_str()],
+    ]
+    .into_iter()
+    .map(|parts| {
+        nostr::Tag::parse(parts).map_err(|error| format!("workflow run status tag: {error}"))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let created_at = record
+        .run
+        .completed_at
+        .as_ref()
+        .or(record.run.started_at.as_ref())
+        .unwrap_or(&record.run.created_at)
+        .timestamp()
+        .max(0) as u64;
+    nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
+        .tags(tags)
+        .custom_created_at(nostr::Timestamp::from(created_at))
+        .sign_with_keys(relay_keys)
+        .map_err(|error| format!("workflow run status sign: {error}"))
+}
+
+async fn synthesize_webhook_workflow_run_status(
+    state: &AppState,
+    tenant: &TenantContext,
+    raw_filters: &[Value],
+    reader_pubkey: &[u8],
+) -> Result<Option<Vec<Value>>, (StatusCode, Json<Value>)> {
+    let Some(selector) = parse_workflow_run_status_selector(raw_filters)
+        .map_err(|message| api_error(StatusCode::BAD_REQUEST, message))?
+    else {
+        return Ok(None);
+    };
+
+    let Some(record) = state
+        .db
+        .get_webhook_workflow_run(
+            tenant.community(),
+            selector.workflow_id,
+            &selector.idempotency_key,
+        )
+        .await
+        .map_err(|error| internal_error(&format!("workflow run status lookup: {error}")))?
+    else {
+        return Ok(Some(Vec::new()));
+    };
+    let Some(channel_id) = webhook_run_channel_snapshot(&record) else {
+        // A keyed run without one internally consistent immutable channel
+        // snapshot has no authority boundary and is therefore unreadable.
+        return Ok(Some(Vec::new()));
+    };
+    let is_member = state
+        .is_member_cached(tenant.community(), channel_id, reader_pubkey)
+        .await
+        .map_err(|error| internal_error(&format!("workflow run status membership: {error}")))?;
+    if !is_member {
+        // Return the same empty result for a missing workflow, missing key, and
+        // unauthorized channel so callers cannot use status reads to enumerate
+        // another channel's workflows or idempotency keys.
+        return Ok(Some(Vec::new()));
+    }
+    let kind = workflow_run_status_kind(&record.run.status);
+    if !selector.kinds.contains(&kind) {
+        return Ok(Some(Vec::new()));
+    }
+    let event = build_webhook_workflow_run_status_event(
+        &record,
+        &selector,
+        tenant,
+        channel_id,
+        &state.relay_keypair,
+    )
+    .map_err(|message| internal_error(&message))?;
+    let event = serde_json::to_value(event)
+        .map_err(|error| internal_error(&format!("workflow run status event: {error}")))?;
+
+    Ok(Some(vec![event]))
 }
 
 /// Count events via HTTP bridge (NIP-98 auth). Returns `{"count": N}`.
@@ -1823,6 +2456,54 @@ pub async fn workflow_webhook(
         .map_err(|_| not_found("workflow not found"))?;
     let community_id = tenant.community();
 
+    let provided_secret = headers
+        .get("x-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| query.secret.clone())
+        .unwrap_or_default();
+    let idempotency_key = webhook_idempotency_key(&headers)
+        .map_err(|message| api_error(StatusCode::BAD_REQUEST, message))?;
+    let payload_hash = idempotency_key
+        .as_ref()
+        .map(|_| Sha256::digest(body.as_ref()).to_vec());
+
+    // Resolve a durable identity before consulting mutable workflow state. The
+    // immutable one-way credential verifier authenticates exact replay even
+    // after the workflow secret rotates. Eligibility below only controls
+    // whether a pending run may cross the execution fence.
+    if let (Some(idempotency_key), Some(payload_hash)) =
+        (idempotency_key.as_deref(), payload_hash.as_deref())
+    {
+        if let Some(record) = state
+            .db
+            .get_webhook_workflow_run(community_id, id, idempotency_key)
+            .await
+            .map_err(|error| super::internal_error(&format!("db error: {error}")))?
+        {
+            let prepared = prepare_keyed_webhook_run(
+                &state,
+                community_id,
+                record,
+                &provided_secret,
+                payload_hash,
+            )
+            .await?;
+            let response = keyed_webhook_response(&prepared.record, true);
+            if let Some((lease_id, execution_def, execution_trigger_ctx)) = prepared.execution {
+                spawn_webhook_run(
+                    &state,
+                    community_id,
+                    prepared.record.run.id,
+                    execution_def,
+                    execution_trigger_ctx,
+                    Some(lease_id),
+                );
+            }
+            return Ok((response.0, Json(response.1)));
+        }
+    }
+
     let workflow = state
         .db
         .get_workflow(community_id, id)
@@ -1839,15 +2520,10 @@ pub async fn workflow_webhook(
         ));
     }
 
-    // Verify webhook secret. Prefer header (not logged by proxies); fall back to query param.
+    // A new key and every legacy non-keyed call authenticate against the
+    // workflow's current credential. Existing keyed identities were handled
+    // above using their immutable verifier.
     let stored_secret = crate::webhook_secret::extract_secret(&workflow.definition);
-    let provided_secret = headers
-        .get("x-webhook-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| query.secret.clone())
-        .unwrap_or_default();
-
     match &stored_secret {
         Some(secret) => {
             if !crate::webhook_secret::verify_secret(&provided_secret, secret) {
@@ -1858,7 +2534,7 @@ pub async fn workflow_webhook(
         None => {
             return Err(api_error(
                 StatusCode::UNAUTHORIZED,
-                "webhook secret required but not configured — re-save the workflow to generate one",
+                "webhook secret required but not configured - re-save the workflow to generate one",
             ));
         }
     }
@@ -1890,10 +2566,13 @@ pub async fn workflow_webhook(
             trigger_ctx.webhook_fields.insert(k.clone(), val_str);
         }
     }
-    let trigger_ctx_json = serde_json::to_value(&trigger_ctx).ok();
+    let trigger_ctx_json = Some(
+        serde_json::to_value(&trigger_ctx)
+            .map_err(|error| super::internal_error(&format!("trigger context: {error}")))?,
+    );
 
-    // SEC-006: the webhook secret authenticates the *caller*, but the run
-    // executes with the workflow **owner's** standing authority — so the
+    // SEC-006: the webhook secret authenticates the caller, but the run
+    // executes with the workflow owner's standing authority, so the
     // secret alone is insufficient. Immediately before run creation, reject
     // disabled/inactive workflows and recheck the owner's current channel
     // membership (and role, for exfiltration-capable definitions). Fail
@@ -1912,54 +2591,61 @@ pub async fn workflow_webhook(
         .await
         .map_err(|_| not_found("workflow not found"))?;
 
+    if let (Some(idempotency_key), Some(payload_hash)) =
+        (idempotency_key.as_deref(), payload_hash.as_deref())
+    {
+        let (definition_snapshot, definition_hash, _) =
+            webhook_execution_snapshot(&workflow.definition)
+                .map_err(|message| api_error(StatusCode::BAD_REQUEST, message))?;
+        let credential_salt = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let credential_hash = webhook_replay_credential_hash(&provided_secret, &credential_salt);
+        let claim = state
+            .db
+            .claim_webhook_workflow_run(buzz_db::workflow::WebhookWorkflowRunClaimRequest {
+                community_id,
+                workflow_id: id,
+                channel_id: wf_channel_id,
+                definition: &definition_snapshot,
+                definition_hash: &definition_hash,
+                idempotency_key,
+                payload_hash,
+                credential_salt: &credential_salt,
+                credential_hash: &credential_hash,
+                trigger_context: trigger_ctx_json.as_ref(),
+            })
+            .await
+            .map_err(|error| super::internal_error(&format!("db error: {error}")))?;
+        let (record, replayed) = match claim {
+            buzz_db::workflow::WebhookWorkflowRunClaim::Created(record) => (record, false),
+            buzz_db::workflow::WebhookWorkflowRunClaim::Existing(record) => (record, true),
+            buzz_db::workflow::WebhookWorkflowRunClaim::PayloadConflict(record) => (record, true),
+        };
+        let prepared =
+            prepare_keyed_webhook_run(&state, community_id, record, &provided_secret, payload_hash)
+                .await?;
+        let response = keyed_webhook_response(&prepared.record, replayed);
+        if let Some((lease_id, execution_def, execution_trigger_ctx)) = prepared.execution {
+            spawn_webhook_run(
+                &state,
+                community_id,
+                prepared.record.run.id,
+                execution_def,
+                execution_trigger_ctx,
+                Some(lease_id),
+            );
+        }
+        return Ok((response.0, Json(response.1)));
+    }
+
+    // Preserve the legacy non-keyed behavior and definition, including its
+    // existing CallWebhook semantics. Only keyed runs require a secret-free
+    // durable execution snapshot.
     let run_id = state
         .db
         .create_workflow_run(community_id, id, None, trigger_ctx_json.as_ref())
         .await
-        .map_err(|e| super::internal_error(&format!("db error: {e}")))?;
-
-    // Spawn workflow execution asynchronously.
-    let engine = Arc::clone(&state.workflow_engine);
-    let db = state.db.clone();
-    let def_value = workflow.definition.clone();
-    let trigger_ctx_clone = trigger_ctx.clone();
-    tokio::spawn(async move {
-        let def: buzz_workflow::WorkflowDef = match serde_json::from_value(def_value) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("webhook: failed to parse definition: {e}");
-                if let Err(db_err) = db
-                    .update_workflow_run(
-                        community_id,
-                        run_id,
-                        buzz_db::workflow::RunStatus::Failed,
-                        0,
-                        &serde_json::json!([]),
-                        Some(&format!("definition parse error: {e}")),
-                    )
-                    .await
-                {
-                    tracing::error!("webhook: failed to mark run as failed: {db_err}");
-                }
-                return;
-            }
-        };
-
-        let result = buzz_workflow::executor::execute_from_step(
-            &engine,
-            community_id,
-            run_id,
-            &def,
-            &trigger_ctx_clone,
-            0,
-            None,
-        )
-        .await;
-        engine
-            .finalize_run(community_id, run_id, result, None)
-            .await;
-    });
-
+        .map_err(|error| super::internal_error(&format!("db error: {error}")))?;
+    spawn_webhook_run(&state, community_id, run_id, def, trigger_ctx, None);
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -2295,6 +2981,414 @@ mod tests {
         ];
 
         assert!(!has_mixed_search_filters(&filters));
+    }
+
+    #[test]
+    fn webhook_idempotency_header_requires_one_contract_safe_value() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(webhook_idempotency_key(&headers), Ok(None));
+
+        headers.insert(
+            "x-idempotency-key",
+            axum::http::HeaderValue::from_static("agency-brain:synthetic_123-4"),
+        );
+        assert_eq!(
+            webhook_idempotency_key(&headers),
+            Ok(Some("agency-brain:synthetic_123-4".to_owned()))
+        );
+
+        headers.append(
+            "x-idempotency-key",
+            axum::http::HeaderValue::from_static("duplicate"),
+        );
+        assert!(webhook_idempotency_key(&headers).is_err());
+    }
+
+    #[test]
+    fn webhook_idempotency_header_rejects_ambiguous_values() {
+        for value in ["", "contains spaces", "contains/slash", "contains.dot"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-idempotency-key",
+                axum::http::HeaderValue::from_str(value).expect("test header value"),
+            );
+            assert!(
+                webhook_idempotency_key(&headers).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+        assert!(!valid_webhook_idempotency_key(&"a".repeat(257)));
+    }
+
+    #[test]
+    fn webhook_replay_credential_verifier_is_bound_to_creation_secret() {
+        let salt = [0x17u8; 16];
+        let hash = webhook_replay_credential_hash("creation-secret", &salt);
+
+        assert!(verify_webhook_replay_credential(
+            "creation-secret",
+            &salt,
+            &hash,
+        ));
+        assert!(
+            !verify_webhook_replay_credential("rotated-current-secret", &salt, &hash),
+            "rotating the mutable workflow secret must not change the creation verifier"
+        );
+        assert!(!verify_webhook_replay_credential(
+            "creation-secret",
+            &[0x17u8; 15],
+            &hash,
+        ));
+    }
+
+    #[test]
+    fn webhook_execution_snapshot_removes_recoverable_credentials() {
+        let definition = serde_json::json!({
+            "name": "safe webhook",
+            "trigger": {"on": "webhook"},
+            "steps": [{
+                "id": "send",
+                "action": "send_message",
+                "text": "{{webhook.message}}"
+            }],
+            "enabled": true,
+            "_webhook_secret": "creation-secret",
+            "outbound_auth": {"bearer": "outbound-token"}
+        });
+
+        let (snapshot, definition_hash, _) =
+            webhook_execution_snapshot(&definition).expect("safe snapshot");
+        let encoded = snapshot.to_string();
+        assert!(snapshot.get("_webhook_secret").is_none());
+        assert!(snapshot.get("outbound_auth").is_none());
+        assert!(!encoded.contains("creation-secret"));
+        assert!(!encoded.contains("outbound-token"));
+        assert_eq!(definition_hash.len(), 32);
+    }
+
+    #[test]
+    fn keyed_webhook_snapshot_rejects_outbound_webhook_credentials() {
+        let definition = serde_json::json!({
+            "name": "unsafe webhook",
+            "trigger": {"on": "webhook"},
+            "steps": [{
+                "id": "forward",
+                "action": "call_webhook",
+                "url": "https://example.invalid/hook?token=url-secret",
+                "headers": {"Authorization": "Bearer header-secret"},
+                "body": "api_key=body-secret"
+            }],
+            "enabled": true,
+            "_webhook_secret": "creation-secret"
+        });
+
+        assert_eq!(
+            webhook_execution_snapshot(&definition).expect_err("outbound snapshot must fail"),
+            "keyed webhook runs cannot snapshot call_webhook actions"
+        );
+    }
+
+    #[test]
+    fn keyed_webhook_response_contract_distinguishes_new_and_replay() {
+        let run_id = uuid::Uuid::new_v4();
+        let workflow_id = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let record = buzz_db::workflow::WebhookWorkflowRunRecord {
+            run: buzz_db::workflow::WorkflowRunRecord {
+                id: run_id,
+                community_id: buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+                workflow_id,
+                status: buzz_db::workflow::RunStatus::Pending,
+                trigger_event_id: None,
+                current_step: 0,
+                execution_trace: serde_json::json!([]),
+                trigger_context: Some(serde_json::json!({
+                    "channel_id": channel_id.to_string()
+                })),
+                started_at: None,
+                completed_at: None,
+                error_message: None,
+                created_at: now,
+            },
+            idempotency_key: "agency-brain:run_1".to_owned(),
+            payload_hash: vec![0xab; 32],
+            credential_salt: vec![0x11; 16],
+            credential_hash: vec![0x22; 32],
+            channel_id,
+            definition: serde_json::json!({"trigger":{"on":"webhook"},"steps":[]}),
+            definition_hash: vec![0; 32],
+        };
+
+        let (new_status, new_body) = keyed_webhook_response(&record, false);
+        assert_eq!(new_status, StatusCode::ACCEPTED);
+        assert_eq!(
+            new_body,
+            serde_json::json!({
+                "external_run_id": run_id.to_string(),
+                "run_id": run_id.to_string(),
+                "workflow_id": workflow_id.to_string(),
+                "idempotency_key": "agency-brain:run_1",
+                "payload_hash": "ab".repeat(32),
+                "status": "pending",
+                "terminal": false,
+                "replayed": false,
+            })
+        );
+
+        let (replay_status, replay_body) = keyed_webhook_response(&record, true);
+        assert_eq!(replay_status, StatusCode::OK);
+        assert_eq!(replay_body["replayed"], true);
+        assert_eq!(replay_body["payload_hash"], "ab".repeat(32));
+        assert_eq!(replay_body["run_id"], run_id.to_string());
+
+        let (conflict_status, Json(conflict_body)) = keyed_webhook_payload_conflict(&record);
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        assert_eq!(conflict_body["run_id"], run_id.to_string());
+        assert_eq!(conflict_body["replayed"], true);
+        assert_eq!(
+            conflict_body["error"],
+            "idempotency key is already bound to a different payload"
+        );
+    }
+
+    #[test]
+    fn workflow_run_status_selector_accepts_exact_reconciler_filter() {
+        let workflow_id = uuid::Uuid::new_v4();
+        let filter = serde_json::json!({
+            "kinds": [46001, 46005, 46006, 46007],
+            "#d": [workflow_id.to_string()],
+            "#i": ["agency-brain:synthetic_123"],
+            "limit": 1,
+        });
+        assert_eq!(
+            parse_workflow_run_status_selector(&[filter]),
+            Ok(Some(WorkflowRunStatusSelector {
+                workflow_id,
+                idempotency_key: "agency-brain:synthetic_123".to_owned(),
+                kinds: vec![46001, 46005, 46006, 46007],
+            }))
+        );
+    }
+
+    #[test]
+    fn workflow_run_status_selector_rejects_broad_or_ambiguous_filters() {
+        let workflow_id = uuid::Uuid::new_v4().to_string();
+        let broad = serde_json::json!({
+            "kinds": [46001, 9],
+            "#d": [workflow_id],
+            "#i": ["agency-brain:run_1"],
+            "limit": 1,
+        });
+        assert!(parse_workflow_run_status_selector(&[broad]).is_err());
+
+        let with_extra_scope = serde_json::json!({
+            "kinds": [46005],
+            "#d": [uuid::Uuid::new_v4().to_string()],
+            "#i": ["agency-brain:run_1"],
+            "#h": [uuid::Uuid::new_v4().to_string()],
+            "limit": 1,
+        });
+        assert!(parse_workflow_run_status_selector(&[with_extra_scope]).is_err());
+    }
+
+    #[test]
+    fn workflow_run_output_ids_are_validated_and_deduplicated() {
+        let event_a = "a".repeat(64);
+        let event_b = "b".repeat(64);
+        let trace = serde_json::json!([
+            {"step_id":"one", "output":{"event_id":event_a.clone()}},
+            {"step_id":"two", "output":{"event_id":event_b.clone()}},
+            {"step_id":"three", "output":{"event_id":event_a.clone()}},
+            {"step_id":"four", "output":{"status":200}}
+        ]);
+        assert_eq!(
+            workflow_run_output_event_ids(&trace),
+            Ok(vec!["a".repeat(64), "b".repeat(64)])
+        );
+        assert!(workflow_run_output_event_ids(&serde_json::json!([
+            {"output":{"event_id":"not-an-event-id"}}
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn webhook_run_status_uses_immutable_matching_channel_snapshot() {
+        let channel_a = uuid::Uuid::new_v4();
+        let channel_b = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let mut record = buzz_db::workflow::WebhookWorkflowRunRecord {
+            run: buzz_db::workflow::WorkflowRunRecord {
+                id: uuid::Uuid::new_v4(),
+                community_id: buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+                workflow_id: uuid::Uuid::new_v4(),
+                status: buzz_db::workflow::RunStatus::Pending,
+                trigger_event_id: None,
+                current_step: 0,
+                execution_trace: serde_json::json!([]),
+                trigger_context: Some(serde_json::json!({
+                    "channel_id": channel_a.to_string()
+                })),
+                started_at: None,
+                completed_at: None,
+                error_message: None,
+                created_at: now,
+            },
+            idempotency_key: "agency-brain:run_1".to_owned(),
+            payload_hash: vec![0; 32],
+            credential_salt: vec![0x11; 16],
+            credential_hash: vec![0x22; 32],
+            channel_id: channel_a,
+            definition: serde_json::json!({"trigger":{"on":"webhook"},"steps":[]}),
+            definition_hash: vec![0; 32],
+        };
+        assert_eq!(webhook_run_channel_snapshot(&record), Some(channel_a));
+
+        record.channel_id = channel_b;
+        assert_eq!(
+            webhook_run_channel_snapshot(&record),
+            None,
+            "a mismatched DB/context snapshot must fail closed"
+        );
+        record.run.trigger_context = None;
+        assert_eq!(
+            webhook_run_channel_snapshot(&record),
+            None,
+            "a missing snapshot must fail closed"
+        );
+    }
+
+    #[test]
+    fn webhook_workflow_run_status_event_has_exact_reconciler_shape() {
+        let run_id = uuid::Uuid::new_v4();
+        let workflow_id = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let output_id = "c".repeat(64);
+        let record = buzz_db::workflow::WebhookWorkflowRunRecord {
+            run: buzz_db::workflow::WorkflowRunRecord {
+                id: run_id,
+                community_id: buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4()),
+                workflow_id,
+                status: buzz_db::workflow::RunStatus::Completed,
+                trigger_event_id: None,
+                current_step: 1,
+                execution_trace: serde_json::json!([
+                    {"step_id":"send", "status":"completed", "output":{"event_id":output_id}}
+                ]),
+                trigger_context: Some(serde_json::json!({
+                    "channel_id": channel_id.to_string()
+                })),
+                started_at: Some(now),
+                completed_at: Some(now),
+                error_message: None,
+                created_at: now,
+            },
+            idempotency_key: "agency-brain:run_1".to_owned(),
+            payload_hash: vec![0xab; 32],
+            credential_salt: vec![0x11; 16],
+            credential_hash: vec![0x22; 32],
+            channel_id,
+            definition: serde_json::json!({"trigger":{"on":"webhook"},"steps":[]}),
+            definition_hash: vec![0; 32],
+        };
+        let selector = WorkflowRunStatusSelector {
+            workflow_id,
+            idempotency_key: "agency-brain:run_1".to_owned(),
+            kinds: WORKFLOW_RUN_STATUS_KINDS.to_vec(),
+        };
+        let tenant = fresh_tenant("buzz.acme.example:8443");
+        let event = build_webhook_workflow_run_status_event(
+            &record,
+            &selector,
+            &tenant,
+            channel_id,
+            &Keys::generate(),
+        )
+        .expect("build status event");
+        event.verify().expect("status receipt signature");
+        let event_json = serde_json::to_value(&event).expect("serialize status event");
+        assert_eq!(event_json["kind"], 46005);
+        assert_eq!(
+            event_json["tags"],
+            serde_json::json!([
+                ["d", workflow_id.to_string()],
+                ["i", "agency-brain:run_1"],
+                ["r", run_id.to_string()],
+                ["h", channel_id.to_string()],
+                ["tenant_host", "buzz.acme.example:8443"],
+                ["status", "completed"],
+            ])
+        );
+        let content: Value = serde_json::from_str(
+            event_json["content"]
+                .as_str()
+                .expect("event content string"),
+        )
+        .expect("parse event content");
+        assert_eq!(
+            content,
+            serde_json::json!({
+                "external_run_id": run_id.to_string(),
+                "run_id": run_id.to_string(),
+                "workflow_id": workflow_id.to_string(),
+                "idempotency_key": "agency-brain:run_1",
+                "payload_hash": "ab".repeat(32),
+                "tenant_host": "buzz.acme.example:8443",
+                "status": "completed",
+                "terminal": true,
+                "output_event_ids": [output_id.clone()],
+                "thread_ids": [output_id.clone()],
+                "message_ids": [output_id.clone()],
+                "thread_id": output_id.clone(),
+                "message_id": output_id,
+                "created_at": now.to_rfc3339(),
+                "started_at": now.to_rfc3339(),
+                "completed_at": now.to_rfc3339(),
+            })
+        );
+        assert!(
+            !content["tenant_host"]
+                .as_str()
+                .expect("tenant host string")
+                .contains("://"),
+            "the signed binding is a normalized host authority, never an inferred URL"
+        );
+
+        let mut tampered_tag = event_json.clone();
+        tampered_tag["tags"][4][1] = Value::String("buzz.other.example:8443".to_owned());
+        let tampered_tag_event: nostr::Event =
+            serde_json::from_value(tampered_tag).expect("parse tag-tampered event");
+        assert!(
+            tampered_tag_event.verify().is_err(),
+            "changing the tenant-host tag must invalidate the signed receipt"
+        );
+
+        let mut tampered_content = content;
+        tampered_content["tenant_host"] = Value::String("buzz.other.example:8443".to_owned());
+        let mut tampered_content_event = event_json;
+        tampered_content_event["content"] = Value::String(
+            serde_json::to_string(&tampered_content).expect("serialize tampered content"),
+        );
+        let tampered_content_event: nostr::Event =
+            serde_json::from_value(tampered_content_event).expect("parse content-tampered event");
+        assert!(
+            tampered_content_event.verify().is_err(),
+            "changing the tenant-host content field must invalidate the signed receipt"
+        );
+    }
+
+    #[test]
+    fn workflow_run_status_maps_terminal_lifecycle_kinds() {
+        use buzz_db::workflow::RunStatus;
+        assert_eq!(workflow_run_status_kind(&RunStatus::Pending), 46001);
+        assert_eq!(workflow_run_status_kind(&RunStatus::Running), 46001);
+        assert_eq!(workflow_run_status_kind(&RunStatus::WaitingApproval), 46001);
+        assert_eq!(workflow_run_status_kind(&RunStatus::Completed), 46005);
+        assert_eq!(workflow_run_status_kind(&RunStatus::Failed), 46006);
+        assert_eq!(workflow_run_status_kind(&RunStatus::Cancelled), 46007);
+        assert!(workflow_run_is_terminal(&RunStatus::Completed));
+        assert!(!workflow_run_is_terminal(&RunStatus::Running));
     }
 
     #[test]
