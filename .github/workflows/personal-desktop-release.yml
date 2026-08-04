@@ -950,6 +950,7 @@ jobs:
       - name: Build matching sidecars
         env:
           BASH_ENV: ""
+          BUZZ_BUILD_SOURCE_SHA: ${{ steps.build-contract.outputs.source_sha }}
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
         run: |

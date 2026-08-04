@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::DedupMode;
+use crate::authorization::AuthorizationReceiptSeed;
 
 /// Maximum events queued per channel before oldest events are dropped.
 const MAX_PENDING_PER_CHANNEL: usize = 500;
@@ -49,6 +50,8 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Secret-free author-gate evidence carried to the actual turn-start seam.
+    pub authorization_receipt: Option<AuthorizationReceiptSeed>,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -57,6 +60,7 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    pub authorization_receipt: Option<AuthorizationReceiptSeed>,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -341,6 +345,7 @@ impl EventQueue {
                 event: qe.event,
                 prompt_tag: qe.prompt_tag,
                 received_at: qe.received_at,
+                authorization_receipt: qe.authorization_receipt,
             })
             .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
@@ -480,6 +485,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                authorization_receipt: be.authorization_receipt,
             });
         }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
@@ -515,6 +521,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                authorization_receipt: be.authorization_receipt,
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
@@ -1003,9 +1010,17 @@ pub struct PromptChannelInfo {
     /// Verified tri-state used by security decisions. Unknown must never be
     /// interpreted as a regular channel.
     pub classification: crate::relay::ChannelClassification,
+    /// Canonical current relay-authored kind:39000 event ID.
+    pub metadata_event_id: String,
+    /// Canonical kind:39000 timestamp rendered as UTC RFC3339.
+    pub metadata_created_at: String,
+    /// Independently pinned relay signer for the verified metadata event.
+    pub metadata_author_pubkey: String,
     /// Canonical two-party/group membership from relay-authored DM metadata.
     /// `None` for regular channels or malformed/unavailable DM metadata.
     pub participant_pubkeys: Option<Vec<String>>,
+    /// Verified NIP-29 participant commitment for DMs.
+    pub participant_set_commitment_sha256: Option<String>,
 }
 
 /// Minimal profile fields needed to label users in ACP prompts.

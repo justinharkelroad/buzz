@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod authorization;
 mod config;
 mod engram_fetch;
 mod filter;
@@ -20,6 +21,10 @@ use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
+use authorization::{
+    AuthorGateDecision, AuthorizationReceiptContext, ChannelEvidence,
+    InvocationPolicyEvidence,
+};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -221,37 +226,124 @@ async fn is_owner_or_sibling(
 /// set. The second bit is meaningful only for DMs and is derived from the
 /// relay-authored kind:39000 participant tags, never from sender-controlled
 /// message `p` tags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthorGateChannel {
     Unknown,
-    Regular,
-    Dm { exact_two_party_dm: bool },
+    Regular {
+        metadata_event_id: Option<String>,
+        metadata_created_at: Option<String>,
+        metadata_author_pubkey: Option<String>,
+    },
+    Dm {
+        exact_two_party_dm: bool,
+        participant_pubkeys: Vec<String>,
+        participant_set_commitment_sha256: Option<String>,
+        metadata_event_id: Option<String>,
+        metadata_created_at: Option<String>,
+        metadata_author_pubkey: Option<String>,
+    },
 }
 
 impl AuthorGateChannel {
-    const fn regular() -> Self {
-        Self::Regular
+    fn regular() -> Self {
+        Self::Regular {
+            metadata_event_id: None,
+            metadata_created_at: None,
+            metadata_author_pubkey: None,
+        }
     }
 
-    const fn dm(exact_two_party_dm: bool) -> Self {
-        Self::Dm { exact_two_party_dm }
+    fn dm(exact_two_party_dm: bool) -> Self {
+        Self::Dm {
+            exact_two_party_dm,
+            participant_pubkeys: Vec::new(),
+            participant_set_commitment_sha256: None,
+            metadata_event_id: None,
+            metadata_created_at: None,
+            metadata_author_pubkey: None,
+        }
     }
 
     const fn unknown() -> Self {
         Self::Unknown
     }
 
-    const fn is_dm(self) -> bool {
+    const fn is_dm(&self) -> bool {
         matches!(self, Self::Dm { .. })
     }
 
-    const fn exact_two_party_dm(self) -> bool {
+    const fn exact_two_party_dm(&self) -> bool {
         matches!(
             self,
             Self::Dm {
-                exact_two_party_dm: true
+                exact_two_party_dm: true,
+                ..
             }
         )
+    }
+
+    const fn is_regular(&self) -> bool {
+        matches!(self, Self::Regular { .. })
+    }
+
+    fn participant_count(&self) -> Option<usize> {
+        match self {
+            Self::Dm {
+                participant_pubkeys,
+                ..
+            } if !participant_pubkeys.is_empty() => Some(participant_pubkeys.len()),
+            _ => None,
+        }
+    }
+
+    fn evidence(&self, channel_id: Uuid) -> ChannelEvidence {
+        match self {
+            Self::Unknown => ChannelEvidence {
+                channel_id,
+                channel_type: "unknown",
+                participant_pubkeys: Vec::new(),
+                participant_set_commitment_sha256: None,
+                participant_metadata_event_id: None,
+                participant_metadata_created_at: None,
+                participant_metadata_author_pubkey: None,
+                participant_metadata_verified: false,
+                participant_metadata_current_for_coordinate: false,
+            },
+            Self::Regular {
+                metadata_event_id,
+                metadata_created_at,
+                metadata_author_pubkey,
+            } => ChannelEvidence {
+                channel_id,
+                channel_type: "regular",
+                participant_pubkeys: Vec::new(),
+                participant_set_commitment_sha256: None,
+                participant_metadata_event_id: metadata_event_id.clone(),
+                participant_metadata_created_at: metadata_created_at.clone(),
+                participant_metadata_author_pubkey: metadata_author_pubkey.clone(),
+                participant_metadata_verified: metadata_event_id.is_some(),
+                participant_metadata_current_for_coordinate: metadata_event_id.is_some(),
+            },
+            Self::Dm {
+                participant_pubkeys,
+                participant_set_commitment_sha256,
+                metadata_event_id,
+                metadata_created_at,
+                metadata_author_pubkey,
+                ..
+            } => ChannelEvidence {
+                channel_id,
+                channel_type: "dm",
+                participant_pubkeys: participant_pubkeys.clone(),
+                participant_set_commitment_sha256: participant_set_commitment_sha256.clone(),
+                participant_metadata_event_id: metadata_event_id.clone(),
+                participant_metadata_created_at: metadata_created_at.clone(),
+                participant_metadata_author_pubkey: metadata_author_pubkey.clone(),
+                participant_metadata_verified: metadata_event_id.is_some()
+                    && participant_set_commitment_sha256.is_some(),
+                participant_metadata_current_for_coordinate: metadata_event_id.is_some(),
+            },
+        }
     }
 }
 
@@ -276,6 +368,77 @@ impl AuthorGateChannel {
 /// agent and the event author. This prevents a third participant from planting
 /// hidden prompt context or observing the delegated agent response. Callers
 /// must resolve unknown channel metadata as a non-eligible DM.
+async fn author_gate_decision(
+    respond_to: &RespondTo,
+    allowlist: &HashSet<String>,
+    author: &str,
+    channel: &AuthorGateChannel,
+    owner_cache: &OwnerCache,
+    rest_client: &relay::RestClient,
+) -> AuthorGateDecision {
+    if !channel.is_regular() {
+        return match respond_to {
+            RespondTo::Nobody => AuthorGateDecision::DeniedNobody,
+            RespondTo::Allowlist => {
+                if channel.exact_two_party_dm() && allowlist.contains(author) {
+                    AuthorGateDecision::AllowedExplicitAllowlist
+                } else if is_owner_or_sibling(author, owner_cache, rest_client).await {
+                    AuthorGateDecision::AllowedOwnerOrSibling
+                } else {
+                    match channel {
+                        AuthorGateChannel::Dm {
+                            participant_pubkeys,
+                            ..
+                        } if participant_pubkeys.len() > 2 => {
+                            AuthorGateDecision::DeniedGroupDm
+                        }
+                        AuthorGateChannel::Dm {
+                            exact_two_party_dm: true,
+                            ..
+                        } => AuthorGateDecision::DeniedNotAllowlisted,
+                        AuthorGateChannel::Dm { .. } => {
+                            AuthorGateDecision::DeniedDmParticipantMismatch
+                        }
+                        AuthorGateChannel::Unknown => {
+                            AuthorGateDecision::DeniedUnverifiedChannelMetadata
+                        }
+                        AuthorGateChannel::Regular { .. } => unreachable!(),
+                    }
+                }
+            }
+            RespondTo::Anyone | RespondTo::OwnerOnly => {
+                if is_owner_or_sibling(author, owner_cache, rest_client).await {
+                    AuthorGateDecision::AllowedOwnerOrSibling
+                } else if *respond_to == RespondTo::OwnerOnly {
+                    AuthorGateDecision::DeniedOwnerOnly
+                } else {
+                    AuthorGateDecision::DeniedDmNotOwnerOrSibling
+                }
+            }
+        };
+    }
+    match respond_to {
+        RespondTo::Anyone => AuthorGateDecision::AllowedAnyone,
+        RespondTo::Nobody => AuthorGateDecision::DeniedNobody,
+        RespondTo::OwnerOnly => {
+            if is_owner_or_sibling(author, owner_cache, rest_client).await {
+                AuthorGateDecision::AllowedOwnerOrSibling
+            } else {
+                AuthorGateDecision::DeniedOwnerOnly
+            }
+        }
+        RespondTo::Allowlist => {
+            if allowlist.contains(author) {
+                AuthorGateDecision::AllowedExplicitAllowlist
+            } else if is_owner_or_sibling(author, owner_cache, rest_client).await {
+                AuthorGateDecision::AllowedOwnerOrSibling
+            } else {
+                AuthorGateDecision::DeniedNotAllowlisted
+            }
+        }
+    }
+}
+
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
@@ -284,27 +447,16 @@ async fn author_allowed(
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
 ) -> bool {
-    if channel != AuthorGateChannel::Regular {
-        return match respond_to {
-            RespondTo::Nobody => false,
-            RespondTo::Allowlist => {
-                (channel.exact_two_party_dm() && allowlist.contains(author))
-                    || is_owner_or_sibling(author, owner_cache, rest_client).await
-            }
-            RespondTo::Anyone | RespondTo::OwnerOnly => {
-                is_owner_or_sibling(author, owner_cache, rest_client).await
-            }
-        };
-    }
-    match respond_to {
-        RespondTo::Anyone => true,
-        RespondTo::Nobody => false,
-        RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
-        RespondTo::Allowlist => {
-            allowlist.contains(author)
-                || is_owner_or_sibling(author, owner_cache, rest_client).await
-        }
-    }
+    author_gate_decision(
+        respond_to,
+        allowlist,
+        author,
+        &channel,
+        owner_cache,
+        rest_client,
+    )
+    .await
+    .is_allowed()
 }
 
 /// Resolve the sender used by the agent instruction gate.
@@ -380,10 +532,22 @@ pub(crate) async fn resolve_author_gate_channel(
             expected.sort();
             let exact_two_party_dm = agent_pubkey != author
                 && info.participant_pubkeys.as_deref() == Some(expected.as_slice());
-            AuthorGateChannel::dm(exact_two_party_dm)
+            AuthorGateChannel::Dm {
+                exact_two_party_dm,
+                participant_pubkeys: info.participant_pubkeys.unwrap_or_default(),
+                participant_set_commitment_sha256: info
+                    .participant_set_commitment_sha256,
+                metadata_event_id: Some(info.metadata_event_id),
+                metadata_created_at: Some(info.metadata_created_at),
+                metadata_author_pubkey: Some(info.metadata_author_pubkey),
+            }
         }
         Some(info) if info.classification == relay::ChannelClassification::Regular => {
-            AuthorGateChannel::regular()
+            AuthorGateChannel::Regular {
+                metadata_event_id: Some(info.metadata_event_id),
+                metadata_created_at: Some(info.metadata_created_at),
+                metadata_author_pubkey: Some(info.metadata_author_pubkey),
+            }
         }
         Some(_) | None => {
             tracing::warn!(
@@ -1787,6 +1951,37 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    let invocation_policy_evidence = if config.authorization_decision_receipts {
+        authorization::resolve_invocation_policy_evidence(
+            &relay.rest_client(),
+            &pubkey_hex,
+            startup_owner.as_deref(),
+            &config.respond_to,
+            &config.respond_to_allowlist,
+        )
+        .await
+    } else {
+        InvocationPolicyEvidence::default()
+    };
+    if config.authorization_decision_receipts {
+        tracing::info!(
+            target: "buzz_acp::authorization",
+            owner_binding_verified = invocation_policy_evidence.agent_owner_binding_verified,
+            policy_event_verified = invocation_policy_evidence.policy_event_verified,
+            policy_current_for_coordinate = invocation_policy_evidence.policy_current_for_coordinate,
+            policy_matches_runtime = invocation_policy_evidence.policy_matches_runtime,
+            "authorization decision receipt provenance resolved"
+        );
+    }
+    let authorization_receipts = AuthorizationReceiptContext::new(
+        config.authorization_decision_receipts,
+        pubkey_hex.clone(),
+        invocation_policy_evidence,
+        config.authorization_decision_receipt_path.as_deref(),
+        observer.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!("authorization receipt setup failed: {error}"))?;
+
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -2453,7 +2648,7 @@ async fn tokio_main() -> Result<()> {
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
-                            {
+                            let authorization_receipt = {
                                 let author = effective_instruction_author(
                                     &buzz_event.event,
                                     trusted_relay_pubkey.as_ref(),
@@ -2469,27 +2664,40 @@ async fn tokio_main() -> Result<()> {
                                     &ctx.channel_info,
                                 )
                                 .await;
-                                let allowed = author_allowed(
+                                let decision = author_gate_decision(
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
                                     &author,
-                                    channel,
+                                    &channel,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
                                 .await;
-                                if !allowed {
+                                let receipt = authorization_receipts.seed(
+                                    &buzz_event.event,
+                                    author,
+                                    channel.evidence(buzz_event.channel_id),
+                                    &config.respond_to,
+                                    decision,
+                                );
+                                if let Some(receipt) = &receipt {
+                                    receipt.emit_gate_evaluated();
+                                }
+                                if !decision.is_allowed() {
                                     tracing::debug!(
                                         channel_id = %buzz_event.channel_id,
                                         author = %buzz_event.event.pubkey.to_hex(),
                                         mode = %config.respond_to,
                                         is_dm = channel.is_dm(),
                                         exact_two_party_dm = channel.exact_two_party_dm(),
+                                        participant_count = channel.participant_count(),
+                                        decision = decision.as_str(),
                                         "inbound author gate — dropping event"
                                     );
                                     continue;
                                 }
-                            }
+                                receipt
+                            };
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
                             let prompt_tag = match matched {
@@ -2520,6 +2728,7 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                authorization_receipt,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -3196,6 +3405,7 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        authorization_receipt: None,
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");

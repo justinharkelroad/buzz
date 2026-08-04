@@ -503,7 +503,12 @@ impl ChannelInfoResolver {
                         name: info.name,
                         channel_type: info.channel_type,
                         classification: info.classification,
+                        metadata_event_id: info.metadata_event_id,
+                        metadata_created_at: info.metadata_created_at,
+                        metadata_author_pubkey: info.metadata_author_pubkey,
                         participant_pubkeys: info.participant_pubkeys,
+                        participant_set_commitment_sha256: info
+                            .participant_set_commitment_sha256,
                     },
                 ))
             })
@@ -1508,6 +1513,13 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    if let Some(batch) = &batch {
+        for event in &batch.events {
+            if let Some(receipt) = &event.authorization_receipt {
+                receipt.emit_turn_dispatched(&turn_id, &turn_started_at);
+            }
+        }
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         None,
@@ -2511,7 +2523,12 @@ pub(crate) async fn fetch_channel_info(
                     name: info.name,
                     channel_type: info.channel_type,
                     classification: info.classification,
+                    metadata_event_id: info.metadata_event_id,
+                    metadata_created_at: info.metadata_created_at,
+                    metadata_author_pubkey: info.metadata_author_pubkey,
                     participant_pubkeys: info.participant_pubkeys,
+                    participant_set_commitment_sha256: info
+                        .participant_set_commitment_sha256,
                 })
             }
             Ok(Err(e)) => {

@@ -458,6 +458,20 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
+    /// Emit secret-free machine-readable author-gate and turn-start records.
+    /// Intended for private acceptance evidence; disabled by default.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPTS",
+        default_value_t = false
+    )]
+    pub authorization_decision_receipts: bool,
+
+    /// Absolute path of the private append-only JSONL decision receipt file.
+    /// Required when authorization decision receipts are enabled.
+    #[arg(long, env = "BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPT_PATH")]
+    pub authorization_decision_receipt_path: Option<PathBuf>,
+
     /// Comma-separated list of allowed `--respond-to` modes.
     /// When set, the harness rejects startup if `--respond-to` is not in this list.
     /// Modes: owner-only, allowlist, anyone, nobody.
@@ -542,6 +556,11 @@ pub struct Config {
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
+    /// Whether to emit structured private acceptance records for author-gate
+    /// decisions and the later turn-start boundary.
+    pub authorization_decision_receipts: bool,
+    /// Private JSONL sink for authorization decision records.
+    pub authorization_decision_receipt_path: Option<PathBuf>,
     /// Allowed `respond_to` modes. Empty = all modes allowed.
     pub allowed_respond_to: Vec<String>,
     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
@@ -1060,6 +1079,25 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        if args.authorization_decision_receipts
+            && args.authorization_decision_receipt_path.is_none()
+        {
+            return Err(ConfigError::ConfigFile(
+                "--authorization-decision-receipts requires \
+                 --authorization-decision-receipt-path"
+                    .into(),
+            ));
+        }
+        if !args.authorization_decision_receipts
+            && args.authorization_decision_receipt_path.is_some()
+        {
+            return Err(ConfigError::ConfigFile(
+                "--authorization-decision-receipt-path requires \
+                 --authorization-decision-receipts"
+                    .into(),
+            ));
+        }
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1101,6 +1139,8 @@ impl Config {
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
+            authorization_decision_receipts: args.authorization_decision_receipts,
+            authorization_decision_receipt_path: args.authorization_decision_receipt_path,
             allowed_respond_to,
             persona_env_vars,
             has_generated_codex_config,
@@ -1131,7 +1171,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} authorization_decision_receipts={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1152,6 +1192,7 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            self.authorization_decision_receipts,
             respond_to_detail,
             allowed_respond_to_detail,
         )
