@@ -145,9 +145,18 @@ pub struct ChannelInfo {
     pub name: String,
     pub channel_type: String,
     pub classification: ChannelClassification,
+    /// Canonical current relay-authored kind:39000 event ID.
+    pub metadata_event_id: String,
+    /// Canonical metadata event timestamp rendered as UTC RFC3339.
+    pub metadata_created_at: String,
+    /// Relay signer that was independently pinned through NIP-11.
+    pub metadata_author_pubkey: String,
     /// Canonical participant pubkeys from relay-authored DM metadata.
     /// `None` means non-DM metadata or malformed DM participant tags.
     pub participant_pubkeys: Option<Vec<String>>,
+    /// Verified NIP-29 DM participant-set commitment. `None` for regular
+    /// channels; malformed commitments never reach this structure.
+    pub participant_set_commitment_sha256: Option<String>,
 }
 
 fn verified_channel_info(
@@ -168,12 +177,27 @@ fn verified_channel_info(
         buzz_core::dm::VerifiedChannelKind::Regular => ChannelClassification::Regular,
         buzz_core::dm::VerifiedChannelKind::Dm => ChannelClassification::Dm,
     };
+    let participant_set_commitment_sha256 = if classification == ChannelClassification::Dm {
+        let participant_bytes = metadata
+            .participant_pubkeys
+            .iter()
+            .map(|pubkey| nostr::PublicKey::from_hex(pubkey).map(|key| key.to_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(buzz_core::dm::dm_participant_commitment_hex(&participant_bytes).ok()?)
+    } else {
+        None
+    };
     Some(ChannelInfo {
         name: metadata.name,
         channel_type: metadata.channel_type,
         classification,
+        metadata_event_id: event.id.to_hex(),
+        metadata_created_at: crate::authorization::nostr_timestamp_rfc3339(event.created_at)?,
+        metadata_author_pubkey: event.pubkey.to_hex(),
         participant_pubkeys: (classification == ChannelClassification::Dm)
             .then_some(metadata.participant_pubkeys),
+        participant_set_commitment_sha256,
     })
 }
 

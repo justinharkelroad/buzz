@@ -815,10 +815,16 @@ short-lived private files:
   current relay-signed DM metadata, current relay-signed DM membership,
   database invariants, denied group-DM and unauthorized-third-party probes,
   and hosted-Buzz unchanged evidence.
-- A `personal-desktop-multi-user-acceptance/v2` manifest based on the field
+- A `personal-desktop-multi-user-acceptance/v3` manifest based on the field
   structure in `deploy/personal-relay/desktop-multi-user-acceptance.example.json`.
   The checked-in example has an `example_only: true` poison pill and must be
-  rejected; it is never acceptance evidence.
+  rejected; it is never acceptance evidence. The v3 contract binds
+  machine-emitted `buzz-acp-authorization-decision/v1` records: each DM turn
+  carries its `gate_evaluated` and `turn_dispatched` pair linked by a shared
+  `decision_id`, each negative probe carries its `gate_evaluated` denial, for
+  48 decision records and 192 domain-separated receipt hashes total, per the
+  derivation documented in `deploy/personal-relay/README.md` and enforced by
+  `validate-desktop-multi-user-acceptance-formula-test.sh`.
 
 Keep both files private with no group or world permission bits; do not commit
 either file or publish either one as a public Actions artifact.
@@ -840,7 +846,7 @@ from the validator's current time, not merely one hour after the recorded
 completion. It deliberately does not authenticate the opaque bundle, verify
 event signatures, or convert receipt hashes into proof.
 
-The resulting `personal-desktop-multi-user-acceptance-summary/v2` is only an
+The resulting `personal-desktop-multi-user-acceptance-summary/v3` is only an
 owner review aid. A passing summary uses the deliberately qualified flags
 `manifest_claimed_all_agents_passed: true` and
 `manifest_claimed_all_dm_conversations_passed: true`, plus

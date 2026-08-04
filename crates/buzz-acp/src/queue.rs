@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::authorization::AuthorizationReceiptSeed;
 use crate::config::DedupMode;
 
 /// Maximum events queued per channel before oldest events are dropped.
@@ -49,6 +50,8 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Secret-free author-gate evidence carried to the actual turn-start seam.
+    pub authorization_receipt: Option<AuthorizationReceiptSeed>,
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -57,6 +60,7 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    pub authorization_receipt: Option<AuthorizationReceiptSeed>,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -341,6 +345,7 @@ impl EventQueue {
                 event: qe.event,
                 prompt_tag: qe.prompt_tag,
                 received_at: qe.received_at,
+                authorization_receipt: qe.authorization_receipt,
             })
             .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
@@ -480,6 +485,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                authorization_receipt: be.authorization_receipt,
             });
         }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
@@ -515,6 +521,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                authorization_receipt: be.authorization_receipt,
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
@@ -1003,9 +1010,17 @@ pub struct PromptChannelInfo {
     /// Verified tri-state used by security decisions. Unknown must never be
     /// interpreted as a regular channel.
     pub classification: crate::relay::ChannelClassification,
+    /// Canonical current relay-authored kind:39000 event ID.
+    pub metadata_event_id: String,
+    /// Canonical kind:39000 timestamp rendered as UTC RFC3339.
+    pub metadata_created_at: String,
+    /// Independently pinned relay signer for the verified metadata event.
+    pub metadata_author_pubkey: String,
     /// Canonical two-party/group membership from relay-authored DM metadata.
     /// `None` for regular channels or malformed/unavailable DM metadata.
     pub participant_pubkeys: Option<Vec<String>>,
+    /// Verified NIP-29 participant commitment for DMs.
+    pub participant_set_commitment_sha256: Option<String>,
 }
 
 /// Minimal profile fields needed to label users in ACP prompts.
@@ -1654,6 +1669,7 @@ mod tests {
     /// Build a QueuedEvent for the given channel.
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
+            authorization_receipt: None,
             channel_id,
             event: make_event(content),
             received_at: Instant::now(),
@@ -1664,6 +1680,7 @@ mod tests {
     /// Build a QueuedEvent with a specific `received_at` offset from now.
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
+            authorization_receipt: None,
             channel_id,
             event: make_event(content),
             received_at: Instant::now() - age,
@@ -1684,6 +1701,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         QueuedEvent {
+            authorization_receipt: None,
             channel_id,
             event,
             received_at: Instant::now(),
@@ -1880,6 +1898,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -1910,11 +1929,13 @@ mod tests {
         FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2042,17 +2063,20 @@ mod tests {
             channel_id: ch,
             events: vec![
                 BatchEvent {
+                    authorization_receipt: None,
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    authorization_receipt: None,
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
             ],
             cancelled_events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2098,11 +2122,13 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: original,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2191,16 +2217,19 @@ mod tests {
             channel_id: ch,
             events: vec![
                 BatchEvent {
+                    authorization_receipt: None,
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    authorization_receipt: None,
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    authorization_receipt: None,
                     event: e3,
                     prompt_tag: "tag-c".into(),
                     received_at: Instant::now(),
@@ -2230,6 +2259,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2253,6 +2283,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2285,6 +2316,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2315,6 +2347,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2342,6 +2375,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2366,6 +2400,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2422,6 +2457,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2460,6 +2496,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2688,6 +2725,7 @@ mod tests {
         let old_time = Instant::now() - Duration::from_secs(10);
 
         q.push(QueuedEvent {
+            authorization_receipt: None,
             channel_id: ch,
             event: make_event("old-msg"),
             received_at: old_time,
@@ -2977,6 +3015,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -2985,6 +3024,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "engineering".into(),
             channel_type: "stream".into(),
             classification: crate::relay::ChannelClassification::Regular,
@@ -3010,6 +3053,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -3018,6 +3062,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -3050,6 +3098,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3078,6 +3127,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3122,6 +3172,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -3130,6 +3181,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -3173,6 +3228,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3380,6 +3436,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -3388,6 +3445,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -3439,6 +3500,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -3447,6 +3509,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -3481,6 +3547,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3505,6 +3572,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3528,6 +3596,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3894,6 +3963,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3936,6 +4006,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3944,6 +4015,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -3972,6 +4047,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4001,6 +4077,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4009,6 +4086,10 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            metadata_event_id: "test-metadata-event-id".to_string(),
+            metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+            metadata_author_pubkey: "0".repeat(64),
+            participant_set_commitment_sha256: None,
             name: "DM".into(),
             channel_type: "dm".into(),
             classification: crate::relay::ChannelClassification::Dm,
@@ -4045,6 +4126,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -4081,6 +4163,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -4117,11 +4200,13 @@ mod tests {
             channel_id: ch,
             events: vec![
                 BatchEvent {
+                    authorization_receipt: None,
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    authorization_receipt: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
@@ -4154,11 +4239,13 @@ mod tests {
             channel_id: ch,
             events: vec![
                 BatchEvent {
+                    authorization_receipt: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    authorization_receipt: None,
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
@@ -4186,6 +4273,7 @@ mod tests {
         FlushBatch {
             channel_id: Uuid::new_v4(),
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event(content),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4263,6 +4351,7 @@ mod tests {
         // Multi-event batch → no pass-through.
         let mut multi = make_single_batch("@Eva /init");
         multi.events.push(BatchEvent {
+            authorization_receipt: None,
             event: make_event("another message"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
@@ -4272,6 +4361,7 @@ mod tests {
         // Cancelled carryover → no pass-through.
         let mut cancelled = make_single_batch("@Eva /init");
         cancelled.cancelled_events.push(BatchEvent {
+            authorization_receipt: None,
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
@@ -4480,6 +4570,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4509,6 +4600,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4537,6 +4629,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: ch,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),

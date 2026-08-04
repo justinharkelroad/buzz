@@ -74,6 +74,7 @@ evalexpr = { workspace = true }
 # Process-group kill (safe wrapper around killpg) — Unix-only; kill_process_group
 # has a #[cfg(not(unix))] fallback in acp.rs.
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]

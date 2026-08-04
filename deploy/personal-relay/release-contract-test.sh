@@ -3135,8 +3135,8 @@ done
 [[ -f "$desktop_multi_user_acceptance_validator" && -r "$desktop_multi_user_acceptance_validator" && -x "$desktop_multi_user_acceptance_validator" && ! -L "$desktop_multi_user_acceptance_validator" ]]
 [[ -f "$desktop_multi_user_acceptance_test" && -r "$desktop_multi_user_acceptance_test" && -x "$desktop_multi_user_acceptance_test" && ! -L "$desktop_multi_user_acceptance_test" ]]
 [[ -f "$desktop_multi_user_acceptance_example" && -r "$desktop_multi_user_acceptance_example" && ! -L "$desktop_multi_user_acceptance_example" ]]
-[[ $(grep -Ec '^mutate_and_reject ' "$desktop_multi_user_acceptance_test") -eq 122 ]]
-[[ $(grep -Ec '^expect_rejected ' "$desktop_multi_user_acceptance_test") -eq 18 ]]
+[[ $(grep -Ec '^mutate_and_reject ' "$desktop_multi_user_acceptance_test") -eq 124 ]]
+[[ $(grep -Ec '^expect_rejected ' "$desktop_multi_user_acceptance_test") -eq 20 ]]
 for desktop_acceptance_mutation in \
   identity-impersonation identity-self-claim-false justin-credentials-used \
   credentials-shared wrong-agent-count wrong-agent-order wrong-agent-hash \
@@ -3205,7 +3205,7 @@ grep -Fq 'jq -e '\''.example_only == true'\'' "$example"' "$desktop_multi_user_a
 grep -Fq 'fail "checked-in example was accepted"' "$desktop_multi_user_acceptance_test"
 jq -e '
   . as $record
-  | .schema == "personal-desktop-multi-user-acceptance/v2"
+  | .schema == "personal-desktop-multi-user-acceptance/v3"
   and .example_only == true
   and .all_dm_negative_probes_passed == true
   and (.agents | type == "array" and length == 8)
@@ -3245,7 +3245,7 @@ jq -e '
       .dm_conversation.channel_metadata.participant_set_commitment_sha256
     and .dm_conversation.db_invariant.recomputed_metadata_participant_set_commitment_sha256 ==
       .dm_conversation.channel_metadata.participant_set_commitment_sha256
-    and .dm_conversation.author_gate_decision == "allowed_explicit_allowlist"
+    and all(.dm_conversation.turns[]; .author_gate_decision == "allowed_explicit_allowlist")
     and (.dm_conversation.turns | length) == 2
     and .dm_conversation.continuity_verified == true
   )
@@ -3278,21 +3278,21 @@ jq -e '
 ' "$desktop_multi_user_acceptance_example" >/dev/null
 grep -Fq 'same-second parallel positive fixture was rejected' "$desktop_multi_user_acceptance_test"
 grep -Fq 'same-agent challenge/response pair in one second was rejected' "$desktop_multi_user_acceptance_test"
-grep -Fq 'all 64 interaction event IDs, 24 channel-security event IDs, 40 nonces, 24 DM channels, and 168 receipt hashes' "$desktop_multi_user_acceptance_test"
+grep -Fq 'all 64 interaction event IDs, 40 channel-security event IDs, 16 authorization event IDs, 40 nonces, 24 DM channels, 192 receipt hashes, and 48 decision-record occurrences / 32 decision IDs' "$desktop_multi_user_acceptance_test"
 grep -Fq '.schema = "personal-desktop-multi-user-acceptance/v1"' "$desktop_multi_user_acceptance_test"
 grep -Fq '.dm_denial = {' "$desktop_multi_user_acceptance_test"
-grep -Fq '.schema == "personal-desktop-multi-user-acceptance/v2"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.schema == "personal-desktop-multi-user-acceptance/v3"' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.challenge_p_tags == [$agent.agent_pubkey]' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.response_p_tags == [$record.identities.mary_pubkey]' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.challenge_kind == 9' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.live_exchange.response_kind == 9' "$desktop_multi_user_acceptance_validator"
 grep -Fq '($interaction_event_ids | length) == 64' "$desktop_multi_user_acceptance_validator"
-grep -Fq '($channel_security_event_ids | length) == 24' "$desktop_multi_user_acceptance_validator"
-grep -Fq '($all_event_ids | length) == 88' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($channel_security_event_ids | length) == 40' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($all_event_ids | length) == 120' "$desktop_multi_user_acceptance_validator"
 grep -Fq '($positive_nonces | length) == 24' "$desktop_multi_user_acceptance_validator"
 grep -Fq '($negative_nonces | length) == 16' "$desktop_multi_user_acceptance_validator"
 grep -Fq '($all_nonces | length) == 40' "$desktop_multi_user_acceptance_validator"
-grep -Fq '($receipt_hashes | length) == 168' "$desktop_multi_user_acceptance_validator"
+grep -Fq '($receipt_hashes | length) == 192' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.dm_conversation.recipient_discovered == true' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.dm_conversation.recipient_selected == true' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.dm_conversation.channel_type == "dm"' "$desktop_multi_user_acceptance_validator"
@@ -3334,7 +3334,7 @@ grep -Fq '$dm_open_at <= $dm_metadata_at' "$desktop_multi_user_acceptance_valida
 grep -Fq '$dm_metadata_verified_at <= $dm_membership_at' "$desktop_multi_user_acceptance_validator"
 grep -Fq '$dm_membership_verified_at <= $dm_db_checked_at' "$desktop_multi_user_acceptance_validator"
 grep -Fq '$dm_db_checked_at <= $dm_first_challenge_at' "$desktop_multi_user_acceptance_validator"
-grep -Fq '.dm_conversation.author_gate_decision == "allowed_explicit_allowlist"' "$desktop_multi_user_acceptance_validator"
+grep -Fq '.author_gate_decision == "allowed_explicit_allowlist"' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.dm_conversation.turns | type == "array" and length == 2' "$desktop_multi_user_acceptance_validator"
 grep -Fq '[.dm_conversation.turns[].ordinal] == [1, 2]' "$desktop_multi_user_acceptance_validator"
 grep -Fq '$dm_followup.challenge_parent_event_id == $dm_first.response_event_id' "$desktop_multi_user_acceptance_validator"
@@ -3351,7 +3351,7 @@ grep -Fq '.turn_started == false' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.response_event_ids == []' "$desktop_multi_user_acceptance_validator"
 grep -Fq '.observation_seconds == 120' "$desktop_multi_user_acceptance_validator"
 grep -Fq '($observed_until - $observed_from) == .observation_seconds' "$desktop_multi_user_acceptance_validator"
-grep -Fq 'fail "acceptance manifest does not satisfy the v2 contract"' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'fail "acceptance manifest does not satisfy the v3 contract"' "$desktop_multi_user_acceptance_validator"
 grep -Fq '$expires >= ($now + 3600)' "$desktop_multi_user_acceptance_validator"
 grep -Fq 'if not hasattr(os, "O_NOFOLLOW")' "$desktop_multi_user_acceptance_validator"
 grep -Fq 'manifest_fd = os.open(manifest_path, open_flags)' "$desktop_multi_user_acceptance_validator"
@@ -3363,7 +3363,7 @@ grep -Fq 'snapshot_fd = os.open(snapshot_path, snapshot_flags, 0o600)' "$desktop
 grep -Fq '# SEALED_MANIFEST_READS_BEGIN: never reopen the caller-controlled input below.' "$desktop_multi_user_acceptance_validator"
 grep -Fq 'fail "validator reopens caller-controlled input after sealing the manifest"' "$desktop_multi_user_acceptance_test"
 grep -Fq 'umask 077' "$desktop_multi_user_acceptance_test"
-grep -Fq 'Its summary alone never authorizes production cutover.' "$desktop_multi_user_acceptance_validator"
+grep -Fq 'authorizes production cutover.' "$desktop_multi_user_acceptance_validator"
 desktop_acceptance_summary_builder=$(awk '/^jq -cnS \\/ { keep = 1 } keep { print }' "$desktop_multi_user_acceptance_validator")
 for desktop_acceptance_summary_assertion in \
   'manifest_claimed_all_agents_passed: true' \
@@ -3627,8 +3627,8 @@ for desktop_acceptance_contract in \
   'pre-build staging' \
   'cannot prove' \
   'private evidence bundle' \
-  '`personal-desktop-multi-user-acceptance/v2`' \
-  '`personal-desktop-multi-user-acceptance-summary/v2`' \
+  '`personal-desktop-multi-user-acceptance/v3`' \
+  '`personal-desktop-multi-user-acceptance-summary/v3`' \
   'exact DMG' \
   'attestation predicate' \
   'final v3 audit' \

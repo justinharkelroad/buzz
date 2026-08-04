@@ -71,7 +71,8 @@ pub(crate) enum AcpAvailabilityStatus {
 }
 
 use crate::{
-    author_allowed,
+    author_gate_decision,
+    authorization::{AuthorizationReceiptContext, InvocationPolicyEvidence},
     config::Config,
     effective_instruction_author, event_mentions_agent, filter,
     relay::{
@@ -320,6 +321,22 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let agent_pubkey = config.keys.public_key();
     let pubkey_hex = agent_pubkey.to_hex();
 
+    // Authorization decision receipts, same sink contract as normal mode
+    // (secret-free, private JSONL). Setup mode never starts an ACP turn, so
+    // it only ever emits `gate_evaluated` records, never `turn_dispatched`.
+    // Invocation-policy provenance (owner binding / kind:30177 policy) is
+    // not resolved here: setup mode is not routing to a live agent, so
+    // `InvocationPolicyEvidence::default()` is an honest "not resolved in
+    // this mode" rather than a fabricated verification.
+    let authorization_receipts = AuthorizationReceiptContext::new(
+        config.authorization_decision_receipts,
+        pubkey_hex.clone(),
+        InvocationPolicyEvidence::default(),
+        config.authorization_decision_receipt_path.as_deref(),
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("authorization receipt setup failed: {error}"))?;
+
     // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
     let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
         .ok()
@@ -506,15 +523,27 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
             &channel_info,
         )
         .await;
-        let allowed = author_allowed(
+        let decision = author_gate_decision(
             &config.respond_to,
             &config.respond_to_allowlist,
             &author_hex,
-            channel,
+            &channel,
             &owner_cache,
             &rest_client,
         )
         .await;
+        if let Some(receipt) = authorization_receipts.seed(
+            &buzz_event.event,
+            author_hex.clone(),
+            channel.evidence(buzz_event.channel_id),
+            &config.respond_to,
+            decision,
+        ) {
+            // Setup mode never starts an ACP turn, so only the gate half of
+            // the record pair is ever emitted here.
+            receipt.emit_gate_evaluated();
+        }
+        let allowed = decision.is_allowed();
 
         // Apply channel/kind filter rules.
         let filter_matched = filter::match_event(

@@ -175,18 +175,32 @@ print(json.dumps(records, separators=(",", ":")))
 PY
 )
 
-dm_negative_security_canonical=$(python3 <<'PY'
+dm_negative_security_canonical=$(python3 - "$mary_pubkey" "$unauthorized_third_party_pubkey" <<'PY'
 import hashlib
 import json
+import sys
+
+mary, third_party = sys.argv[1:]
 
 records = []
 for index in range(8):
     for offset, probe_type in ((3400, "group_dm"), (3500, "unauthorized_third_party_dm")):
         channel_id = f"00000000-0000-4000-8000-{offset + index:012d}"
+        agent = f"{10 + index:064d}"
+        participants = sorted(
+            [mary, agent, third_party]
+            if probe_type == "group_dm"
+            else [agent, third_party]
+        )
+        material = bytearray(b"buzz:dm-participants:v1\0")
+        material.append(len(participants))
+        for participant in participants:
+            material.extend(bytes.fromhex(participant))
         records.append({
             "probe_type": probe_type,
             "channel_id": channel_id,
             "dm_channel_sha256": hashlib.sha256(channel_id.encode("ascii")).hexdigest(),
+            "participant_set_commitment_sha256": hashlib.sha256(material).hexdigest(),
         })
 print(json.dumps(records, separators=(",", ":")))
 PY
@@ -217,8 +231,11 @@ jq -n \
   --argjson expires "$expires_epoch" '
   def h($n):
     ("0000000000000000000000000000000000000000000000000000000000000000" + ($n | tostring))[-64:];
+  def uuid($n):
+    "00000000-0000-4000-8000-" +
+      (("000000000000" + ($n | tostring))[-12:]);
   {
-    schema: "personal-desktop-multi-user-acceptance/v2",
+    schema: "personal-desktop-multi-user-acceptance/v3",
     evidence_bundle_sha256: $evidence_bundle_sha256,
     relay: {
       environment: "personal-staging",
@@ -266,6 +283,15 @@ jq -n \
           authorization: {
             policy: "allowlist",
             mary_present: true,
+            agent_owner_binding_event_id: h(4000 + $i),
+            agent_owner_binding_verified: true,
+            policy_event_id: h(4100 + $i),
+            policy_event_kind: 30177,
+            policy_event_created_at: (($installed + 50) | todateiso8601),
+            policy_author_pubkey: $justin_pubkey,
+            policy_event_verified: true,
+            policy_current_for_coordinate: true,
+            policy_matches_runtime: true,
             policy_receipt_sha256: h(1200 + $i)
           },
           channel: {
@@ -375,8 +401,6 @@ jq -n \
                 $dm_security_record.participant_set_commitment_sha256,
               invariant_receipt_sha256: h(1970 + $i)
             },
-            author_gate_decision: "allowed_explicit_allowlist",
-            decision_receipt_sha256: h(1700 + $i),
             turns: [
               {
                 ordinal: 1,
@@ -385,6 +409,7 @@ jq -n \
                 challenge_kind: 9,
                 challenge_created_at: (($started + 30) | todateiso8601),
                 challenge_author_pubkey: $mary_pubkey,
+                challenge_signature_verified: true,
                 challenge_root_event_id: null,
                 challenge_parent_event_id: null,
                 challenge_p_tags: [h(10 + $i)],
@@ -395,9 +420,62 @@ jq -n \
                 response_root_event_id: h(2500 + (4 * $i)),
                 response_parent_event_id: h(2500 + (4 * $i)),
                 response_p_tags: [$mary_pubkey],
+                author_gate_decision: "allowed_explicit_allowlist",
+                decision_receipt_sha256: h(5000 + (2 * $i)),
+                decision_record: {
+                  schema: "buzz-acp-authorization-decision/v1",
+                  decision_id: uuid(6000 + (2 * $i)),
+                  source_sha: $relay_source_sha,
+                  agent_pubkey: h(10 + $i),
+                  event_signer_pubkey: $mary_pubkey,
+                  author_pubkey: $mary_pubkey,
+                  challenge_event_id: h(2500 + (4 * $i)),
+                  challenge_kind: 9,
+                  challenge_created_at: (($started + 30) | todateiso8601),
+                  challenge_signature_verified: true,
+                  channel_id: $dm_security_record.d_tag,
+                  channel_type: "dm",
+                  participant_pubkeys: ([$mary_pubkey, h(10 + $i)] | sort),
+                  participant_set_commitment_sha256:
+                    $dm_security_record.participant_set_commitment_sha256,
+                  participant_metadata_event_id: h(2600 + $i),
+                  participant_metadata_created_at: (($started + 21) | todateiso8601),
+                  participant_metadata_author_pubkey: $relay_pubkey,
+                  participant_metadata_verified: true,
+                  participant_metadata_current_for_coordinate: true,
+                  agent_owner_binding_event_id: h(4000 + $i),
+                  agent_owner_binding_verified: true,
+                  policy_event_id: h(4100 + $i),
+                  policy_event_kind: 30177,
+                  policy_event_created_at: (($installed + 50) | todateiso8601),
+                  policy_author_pubkey: $justin_pubkey,
+                  policy_event_verified: true,
+                  policy_current_for_coordinate: true,
+                  policy_matches_runtime: true,
+                  respond_to_mode: "allowlist",
+                  decision: "allowed_explicit_allowlist",
+                  phase: "turn_dispatched",
+                  turn_id: uuid(4300 + (2 * $i)),
+                  turn_started: true,
+                  decided_at: (($started + 31) | todateiso8601),
+                  turn_started_at: (($started + 32) | todateiso8601)
+                },
+                turn_id: uuid(4300 + (2 * $i)),
+                author_gate_decided_at: (($started + 31) | todateiso8601),
                 turn_started: true,
+                turn_started_at: (($started + 32) | todateiso8601),
                 exchange_receipt_sha256: h(1800 + (2 * $i))
-              },
+              }
+              | .decision_record as $decision_record
+              | . + {
+                  gate_decision_receipt_sha256: h(5200 + (2 * $i)),
+                  gate_decision_record: ($decision_record
+                    | .phase = "gate_evaluated"
+                    | .turn_id = null
+                    | .turn_started = false
+                    | .decided_at = .challenge_created_at
+                    | .turn_started_at = null)
+                },
               {
                 ordinal: 2,
                 challenge_nonce_sha256: h(2401 + (2 * $i)),
@@ -405,6 +483,7 @@ jq -n \
                 challenge_kind: 9,
                 challenge_created_at: (($started + 50) | todateiso8601),
                 challenge_author_pubkey: $mary_pubkey,
+                challenge_signature_verified: true,
                 challenge_root_event_id: h(2500 + (4 * $i)),
                 challenge_parent_event_id: h(2501 + (4 * $i)),
                 challenge_p_tags: [h(10 + $i)],
@@ -415,9 +494,62 @@ jq -n \
                 response_root_event_id: h(2500 + (4 * $i)),
                 response_parent_event_id: h(2502 + (4 * $i)),
                 response_p_tags: [$mary_pubkey],
+                author_gate_decision: "allowed_explicit_allowlist",
+                decision_receipt_sha256: h(5001 + (2 * $i)),
+                decision_record: {
+                  schema: "buzz-acp-authorization-decision/v1",
+                  decision_id: uuid(6001 + (2 * $i)),
+                  source_sha: $relay_source_sha,
+                  agent_pubkey: h(10 + $i),
+                  event_signer_pubkey: $mary_pubkey,
+                  author_pubkey: $mary_pubkey,
+                  challenge_event_id: h(2502 + (4 * $i)),
+                  challenge_kind: 9,
+                  challenge_created_at: (($started + 50) | todateiso8601),
+                  challenge_signature_verified: true,
+                  channel_id: $dm_security_record.d_tag,
+                  channel_type: "dm",
+                  participant_pubkeys: ([$mary_pubkey, h(10 + $i)] | sort),
+                  participant_set_commitment_sha256:
+                    $dm_security_record.participant_set_commitment_sha256,
+                  participant_metadata_event_id: h(2600 + $i),
+                  participant_metadata_created_at: (($started + 21) | todateiso8601),
+                  participant_metadata_author_pubkey: $relay_pubkey,
+                  participant_metadata_verified: true,
+                  participant_metadata_current_for_coordinate: true,
+                  agent_owner_binding_event_id: h(4000 + $i),
+                  agent_owner_binding_verified: true,
+                  policy_event_id: h(4100 + $i),
+                  policy_event_kind: 30177,
+                  policy_event_created_at: (($installed + 50) | todateiso8601),
+                  policy_author_pubkey: $justin_pubkey,
+                  policy_event_verified: true,
+                  policy_current_for_coordinate: true,
+                  policy_matches_runtime: true,
+                  respond_to_mode: "allowlist",
+                  decision: "allowed_explicit_allowlist",
+                  phase: "turn_dispatched",
+                  turn_id: uuid(4301 + (2 * $i)),
+                  turn_started: true,
+                  decided_at: (($started + 51) | todateiso8601),
+                  turn_started_at: (($started + 52) | todateiso8601)
+                },
+                turn_id: uuid(4301 + (2 * $i)),
+                author_gate_decided_at: (($started + 51) | todateiso8601),
                 turn_started: true,
+                turn_started_at: (($started + 52) | todateiso8601),
                 exchange_receipt_sha256: h(1801 + (2 * $i))
               }
+              | .decision_record as $decision_record
+              | . + {
+                  gate_decision_receipt_sha256: h(5201 + (2 * $i)),
+                  gate_decision_record: ($decision_record
+                    | .phase = "gate_evaluated"
+                    | .turn_id = null
+                    | .turn_started = false
+                    | .decided_at = .challenge_created_at
+                    | .turn_started_at = null)
+                }
             ],
             continuity_verified: true,
             continuity_receipt_sha256: h(1900 + $i)
@@ -439,6 +571,22 @@ jq -n \
             then ([$mary_pubkey, h(10 + $i), $unauthorized_third_party_pubkey] | sort)
             else ([h(10 + $i), $unauthorized_third_party_pubkey] | sort)
             end),
+          participant_set_commitment_sha256: $security.participant_set_commitment_sha256,
+          participant_metadata_event_id: h(4200 + (2 * $i) + $probe_index),
+          participant_metadata_created_at: (($started + (if $probe_index == 0 then 80 else 200 end)) | todateiso8601),
+          participant_metadata_author_pubkey: $relay_pubkey,
+          participant_metadata_verified: true,
+          participant_metadata_current_for_coordinate: true,
+          agent_owner_binding_event_id: h(4000 + $i),
+          agent_owner_binding_verified: true,
+          policy_event_id: h(4100 + $i),
+          policy_event_kind: 30177,
+          policy_event_created_at: (($installed + 50) | todateiso8601),
+          policy_author_pubkey: $justin_pubkey,
+          policy_event_verified: true,
+          policy_current_for_coordinate: true,
+          policy_matches_runtime: true,
+          respond_to_mode: "allowlist",
           challenge_nonce_sha256: h(2800 + (2 * $i) + $probe_index),
           challenge_event_id: h(2700 + (2 * $i) + $probe_index),
           challenge_kind: 9,
@@ -447,6 +595,7 @@ jq -n \
             then $mary_pubkey
             else $unauthorized_third_party_pubkey
             end),
+          challenge_signature_verified: true,
           challenge_p_tags: [h(10 + $i)],
           probe_receipt_sha256: h(3600 + (2 * $i) + $probe_index),
           participant_set_receipt_sha256: h(3700 + (2 * $i) + $probe_index),
@@ -454,8 +603,60 @@ jq -n \
             then "denied_group_dm"
             else "denied_not_allowlisted"
             end),
-          decision_receipt_sha256: h(3800 + (2 * $i) + $probe_index),
+          decision_receipt_sha256: h(5100 + (2 * $i) + $probe_index),
+          decision_record: {
+            schema: "buzz-acp-authorization-decision/v1",
+            decision_id: uuid(6200 + (2 * $i) + $probe_index),
+            source_sha: $relay_source_sha,
+            agent_pubkey: h(10 + $i),
+            event_signer_pubkey: (if $probe_index == 0
+              then $mary_pubkey
+              else $unauthorized_third_party_pubkey
+              end),
+            author_pubkey: (if $probe_index == 0
+              then $mary_pubkey
+              else $unauthorized_third_party_pubkey
+              end),
+            challenge_event_id: h(2700 + (2 * $i) + $probe_index),
+            challenge_kind: 9,
+            challenge_created_at: (($started + (if $probe_index == 0 then 90 else 220 end)) | todateiso8601),
+            challenge_signature_verified: true,
+            channel_id: $security.channel_id,
+            channel_type: "dm",
+            participant_pubkeys: (if $probe_index == 0
+              then ([$mary_pubkey, h(10 + $i), $unauthorized_third_party_pubkey] | sort)
+              else ([h(10 + $i), $unauthorized_third_party_pubkey] | sort)
+              end),
+            participant_set_commitment_sha256: $security.participant_set_commitment_sha256,
+            participant_metadata_event_id: h(4200 + (2 * $i) + $probe_index),
+            participant_metadata_created_at: (($started + (if $probe_index == 0 then 80 else 200 end)) | todateiso8601),
+            participant_metadata_author_pubkey: $relay_pubkey,
+            participant_metadata_verified: true,
+            participant_metadata_current_for_coordinate: true,
+            agent_owner_binding_event_id: h(4000 + $i),
+            agent_owner_binding_verified: true,
+            policy_event_id: h(4100 + $i),
+            policy_event_kind: 30177,
+            policy_event_created_at: (($installed + 50) | todateiso8601),
+            policy_author_pubkey: $justin_pubkey,
+            policy_event_verified: true,
+            policy_current_for_coordinate: true,
+            policy_matches_runtime: true,
+            respond_to_mode: "allowlist",
+            decision: (if $probe_index == 0
+              then "denied_group_dm"
+              else "denied_not_allowlisted"
+              end),
+            phase: "gate_evaluated",
+            turn_id: null,
+            turn_started: false,
+            decided_at: (($started + (if $probe_index == 0 then 91 else 221 end)) | todateiso8601),
+            turn_started_at: null
+          },
+          turn_id: null,
+          author_gate_decided_at: (($started + (if $probe_index == 0 then 91 else 221 end)) | todateiso8601),
           turn_started: false,
+          turn_started_at: null,
           response_event_ids: [],
           observed_from: (($started + (if $probe_index == 0 then 90 else 220 end)) | todateiso8601),
           observed_until: (($started + (if $probe_index == 0 then 210 else 340 end)) | todateiso8601),
@@ -467,6 +668,38 @@ jq -n \
     all_dm_negative_probes_passed: true
   }
 ' > "$valid"
+
+set_decision_record_hash_in_file() {
+  target=$1
+  record_filter=$2
+  hash_filter=$3
+  canonical=$(jq -ceS "$record_filter" "$target")
+  digest=$(printf '%s\n%s\n' \
+    "buzz-acp-authorization-decision/v1" "$canonical" | sha256_line)
+  updated="$fixture_root/decision-hash-update.json"
+  jq --arg digest "$digest" "$hash_filter = \$digest" "$target" > "$updated"
+  mv "$updated" "$target"
+}
+
+set_decision_record_hash() {
+  set_decision_record_hash_in_file "$valid" "$1" "$2"
+}
+
+for agent_index in {0..7}; do
+  for turn_index in {0..1}; do
+    set_decision_record_hash \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_record" \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_receipt_sha256"
+    set_decision_record_hash \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_record" \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_receipt_sha256"
+  done
+done
+for probe_index in {0..15}; do
+  set_decision_record_hash \
+    ".dm_negative_probes[$probe_index].decision_record" \
+    ".dm_negative_probes[$probe_index].decision_receipt_sha256"
+done
 
 common_args=(
   --expected-evidence-bundle-sha256 "$evidence_bundle_sha256"
@@ -504,13 +737,15 @@ jq -e \
     "dm_negative_probe_count", "dm_turn_count",
     "evidence_bundle_authenticated",
     "evidence_bundle_sha256", "expires_at", "group_dm_denial_probe_count",
+    "machine_decision_record_count", "machine_decision_records_cross_bound",
     "manifest_claimed_all_agents_passed",
     "manifest_claimed_all_dm_channels_current_and_safe",
     "manifest_claimed_all_dm_conversations_passed",
-    "manifest_claimed_all_dm_negative_probes_passed", "manifest_contract_passed",
+    "manifest_claimed_all_dm_negative_probes_passed",
+    "manifest_contract_passed",
     "schema", "unauthorized_third_party_dm_denial_probe_count"
   ]
-  and .schema == "personal-desktop-multi-user-acceptance-summary/v2"
+  and .schema == "personal-desktop-multi-user-acceptance-summary/v3"
   and .acceptance_manifest_sha256 == $acceptance_manifest_sha256
   and .evidence_bundle_sha256 == $evidence_bundle_sha256
   and .agent_set_sha256 == $agent_set_sha256
@@ -528,6 +763,8 @@ jq -e \
   and .dm_negative_probe_count == 16
   and .group_dm_denial_probe_count == 8
   and .unauthorized_third_party_dm_denial_probe_count == 8
+  and .machine_decision_record_count == 48
+  and .machine_decision_records_cross_bound == true
   and .manifest_contract_passed == true
   and .evidence_bundle_authenticated == false
   and .cutover_authorized == false
@@ -556,10 +793,17 @@ jq -e '
   and ([
     .agents[].dm_conversation.open_event_id,
     .agents[].dm_conversation.channel_metadata.event_id,
-    .agents[].dm_conversation.membership_snapshot.event_id
+    .agents[].dm_conversation.membership_snapshot.event_id,
+    .dm_negative_probes[].participant_metadata_event_id
   ] as $channel_security_event_ids
-    | ($channel_security_event_ids | length) == 24
-    and ($channel_security_event_ids | unique | length) == 24)
+    | ($channel_security_event_ids | length) == 40
+    and ($channel_security_event_ids | unique | length) == 40)
+  and ([
+    .agents[].authorization.agent_owner_binding_event_id,
+    .agents[].authorization.policy_event_id
+  ] as $authorization_event_ids
+    | ($authorization_event_ids | length) == 16
+    and ($authorization_event_ids | unique | length) == 16)
   and ([
     .agents[].live_exchange.challenge_event_id,
     .agents[].live_exchange.response_event_id,
@@ -568,10 +812,13 @@ jq -e '
     .agents[].dm_conversation.membership_snapshot.event_id,
     .agents[].dm_conversation.turns[].challenge_event_id,
     .agents[].dm_conversation.turns[].response_event_id,
-    .dm_negative_probes[].challenge_event_id
+    .dm_negative_probes[].challenge_event_id,
+    .dm_negative_probes[].participant_metadata_event_id,
+    .agents[].authorization.agent_owner_binding_event_id,
+    .agents[].authorization.policy_event_id
   ] as $all_event_ids
-    | ($all_event_ids | length) == 88
-    and ($all_event_ids | unique | length) == 88)
+    | ($all_event_ids | length) == 120
+    and ($all_event_ids | unique | length) == 120)
   and ([
     .agents[].live_exchange.challenge_nonce_sha256,
     .agents[].dm_conversation.turns[].challenge_nonce_sha256
@@ -603,10 +850,11 @@ jq -e '
         .runtime_application.application_receipt_sha256,
         .dm_conversation.discovery_receipt_sha256,
         .dm_conversation.membership_snapshot.membership_receipt_sha256,
-        .dm_conversation.decision_receipt_sha256,
         .dm_conversation.continuity_receipt_sha256,
         .dm_conversation.channel_metadata.metadata_receipt_sha256,
         .dm_conversation.db_invariant.invariant_receipt_sha256,
+        .dm_conversation.turns[].decision_receipt_sha256,
+        .dm_conversation.turns[].gate_decision_receipt_sha256,
         .dm_conversation.turns[].exchange_receipt_sha256),
     (.dm_negative_probes[]
       | .probe_receipt_sha256,
@@ -614,10 +862,17 @@ jq -e '
         .decision_receipt_sha256,
         .no_turn_receipt_sha256)
   ] as $receipt_hashes
-    | ($receipt_hashes | length) == 168
-    and ($receipt_hashes | unique | length) == 168)
+    | ($receipt_hashes | length) == 192
+    and ($receipt_hashes | unique | length) == 192)
+  and ([
+    .agents[].dm_conversation.turns[].gate_decision_record.decision_id,
+    .agents[].dm_conversation.turns[].decision_record.decision_id,
+    .dm_negative_probes[].decision_record.decision_id
+  ] as $decision_ids
+    | ($decision_ids | length) == 48
+    and ($decision_ids | unique | length) == 32)
 ' "$valid" >/dev/null \
-  || fail "fixture does not cover all 64 interaction event IDs, 24 channel-security event IDs, 40 nonces, 24 DM channels, and 168 receipt hashes"
+  || fail "fixture does not cover all 64 interaction event IDs, 40 channel-security event IDs, 16 authorization event IDs, 40 nonces, 24 DM channels, 192 receipt hashes, and 48 decision-record occurrences / 32 decision IDs"
 "$validator" --input "$valid" --evidence-bundle "$evidence_bundle" \
   "${common_args[@]}" >/dev/null \
   || fail "same-second parallel positive fixture was rejected"
@@ -626,7 +881,20 @@ same_pair_second="$fixture_root/same-agent-pair-second.json"
 jq '
   .agents[0].live_exchange.response_created_at =
     .agents[0].live_exchange.challenge_created_at
+  | .agents[0].dm_conversation.turns[0].response_created_at =
+      .agents[0].dm_conversation.turns[0].challenge_created_at
+  | .agents[0].dm_conversation.turns[0].author_gate_decided_at =
+      .agents[0].dm_conversation.turns[0].challenge_created_at
+  | .agents[0].dm_conversation.turns[0].turn_started_at =
+      .agents[0].dm_conversation.turns[0].challenge_created_at
+  | .agents[0].dm_conversation.turns[0].decision_record.decided_at =
+      .agents[0].dm_conversation.turns[0].challenge_created_at
+  | .agents[0].dm_conversation.turns[0].decision_record.turn_started_at =
+      .agents[0].dm_conversation.turns[0].challenge_created_at
 ' "$valid" > "$same_pair_second"
+set_decision_record_hash_in_file "$same_pair_second" \
+  '.agents[0].dm_conversation.turns[0].decision_record' \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256'
 "$validator" --input "$same_pair_second" --evidence-bundle "$evidence_bundle" \
   "${common_args[@]}" >/dev/null \
   || fail "same-agent challenge/response pair in one second was rejected"
@@ -662,6 +930,177 @@ mutate_and_reject() {
   jq "$filter" "$valid" > "$path"
   expect_rejected "$label" "$path"
 }
+
+mutate_record_and_rehash() {
+  label=$1
+  filter=$2
+  record_filter=$3
+  hash_filter=$4
+  path="$fixture_root/$label.json"
+  jq "$filter" "$valid" > "$path"
+  set_decision_record_hash_in_file "$path" "$record_filter" "$hash_filter"
+  expect_rejected "$label" "$path"
+}
+
+positive_decision_record='.agents[0].dm_conversation.turns[0].decision_record'
+positive_decision_hash='.agents[0].dm_conversation.turns[0].decision_receipt_sha256'
+positive_gate_decision_record='.agents[0].dm_conversation.turns[0].gate_decision_record'
+positive_gate_decision_hash='.agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256'
+
+mutate_record_and_rehash decision-id-pair-mismatch \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record.decision_id =
+    "00000000-0000-4000-8000-000000006299"' \
+  "$positive_gate_decision_record" "$positive_gate_decision_hash"
+
+decision_id_reuse_across_pairs="$fixture_root/decision-id-reuse-across-pairs.json"
+jq '
+  .agents[0].dm_conversation.turns[0].decision_record.decision_id =
+    .agents[0].dm_conversation.turns[1].decision_record.decision_id
+  | .agents[0].dm_conversation.turns[0].gate_decision_record.decision_id =
+      .agents[0].dm_conversation.turns[1].decision_record.decision_id
+' "$valid" > "$decision_id_reuse_across_pairs"
+set_decision_record_hash_in_file "$decision_id_reuse_across_pairs" \
+  '.agents[0].dm_conversation.turns[0].decision_record' \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256'
+set_decision_record_hash_in_file "$decision_id_reuse_across_pairs" \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record' \
+  '.agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256'
+expect_rejected decision-id-reuse-across-pairs "$decision_id_reuse_across_pairs"
+
+mutate_and_reject missing-gate-decision-record '
+  del(.agents[0].dm_conversation.turns[0].gate_decision_record,
+      .agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256)
+'
+
+mutate_record_and_rehash gate-turn-started \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record.turn_started = true' \
+  "$positive_gate_decision_record" "$positive_gate_decision_hash"
+
+wrong_domain_hash="$fixture_root/wrong-decision-domain-prefix.json"
+jq '.' "$valid" > "$wrong_domain_hash"
+wrong_domain_digest=$(jq -ceS \
+  '.agents[0].dm_conversation.turns[0].decision_record' "$wrong_domain_hash" \
+  | sha256_line)
+jq --arg digest "$wrong_domain_digest" \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256 = $digest' \
+  "$wrong_domain_hash" > "$fixture_root/wrong-decision-domain-prefix-updated.json"
+mv "$fixture_root/wrong-decision-domain-prefix-updated.json" "$wrong_domain_hash"
+expect_rejected wrong-decision-domain-prefix "$wrong_domain_hash"
+
+mutate_and_reject decision-record-canonical-hash-mismatch \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256 = ("a" * 64)'
+mutate_record_and_rehash decision-record-schema \
+  '.agents[0].dm_conversation.turns[0].decision_record.schema = "buzz-acp-authorization-decision/v2"' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-source \
+  '.agents[0].dm_conversation.turns[0].decision_record.source_sha = ("f" * 40)' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-agent \
+  '.agents[0].dm_conversation.turns[0].decision_record.agent_pubkey = .agents[1].agent_pubkey' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-event-signer \
+  '.agents[0].dm_conversation.turns[0].decision_record.event_signer_pubkey = .identities.justin_pubkey' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-author \
+  '.agents[0].dm_conversation.turns[0].decision_record.author_pubkey = .identities.justin_pubkey' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-challenge-event \
+  '.agents[0].dm_conversation.turns[0].decision_record.challenge_event_id = .agents[1].dm_conversation.turns[0].challenge_event_id' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-challenge-kind \
+  '.agents[0].dm_conversation.turns[0].decision_record.challenge_kind = 10' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-challenge-created-at '
+  .agents[0].dm_conversation.turns[0].decision_record.challenge_created_at |=
+    ((fromdateiso8601 + 1) | todateiso8601)
+' "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-challenge-signature \
+  '.agents[0].dm_conversation.turns[0].decision_record.challenge_signature_verified = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-channel-id \
+  '.agents[0].dm_conversation.turns[0].decision_record.channel_id = .agents[1].dm_conversation.channel_metadata.d_tag' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-channel-type \
+  '.agents[0].dm_conversation.turns[0].decision_record.channel_type = "stream"' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-participants \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_pubkeys = .agents[1].dm_conversation.participant_pubkeys' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-participant-commitment \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_set_commitment_sha256 = .agents[1].dm_conversation.channel_metadata.participant_set_commitment_sha256' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-metadata-event \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_metadata_event_id = .agents[1].dm_conversation.channel_metadata.event_id' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-metadata-created-at '
+  .agents[0].dm_conversation.turns[0].decision_record.participant_metadata_created_at |=
+    ((fromdateiso8601 + 1) | todateiso8601)
+' "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-metadata-author \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_metadata_author_pubkey = .identities.justin_pubkey' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-metadata-verified \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_metadata_verified = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-metadata-current \
+  '.agents[0].dm_conversation.turns[0].decision_record.participant_metadata_current_for_coordinate = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-owner-binding-event \
+  '.agents[0].dm_conversation.turns[0].decision_record.agent_owner_binding_event_id = .agents[1].authorization.agent_owner_binding_event_id' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-owner-binding-verified \
+  '.agents[0].dm_conversation.turns[0].decision_record.agent_owner_binding_verified = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-event \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_event_id = .agents[1].authorization.policy_event_id' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-kind \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_event_kind = 30178' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-created-at '
+  .agents[0].dm_conversation.turns[0].decision_record.policy_event_created_at |=
+    ((fromdateiso8601 + 1) | todateiso8601)
+' "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-author \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_author_pubkey = .identities.mary_pubkey' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-verified \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_event_verified = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-current \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_current_for_coordinate = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-policy-runtime-match \
+  '.agents[0].dm_conversation.turns[0].decision_record.policy_matches_runtime = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-respond-to-mode \
+  '.agents[0].dm_conversation.turns[0].decision_record.respond_to_mode = "owner_only"' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-decision \
+  '.agents[0].dm_conversation.turns[0].decision_record.decision = "denied_group_dm"' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-phase \
+  '.agents[0].dm_conversation.turns[0].decision_record.phase = "gate_evaluated"' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-turn-id \
+  '.agents[0].dm_conversation.turns[0].decision_record.turn_id = .agents[0].dm_conversation.turns[1].turn_id' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-turn-started \
+  '.agents[0].dm_conversation.turns[0].decision_record.turn_started = false' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-decided-at '
+  .agents[0].dm_conversation.turns[0].decision_record.decided_at |=
+    ((fromdateiso8601 + 1) | todateiso8601)
+' "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-turn-started-at \
+  '.agents[0].dm_conversation.turns[0].decision_record.turn_started_at = null' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-missing-key \
+  'del(.agents[0].dm_conversation.turns[0].decision_record.policy_matches_runtime)' \
+  "$positive_decision_record" "$positive_decision_hash"
+mutate_record_and_rehash decision-record-extra-key \
+  '.agents[0].dm_conversation.turns[0].decision_record.unexpected = true' \
+  "$positive_decision_record" "$positive_decision_hash"
 
 mutate_and_reject identity-impersonation \
   '.identities.mary_authenticated_pubkey = .identities.justin_pubkey'
@@ -821,7 +1260,7 @@ mutate_and_reject tampered-dm-open-author \
 mutate_and_reject tampered-dm-open-tag \
   '.agents[0].dm_conversation.open_p_tags = [.identities.mary_pubkey]'
 mutate_and_reject tampered-dm-decision \
-  '.agents[0].dm_conversation.author_gate_decision = "denied_dm_external"'
+  '.agents[0].dm_conversation.turns[0].author_gate_decision = "denied_dm_external"'
 mutate_and_reject missing-second-dm-turn '.agents[0].dm_conversation.turns |= .[0:1]'
 mutate_and_reject wrong-dm-turn-order '.agents[0].dm_conversation.turns |= reverse'
 mutate_and_reject dm-turn-not-started \
@@ -1149,7 +1588,7 @@ expect_rejected fresh-example-only-poison "$fresh_poison"
 duplicate_top="$fixture_root/duplicate-top-member.json"
 awk '
   !injected && /"schema":/ {
-    sub(/"schema":/, "\"schema\":\"personal-desktop-multi-user-acceptance/v2\",\"schema\":")
+    sub(/"schema":/, "\"schema\":\"personal-desktop-multi-user-acceptance/v3\",\"schema\":")
     injected = 1
   }
   { print }
