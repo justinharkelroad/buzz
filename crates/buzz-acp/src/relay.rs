@@ -177,18 +177,17 @@ fn verified_channel_info(
         buzz_core::dm::VerifiedChannelKind::Regular => ChannelClassification::Regular,
         buzz_core::dm::VerifiedChannelKind::Dm => ChannelClassification::Dm,
     };
-    let participant_set_commitment_sha256 =
-        if classification == ChannelClassification::Dm {
-            let participant_bytes = metadata
-                .participant_pubkeys
-                .iter()
-                .map(|pubkey| nostr::PublicKey::from_hex(pubkey).map(|key| key.to_bytes()))
-                .collect::<Result<Vec<_>, _>>()
-                .ok()?;
-            Some(buzz_core::dm::dm_participant_commitment_hex(&participant_bytes).ok()?)
-        } else {
-            None
-        };
+    let participant_set_commitment_sha256 = if classification == ChannelClassification::Dm {
+        let participant_bytes = metadata
+            .participant_pubkeys
+            .iter()
+            .map(|pubkey| nostr::PublicKey::from_hex(pubkey).map(|key| key.to_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(buzz_core::dm::dm_participant_commitment_hex(&participant_bytes).ok()?)
+    } else {
+        None
+    };
     Some(ChannelInfo {
         name: metadata.name,
         channel_type: metadata.channel_type,

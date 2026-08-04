@@ -34,6 +34,7 @@ use crate::acp::{
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
     SystemPromptTransport,
 };
+use crate::authorization::now_rfc3339;
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
 use crate::queue::{
@@ -507,8 +508,7 @@ impl ChannelInfoResolver {
                         metadata_created_at: info.metadata_created_at,
                         metadata_author_pubkey: info.metadata_author_pubkey,
                         participant_pubkeys: info.participant_pubkeys,
-                        participant_set_commitment_sha256: info
-                            .participant_set_commitment_sha256,
+                        participant_set_commitment_sha256: info.participant_set_commitment_sha256,
                     },
                 ))
             })
@@ -837,6 +837,17 @@ impl AgentPool {
             .ok_or_else(|| SteerError::Transport("steer_tx not installed".into()))?;
         tx.try_send(request)
             .map_err(|e| SteerError::Transport(e.to_string()))
+    }
+
+    /// The `turn_id` of the in-flight task for `channel_id`, if any. Used
+    /// by native steer to attribute a `turn_dispatched` authorization
+    /// receipt to the actual live turn a steered event joined, rather than
+    /// fabricating one.
+    pub fn in_flight_turn_id(&self, channel_id: Uuid) -> Option<String> {
+        self.task_map
+            .values()
+            .find(|meta| meta.channel_id == Some(channel_id))
+            .map(|meta| meta.turn_id.clone())
     }
 
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
@@ -1512,13 +1523,23 @@ pub async fn run_prompt_task(
         PromptSource::Channel(channel_id) => Some(*channel_id),
         PromptSource::Heartbeat => None,
     };
-    let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // RFC3339 UTC, seconds precision, `Z` suffix: matches every other
+    // emitted-record timestamp (see `authorization::now_rfc3339`) so the
+    // acceptance validator's timestamp regex applies uniformly.
+    let turn_started_at = now_rfc3339();
     if let Some(batch) = &batch {
         for event in &batch.events {
             if let Some(receipt) = &event.authorization_receipt {
                 receipt.emit_turn_dispatched(&turn_id, &turn_started_at);
             }
         }
+        // `batch.cancelled_events` is deliberately NOT iterated here: a
+        // cancelled event already has its `gate_evaluated` record from the
+        // author gate, but no ACP turn ever started for it (the turn it was
+        // queued against was cancelled before dispatch), so no
+        // `turn_dispatched` record is emitted for it. This mirrors the
+        // schema's contract that `turn_dispatched` only fires at a real
+        // turn-start boundary.
     }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
@@ -2527,8 +2548,7 @@ pub(crate) async fn fetch_channel_info(
                     metadata_created_at: info.metadata_created_at,
                     metadata_author_pubkey: info.metadata_author_pubkey,
                     participant_pubkeys: info.participant_pubkeys,
-                    participant_set_commitment_sha256: info
-                        .participant_set_commitment_sha256,
+                    participant_set_commitment_sha256: info.participant_set_commitment_sha256,
                 })
             }
             Ok(Err(e)) => {
@@ -5207,6 +5227,7 @@ mod tests {
         let batch = FlushBatch {
             channel_id: Uuid::new_v4(),
             events: vec![crate::queue::BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
@@ -5533,6 +5554,7 @@ mod tests {
         FlushBatch {
             channel_id,
             events: vec![crate::queue::BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),

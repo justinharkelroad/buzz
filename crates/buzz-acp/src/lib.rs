@@ -22,8 +22,8 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use authorization::{
-    AuthorGateDecision, AuthorizationReceiptContext, ChannelEvidence,
-    InvocationPolicyEvidence,
+    now_rfc3339, AuthorGateDecision, AuthorizationReceiptContext, AuthorizationReceiptSeed,
+    ChannelEvidence, InvocationPolicyEvidence,
 };
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
@@ -245,6 +245,12 @@ pub(crate) enum AuthorGateChannel {
 }
 
 impl AuthorGateChannel {
+    /// Test-only fixture constructor: real resolution always carries
+    /// `Some(_)` metadata provenance (see `resolve_author_gate_channel`),
+    /// so this all-`None` shape is only ever a valid input fixture for
+    /// tests that construct an `AuthorGateChannel` directly, never an
+    /// expected resolver output.
+    #[cfg(test)]
     fn regular() -> Self {
         Self::Regular {
             metadata_event_id: None,
@@ -253,6 +259,8 @@ impl AuthorGateChannel {
         }
     }
 
+    /// Test-only fixture constructor; see `regular()` above.
+    #[cfg(test)]
     fn dm(exact_two_party_dm: bool) -> Self {
         Self::Dm {
             exact_two_party_dm,
@@ -389,9 +397,7 @@ async fn author_gate_decision(
                         AuthorGateChannel::Dm {
                             participant_pubkeys,
                             ..
-                        } if participant_pubkeys.len() > 2 => {
-                            AuthorGateDecision::DeniedGroupDm
-                        }
+                        } if participant_pubkeys.len() > 2 => AuthorGateDecision::DeniedGroupDm,
                         AuthorGateChannel::Dm {
                             exact_two_party_dm: true,
                             ..
@@ -402,7 +408,22 @@ async fn author_gate_decision(
                         AuthorGateChannel::Unknown => {
                             AuthorGateDecision::DeniedUnverifiedChannelMetadata
                         }
-                        AuthorGateChannel::Regular { .. } => unreachable!(),
+                        AuthorGateChannel::Regular { .. } => {
+                            // `channel.is_regular()` already gated us into
+                            // this branch's `!is_regular()` arm, so a
+                            // `Regular` channel reaching here is logically
+                            // impossible today. A future refactor could
+                            // still break that invariant, and this is a
+                            // security-sensitive author gate: panicking the
+                            // whole process on an impossible state is
+                            // unacceptable, so fail closed instead.
+                            tracing::error!(
+                                target: "buzz_acp::authorization",
+                                "author gate reached an impossible Regular-channel state \
+                                 inside the non-regular branch; failing closed"
+                            );
+                            AuthorGateDecision::DeniedUnverifiedChannelMetadata
+                        }
                     }
                 }
             }
@@ -439,6 +460,12 @@ async fn author_gate_decision(
     }
 }
 
+/// Test-only convenience wrapper: production call sites (the main event
+/// loop, setup mode) need the full `AuthorGateDecision` to seed an
+/// authorization receipt, so they call `author_gate_decision` directly and
+/// derive `is_allowed()` themselves. Tests that only care about the pass/
+/// fail outcome use this boolean-returning wrapper instead.
+#[cfg(test)]
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
@@ -535,8 +562,7 @@ pub(crate) async fn resolve_author_gate_channel(
             AuthorGateChannel::Dm {
                 exact_two_party_dm,
                 participant_pubkeys: info.participant_pubkeys.unwrap_or_default(),
-                participant_set_commitment_sha256: info
-                    .participant_set_commitment_sha256,
+                participant_set_commitment_sha256: info.participant_set_commitment_sha256,
                 metadata_event_id: Some(info.metadata_event_id),
                 metadata_created_at: Some(info.metadata_created_at),
                 metadata_author_pubkey: Some(info.metadata_author_pubkey),
@@ -1617,6 +1643,7 @@ mod membership_removal_cleanup_tests {
         let event_id = event.id.to_hex();
         let mut queue = EventQueue::new(DedupMode::Queue);
         assert!(queue.push(QueuedEvent {
+            authorization_receipt: None,
             channel_id,
             event,
             received_at: std::time::Instant::now(),
@@ -2723,6 +2750,12 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
+                            // Same reasoning as the two clones above: the
+                            // receipt is moved into `queue.push` below, but
+                            // a native steer that joins the live turn still
+                            // needs its own copy to emit a `turn_dispatched`
+                            // record for the turn it actually joined.
+                            let authorization_receipt_for_steer = authorization_receipt.clone();
                             let accepted = queue.push(QueuedEvent {
                                 channel_id: buzz_event.channel_id,
                                 event: buzz_event.event,
@@ -2776,6 +2809,7 @@ async fn tokio_main() -> Result<()> {
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
+                                            authorization_receipt_for_steer,
                                         );
                                     if !native_attempted {
                                         signal_in_flight_task(
@@ -3385,6 +3419,7 @@ fn try_native_steer(
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
+    authorization_receipt: Option<AuthorizationReceiptSeed>,
 ) -> bool {
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
@@ -3405,6 +3440,10 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        // The receipt is emitted separately below (only once we know
+        // whether the steer actually joined a live turn); it does not need
+        // to live inside this BatchEvent, which exists only to render the
+        // prompt body via `format_event_block`.
         authorization_receipt: None,
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
@@ -3418,6 +3457,27 @@ fn try_native_steer(
 
     match pool.send_steer(channel_id, request) {
         Ok(()) => {
+            // The event joined a LIVE turn via native steer rather than
+            // starting a new one, so the receipt (if any) is attributed to
+            // that live turn's id, looked up from the pool right now. If
+            // the in-flight task has since completed in the brief window
+            // between `send_steer` succeeding and this lookup, there is no
+            // live turn id to attribute the record to; we do not fabricate
+            // one, so no `turn_dispatched` record is emitted for this
+            // event in that narrow race (the gate_evaluated record from
+            // the author gate still exists either way).
+            if let Some(receipt) = &authorization_receipt {
+                if let Some(turn_id) = pool.in_flight_turn_id(channel_id) {
+                    receipt.emit_turn_dispatched(&turn_id, &now_rfc3339());
+                } else {
+                    tracing::warn!(
+                        channel = %channel_id,
+                        event_id = %event_id_hex,
+                        "native steer succeeded but no live turn id was found; no \
+                         turn_dispatched receipt emitted for this event"
+                    );
+                }
+            }
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
@@ -5285,7 +5345,11 @@ mod author_gate_tests {
         cache.cache_sibling(external.clone(), false);
         let allowlist = HashSet::from([external.clone()]);
 
-        assert_eq!(channel, AuthorGateChannel::dm(true));
+        assert_dm_exact_two_party(
+            &channel,
+            true,
+            "verified 1:1 DM must resolve exact_two_party_dm",
+        );
         assert!(
             author_allowed(
                 &RespondTo::Allowlist,
@@ -5329,7 +5393,11 @@ mod author_gate_tests {
         cache.cache_sibling(external.clone(), false);
         let allowlist = HashSet::from([external.clone()]);
 
-        assert_eq!(channel, AuthorGateChannel::dm(false));
+        assert_dm_exact_two_party(
+            &channel,
+            false,
+            "group DM must not resolve exact_two_party_dm",
+        );
         assert!(
             !author_allowed(
                 &RespondTo::Allowlist,
@@ -5429,6 +5497,21 @@ mod author_gate_tests {
 
     // ── author-gate channel resolution ────────────────────────────────────
 
+    /// Assert `channel` is a `Dm` variant with the given `exact_two_party_dm`
+    /// value. Relay-mocked tests resolve real (per-run-random) metadata
+    /// provenance, so a full struct equality against the all-`None`
+    /// `AuthorGateChannel::dm(_)` fixture shape is never meaningful for
+    /// these; only the discriminant each test actually exercises is
+    /// checked here.
+    fn assert_dm_exact_two_party(channel: &AuthorGateChannel, expected: bool, msg: &str) {
+        match channel {
+            AuthorGateChannel::Dm {
+                exact_two_party_dm, ..
+            } => assert_eq!(*exact_two_party_dm, expected, "{msg}"),
+            other => panic!("{msg}: expected a Dm channel, got {other:?}"),
+        }
+    }
+
     fn resolver(startup: HashMap<Uuid, relay::ChannelInfo>) -> pool::ChannelInfoResolver {
         pool::ChannelInfoResolver::new(startup, dummy_rest_client(), None)
     }
@@ -5458,13 +5541,25 @@ mod author_gate_tests {
                 name: "stream".into(),
                 channel_type: "stream".into(),
                 classification: relay::ChannelClassification::Regular,
+                metadata_event_id: "test-regular-metadata-event-id".to_string(),
+                metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+                metadata_author_pubkey: "0".repeat(64),
                 participant_pubkeys: None,
+                participant_set_commitment_sha256: None,
             },
         )]);
         let resolver = resolver(startup);
+        // The resolved channel now carries real metadata provenance, so it
+        // can never equal the all-`None` `AuthorGateChannel::regular()`
+        // fixture shape once provenance is wired through; assert against
+        // the actual expected values instead.
         assert_eq!(
             resolve_author_gate_channel(stream_id, OWNER, EXTERNAL, &resolver).await,
-            AuthorGateChannel::regular()
+            AuthorGateChannel::Regular {
+                metadata_event_id: Some("test-regular-metadata-event-id".to_string()),
+                metadata_created_at: Some("1970-01-01T00:00:00Z".to_string()),
+                metadata_author_pubkey: Some("0".repeat(64)),
+            }
         );
     }
 
@@ -5479,7 +5574,11 @@ mod author_gate_tests {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
                 classification: relay::ChannelClassification::Unknown,
+                metadata_event_id: "test-unknown-metadata-event-id".to_string(),
+                metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+                metadata_author_pubkey: "0".repeat(64),
                 participant_pubkeys: None,
+                participant_set_commitment_sha256: None,
             },
         )]);
         let (resolver, requests, server) =
@@ -5645,13 +5744,15 @@ mod author_gate_tests {
             AuthorGateChannel::unknown()
         );
         wait_for_background_channel_resolution(&resolver, id).await;
-        assert_eq!(
-            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
-            AuthorGateChannel::dm(true)
+        assert_dm_exact_two_party(
+            &resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            true,
+            "verified immutable DM metadata must resolve exact_two_party_dm",
         );
-        assert_eq!(
-            resolve_author_gate_channel(id, &agent, &external, &resolver).await,
-            AuthorGateChannel::dm(true)
+        assert_dm_exact_two_party(
+            &resolve_author_gate_channel(id, &agent, &external, &resolver).await,
+            true,
+            "cached verified immutable DM metadata must still resolve exact_two_party_dm",
         );
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -5685,10 +5786,10 @@ mod author_gate_tests {
         assert_eq!(prefetched.classification, relay::ChannelClassification::Dm);
 
         let channel = resolve_author_gate_channel(id, &agent, &mary, &resolver).await;
-        assert_eq!(
-            channel,
-            AuthorGateChannel::dm(true),
-            "the first replayed message must not observe an intermediate Unknown classification"
+        assert_dm_exact_two_party(
+            &channel,
+            true,
+            "the first replayed message must not observe an intermediate Unknown classification",
         );
         assert!(
             author_allowed(
@@ -5754,15 +5855,30 @@ mod author_gate_tests {
                 name: "DM".into(),
                 channel_type: "dm".into(),
                 classification: relay::ChannelClassification::Dm,
+                metadata_event_id: "test-dm-metadata-event-id".to_string(),
+                metadata_created_at: "1970-01-01T00:00:00Z".to_string(),
+                metadata_author_pubkey: "0".repeat(64),
                 participant_pubkeys: Some(cached_pair.clone()),
+                participant_set_commitment_sha256: None,
             },
         )]);
         let (resolver, requests, server) =
             resolver_with_response(startup, serde_json::json!([]), None).await;
 
+        // The resolved channel now carries real metadata provenance, so it
+        // can never equal the all-`None` `AuthorGateChannel::dm(true)`
+        // fixture shape once provenance is wired through; assert against
+        // the actual expected values instead.
         assert_eq!(
             resolve_author_gate_channel(id, &agent, &external, &resolver).await,
-            AuthorGateChannel::dm(true),
+            AuthorGateChannel::Dm {
+                exact_two_party_dm: true,
+                participant_pubkeys: cached_pair.clone(),
+                participant_set_commitment_sha256: None,
+                metadata_event_id: Some("test-dm-metadata-event-id".to_string()),
+                metadata_created_at: Some("1970-01-01T00:00:00Z".to_string()),
+                metadata_author_pubkey: Some("0".repeat(64)),
+            },
             "DB-enforced immutable startup metadata is safe to cache"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -6007,6 +6123,8 @@ mod build_mcp_servers_tests {
 
     fn test_config() -> Config {
         Config {
+            authorization_decision_receipts: false,
+            authorization_decision_receipt_path: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -6226,6 +6344,8 @@ mod error_outcome_emission_tests {
 
     fn test_config() -> Config {
         Config {
+            authorization_decision_receipts: false,
+            authorization_decision_receipt_path: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and
@@ -6565,6 +6685,7 @@ mod error_outcome_emission_tests {
             FlushBatch {
                 channel_id: Uuid::new_v4(),
                 events: vec![BatchEvent {
+                    authorization_receipt: None,
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
@@ -6671,6 +6792,7 @@ mod error_outcome_emission_tests {
             FlushBatch {
                 channel_id,
                 events: vec![BatchEvent {
+                    authorization_receipt: None,
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
@@ -6787,6 +6909,7 @@ mod error_outcome_emission_tests {
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: EventBuilder::new(Kind::Custom(9), "test")
                     .sign_with_keys(&Keys::generate())
                     .unwrap(),
@@ -6880,6 +7003,7 @@ mod error_outcome_emission_tests {
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
                     .sign_with_keys(&Keys::generate())
                     .unwrap(),
@@ -6960,6 +7084,7 @@ mod error_outcome_emission_tests {
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -6988,6 +7113,7 @@ mod error_outcome_emission_tests {
         // out on drain — so it is already queued by the time
         // handle_prompt_result runs.
         queue.push(QueuedEvent {
+            authorization_receipt: None,
             channel_id,
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
@@ -7281,6 +7407,7 @@ mod error_outcome_emission_tests {
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
@@ -7366,6 +7493,7 @@ mod error_outcome_emission_tests {
         let batch = FlushBatch {
             channel_id,
             events: vec![BatchEvent {
+                authorization_receipt: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),

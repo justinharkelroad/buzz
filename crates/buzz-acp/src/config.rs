@@ -463,13 +463,18 @@ pub struct CliArgs {
     #[arg(
         long,
         env = "BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPTS",
-        default_value_t = false
+        default_value_t = false,
+        hide_env_values = true
     )]
     pub authorization_decision_receipts: bool,
 
     /// Absolute path of the private append-only JSONL decision receipt file.
     /// Required when authorization decision receipts are enabled.
-    #[arg(long, env = "BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPT_PATH")]
+    #[arg(
+        long,
+        env = "BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPT_PATH",
+        hide_env_values = true
+    )]
     pub authorization_decision_receipt_path: Option<PathBuf>,
 
     /// Comma-separated list of allowed `--respond-to` modes.
@@ -1481,6 +1486,8 @@ mod tests {
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
         Config {
+            authorization_decision_receipts: false,
+            authorization_decision_receipt_path: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),

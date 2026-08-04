@@ -5,7 +5,10 @@
 //! Each accepted event therefore carries the same immutable seed into the
 //! queue. The gate emits `phase=gate_evaluated, turn_started=false`; the prompt
 //! task emits a second record with `phase=turn_dispatched, turn_started=true`
-//! only when the existing turn-start boundary is reached.
+//! only when the existing turn-start boundary is reached. Both records for a
+//! given decision share one `decision_id`, generated once when the seed is
+//! created, so a validator can bind the pair without relying on an implicit
+//! `challenge_event_id` + `decided_at` join.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -148,6 +151,7 @@ impl AuthorizationReceiptContext {
         decision: AuthorGateDecision,
     ) -> Option<AuthorizationReceiptSeed> {
         self.enabled.then(|| AuthorizationReceiptSeed {
+            decision_id: uuid::Uuid::new_v4().to_string(),
             source_sha: self.source_sha.clone(),
             agent_pubkey: self.agent_pubkey.clone(),
             event_signer_pubkey: event.pubkey.to_hex(),
@@ -167,13 +171,45 @@ impl AuthorizationReceiptContext {
     }
 }
 
+/// Secret-free sink for persisted authorization decision receipts.
+///
+/// Known operational limits, accepted as out of scope for this branch:
+/// - The `Mutex` below provides only process-local single-writer
+///   serialization. There is no `flock` or other cross-process advisory
+///   lock, so if two `buzz-acp` processes are ever pointed at the same
+///   receipt path, interleaved writes between them are NOT prevented.
+/// - The file is opened in append mode with no rotation or size cap, so it
+///   grows unboundedly for the lifetime of the process. Rotation is a known
+///   follow-up, not implemented here.
 #[derive(Clone)]
 struct AuthorizationReceiptSink {
     file: Arc<Mutex<File>>,
     observer: Option<ObserverHandle>,
 }
 
+impl std::fmt::Debug for AuthorizationReceiptSink {
+    /// Opaque by design: never print file contents or path text. The open
+    /// `File` handle does not retain its original path string, so there is
+    /// nothing to redact beyond this fixed placeholder.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationReceiptSink")
+            .field("file", &"<redacted>")
+            .field("observer", &self.observer.is_some())
+            .finish()
+    }
+}
+
 impl AuthorizationReceiptSink {
+    #[cfg(not(unix))]
+    fn open(_path: &Path, _observer: Option<ObserverHandle>) -> Result<Self, String> {
+        Err(
+            "authorization decision receipts are only supported on Unix targets; refusing to \
+             enable receipts on this platform"
+                .to_string(),
+        )
+    }
+
+    #[cfg(unix)]
     fn open(path: &Path, observer: Option<ObserverHandle>) -> Result<Self, String> {
         if !path.is_absolute() {
             return Err("authorization decision receipt path must be absolute".into());
@@ -182,20 +218,14 @@ impl AuthorizationReceiptSink {
             "authorization decision receipt path must have a parent directory".to_string()
         })?;
         let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
-            format!(
-                "authorization decision receipt directory is unavailable: {error}"
-            )
+            format!("authorization decision receipt directory is unavailable: {error}")
         })?;
         if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
-            return Err(
-                "authorization decision receipt parent must be a real directory".into(),
-            );
+            return Err("authorization decision receipt parent must be a real directory".into());
         }
-        #[cfg(unix)]
         if parent_metadata.permissions().mode() & 0o077 != 0 {
             return Err(
-                "authorization decision receipt directory must have mode 0700 or stricter"
-                    .into(),
+                "authorization decision receipt directory must have mode 0700 or stricter".into(),
             );
         }
 
@@ -203,19 +233,18 @@ impl AuthorizationReceiptSink {
             if !existing.is_file() || existing.file_type().is_symlink() {
                 return Err("authorization decision receipt path must be a regular file".into());
             }
-            #[cfg(unix)]
             if existing.permissions().mode() & 0o077 != 0 {
                 return Err(
-                    "authorization decision receipt file must have mode 0600 or stricter"
-                        .into(),
+                    "authorization decision receipt file must have mode 0600 or stricter".into(),
                 );
             }
         }
 
         let mut options = OpenOptions::new();
         options.create(true).append(true);
-        #[cfg(unix)]
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         let file = options.open(path).map_err(|error| {
             format!("failed to open authorization decision receipt file: {error}")
         })?;
@@ -225,12 +254,20 @@ impl AuthorizationReceiptSink {
         if !opened.is_file() {
             return Err("opened authorization decision receipt is not a regular file".into());
         }
-        #[cfg(unix)]
         if opened.permissions().mode() & 0o077 != 0 {
-            return Err(
-                "opened authorization decision receipt file is not private".into(),
-            );
+            return Err("opened authorization decision receipt file is not private".into());
         }
+        // Durability of creation: fsync the parent directory once at open so
+        // a crash immediately after first file creation cannot lose the
+        // directory entry. Fail closed (not best-effort) if the directory
+        // cannot be fsynced: silently accepting a weaker durability
+        // guarantee here would itself be a silent failure.
+        let parent_dir = File::open(parent).map_err(|error| {
+            format!("failed to open authorization decision receipt directory for fsync: {error}")
+        })?;
+        parent_dir.sync_all().map_err(|error| {
+            format!("failed to fsync authorization decision receipt directory: {error}")
+        })?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             observer,
@@ -250,8 +287,12 @@ impl AuthorizationReceiptSink {
                 .file
                 .lock()
                 .map_err(|_| "authorization decision receipt file lock poisoned".to_string())?;
-            file.write_all(json.as_bytes())
-                .and_then(|_| file.write_all(b"\n"))
+            // Single write_all of record+newline: two separate writes under
+            // the same lock would let a concurrent reader (e.g. `tail -f`)
+            // observe a partial line between them.
+            let mut line = json.as_bytes().to_vec();
+            line.push(b'\n');
+            file.write_all(&line)
                 .and_then(|_| file.sync_data())
                 .map_err(|error| {
                     format!("failed to persist authorization decision receipt: {error}")
@@ -277,6 +318,11 @@ impl AuthorizationReceiptSink {
 /// Immutable decision facts that travel with an accepted queued event.
 #[derive(Debug, Clone)]
 pub(crate) struct AuthorizationReceiptSeed {
+    /// UUIDv4 generated once when this seed is built (gate time). Both the
+    /// `gate_evaluated` and `turn_dispatched` records emitted from this seed
+    /// carry the same value, so a validator can bind the pair explicitly
+    /// instead of joining on `challenge_event_id` + `decided_at`.
+    decision_id: String,
     source_sha: Option<String>,
     agent_pubkey: String,
     event_signer_pubkey: String,
@@ -296,6 +342,7 @@ pub(crate) struct AuthorizationReceiptSeed {
 #[derive(Debug, Serialize)]
 struct AuthorizationDecisionRecord<'a> {
     schema: &'static str,
+    decision_id: &'a str,
     source_sha: Option<&'a str>,
     agent_pubkey: &'a str,
     event_signer_pubkey: &'a str,
@@ -352,15 +399,10 @@ impl AuthorizationReceiptSeed {
         turn_started: bool,
         turn_started_at: Option<&str>,
     ) {
-        let record = self.record(
-            phase,
-            turn_id,
-            turn_started,
-            turn_started_at,
-        );
-        match serde_json::to_value(&record).and_then(|value| {
-            serde_json::to_string(&value).map(|json| (value, json))
-        }) {
+        let record = self.record(phase, turn_id, turn_started, turn_started_at);
+        match serde_json::to_value(&record)
+            .and_then(|value| serde_json::to_string(&value).map(|json| (value, json)))
+        {
             Ok((value, json)) => {
                 if let Some(sink) = &self.sink {
                     if let Err(error) = sink.persist_and_mirror(
@@ -399,6 +441,7 @@ impl AuthorizationReceiptSeed {
     ) -> AuthorizationDecisionRecord<'a> {
         AuthorizationDecisionRecord {
             schema: DECISION_RECORD_SCHEMA,
+            decision_id: &self.decision_id,
             source_sha: self.source_sha.as_deref(),
             agent_pubkey: &self.agent_pubkey,
             event_signer_pubkey: &self.event_signer_pubkey,
@@ -427,10 +470,7 @@ impl AuthorizationReceiptSeed {
             participant_metadata_current_for_coordinate: self
                 .channel
                 .participant_metadata_current_for_coordinate,
-            agent_owner_binding_event_id: self
-                .policy
-                .agent_owner_binding_event_id
-                .as_deref(),
+            agent_owner_binding_event_id: self.policy.agent_owner_binding_event_id.as_deref(),
             agent_owner_binding_verified: self.policy.agent_owner_binding_verified,
             policy_event_id: self.policy.policy_event_id.as_deref(),
             policy_event_kind: buzz_core::kind::KIND_MANAGED_AGENT,
@@ -507,6 +547,104 @@ pub(crate) async fn resolve_invocation_policy_evidence(
     )
 }
 
+/// The claimed `created_at` of a raw relay-JSON record, read tolerantly
+/// without requiring a full `Event` parse. Missing or non-numeric is
+/// treated as `i64::MAX` (maximally new) rather than skipped: a record we
+/// cannot date must never be silently treated as older than it might
+/// actually be. Instead it becomes the presumptive newest, which forces a
+/// verification attempt that then fails closed on the malformed record.
+fn raw_claimed_created_at(value: &serde_json::Value) -> i64 {
+    value
+        .get("created_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MAX)
+}
+
+/// The claimed `id` of a raw relay-JSON record, used only to break ties
+/// between two claimants that share the exact same `raw_claimed_created_at`.
+/// Missing is treated as an empty string. Ties are astronomically rare in
+/// practice; the security property this selection provides is the
+/// created_at ordering, not the tie-break rule.
+fn raw_claimed_id(value: &serde_json::Value) -> &str {
+    value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+}
+
+/// True when `value` structurally claims to be a kind:0 profile authored by
+/// `agent_hex`, read directly from raw JSON without requiring a full
+/// `Event` parse. Kind 0 is a non-parameterized replaceable event (NIP-01):
+/// its coordinate is `(kind, pubkey)` alone, no `d` tag involved.
+fn raw_claims_owner_binding(value: &serde_json::Value, agent_hex: &str) -> bool {
+    let kind_matches = value.get("kind").and_then(serde_json::Value::as_u64) == Some(0);
+    let pubkey_matches = value
+        .get("pubkey")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(agent_hex));
+    kind_matches && pubkey_matches
+}
+
+/// True when `value` structurally claims to be a kind:30177 managed-agent
+/// policy authored by `owner_hex` addressing `agent_hex` via its `d` tag,
+/// read directly from raw JSON without requiring a full `Event` parse.
+/// Kind 30177 is a parameterized replaceable event (NIP-01): its coordinate
+/// is `(kind, pubkey, d)`.
+fn raw_claims_policy_coordinate(
+    value: &serde_json::Value,
+    owner_hex: &str,
+    agent_hex: &str,
+) -> bool {
+    let kind_matches = value.get("kind").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(buzz_core::kind::KIND_MANAGED_AGENT));
+    let pubkey_matches = value
+        .get("pubkey")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(owner_hex));
+    let d_matches = value
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array().is_some_and(|parts| {
+                    parts.first().and_then(serde_json::Value::as_str) == Some("d")
+                        && parts
+                            .get(1)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|d| d.eq_ignore_ascii_case(agent_hex))
+                })
+            })
+        });
+    kind_matches && pubkey_matches && d_matches
+}
+
+/// Select the single newest raw JSON record among all values in `response`
+/// that structurally claim the coordinate per `matches_coordinate`, without
+/// parsing or verifying any of them.
+///
+/// This is the fail-closed head-selection primitive: callers must fully
+/// parse and verify ONLY the returned value before trusting it as a head.
+/// Selection deliberately happens before verification, so a newer,
+/// malformed, or unverifiable record shadows an older valid one rather than
+/// being silently skipped in the older one's favor. Returns `None` when
+/// there are zero structurally-claiming candidates (existing empty-input
+/// behavior is preserved).
+fn newest_raw_claimant(
+    response: Option<&serde_json::Value>,
+    matches_coordinate: impl Fn(&serde_json::Value) -> bool,
+) -> Option<&serde_json::Value> {
+    response
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|value| matches_coordinate(value))
+        .max_by(|left, right| {
+            raw_claimed_created_at(left)
+                .cmp(&raw_claimed_created_at(right))
+                .then_with(|| raw_claimed_id(right).cmp(raw_claimed_id(left)))
+        })
+}
+
 fn verified_policy_evidence(
     profile_response: Option<&serde_json::Value>,
     policy_response: Option<&serde_json::Value>,
@@ -516,36 +654,38 @@ fn verified_policy_evidence(
     runtime_allowlist: &HashSet<String>,
 ) -> InvocationPolicyEvidence {
     let owner_hex = owner.to_hex();
-    let owner_binding_event = profile_response
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| serde_json::from_value::<Event>(value.clone()).ok())
-        .filter(|event| event.kind == Kind::Metadata && event.pubkey == *agent)
-        .filter(|event| event.verify().is_ok())
-        .filter(|event| profile_binds_owner(event, agent, &owner_hex))
-        .max_by(compare_replaceable_events);
+    let agent_hex = agent.to_hex();
+
+    // Fail-closed head selection: pick the newest record that structurally
+    // claims the coordinate FIRST (from raw JSON, tolerant of parse
+    // failure), then attempt a full parse + verify of ONLY that one record.
+    // If the newest claimant cannot be parsed or fails verification, the
+    // head is unverifiable and evidence stays unset (deny) even when an
+    // older, fully valid record exists in the same response.
+    let owner_binding_event = newest_raw_claimant(profile_response, |value| {
+        raw_claims_owner_binding(value, &agent_hex)
+    })
+    .and_then(|value| serde_json::from_value::<Event>(value.clone()).ok())
+    .filter(|event| event.kind == Kind::Metadata && event.pubkey == *agent)
+    .filter(|event| event.verify().is_ok())
+    .filter(|event| profile_binds_owner(event, agent, &owner_hex));
 
     let mut evidence = InvocationPolicyEvidence {
-        agent_owner_binding_event_id: owner_binding_event
-            .as_ref()
-            .map(|event| event.id.to_hex()),
+        agent_owner_binding_event_id: owner_binding_event.as_ref().map(|event| event.id.to_hex()),
         agent_owner_binding_verified: owner_binding_event.is_some(),
         ..InvocationPolicyEvidence::default()
     };
 
-    let policy_head = policy_response
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| serde_json::from_value::<Event>(value.clone()).ok())
-        .filter(|event| {
-            event.kind.as_u16() as u32 == buzz_core::kind::KIND_MANAGED_AGENT
-                && event.pubkey == *owner
-                && first_coordinate_d(event) == Some(agent.to_hex().as_str())
-                && event.verify().is_ok()
-        })
-        .max_by(compare_replaceable_events);
+    let policy_head = newest_raw_claimant(policy_response, |value| {
+        raw_claims_policy_coordinate(value, &owner_hex, &agent_hex)
+    })
+    .and_then(|value| serde_json::from_value::<Event>(value.clone()).ok())
+    .filter(|event| {
+        event.kind.as_u16() as u32 == buzz_core::kind::KIND_MANAGED_AGENT
+            && event.pubkey == *owner
+            && first_coordinate_d(event) == Some(agent_hex.as_str())
+            && event.verify().is_ok()
+    });
 
     let Some(policy) = policy_head else {
         return evidence;
@@ -568,9 +708,7 @@ fn verified_policy_evidence(
             .map(|entry| entry.trim().to_ascii_lowercase())
             .collect::<HashSet<_>>();
         let entries_valid = normalized.len() == content.respond_to_allowlist.len()
-            && normalized
-                .iter()
-                .all(|entry| is_lower_hex(entry, 64));
+            && normalized.iter().all(|entry| is_lower_hex(entry, 64));
         entries_valid
             && matches!(
                 content.respond_to.as_str(),
@@ -580,7 +718,7 @@ fn verified_policy_evidence(
     });
     evidence.policy_event_verified = evidence.agent_owner_binding_verified
         && exact_d.len() == 1
-        && exact_d[0].as_slice().get(1).map(String::as_str) == Some(agent.to_hex().as_str())
+        && exact_d[0].as_slice().get(1).map(String::as_str) == Some(agent_hex.as_str())
         && exact_d[0].as_slice().len() == 2
         && valid_content;
     evidence.policy_matches_runtime = evidence.policy_event_verified
@@ -625,12 +763,6 @@ fn first_coordinate_d(event: &Event) -> Option<&str> {
     })
 }
 
-fn compare_replaceable_events(left: &Event, right: &Event) -> std::cmp::Ordering {
-    left.created_at
-        .cmp(&right.created_at)
-        .then_with(|| right.id.to_hex().cmp(&left.id.to_hex()))
-}
-
 fn compiled_source_sha() -> Option<String> {
     option_env!("BUZZ_BUILD_SOURCE_SHA")
         .or(option_env!("GIT_SHA"))
@@ -645,12 +777,16 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+/// Current time as RFC3339, UTC, seconds precision, `Z` suffix. Shared by
+/// every emitted-record timestamp field (`decided_at`, and reused by
+/// callers outside this module for `turn_started_at`) so all timestamps the
+/// acceptance validator regex-checks use one consistent format.
+pub(crate) fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 pub(crate) fn nostr_timestamp_rfc3339(timestamp: nostr::Timestamp) -> Option<String> {
-    let seconds = i64::try_from(timestamp.as_u64()).ok()?;
+    let seconds = i64::try_from(timestamp.as_secs()).ok()?;
     chrono::DateTime::<Utc>::from_timestamp(seconds, 0)
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
@@ -707,13 +843,8 @@ mod tests {
                 AuthorGateDecision::DeniedNotAllowlisted,
             )
             .expect("receipts enabled");
-        let json = serde_json::to_string(&seed.record(
-            "gate_evaluated",
-            None,
-            false,
-            None,
-        ))
-        .expect("serialize record");
+        let json = serde_json::to_string(&seed.record("gate_evaluated", None, false, None))
+            .expect("serialize record");
         assert!(!json.contains("private prompt"));
         for forbidden in [
             "private_key",
@@ -724,5 +855,331 @@ mod tests {
         ] {
             assert!(!json.contains(forbidden), "record leaked {forbidden}");
         }
+    }
+
+    #[test]
+    fn two_seeds_from_the_same_context_never_share_a_decision_id() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::text_note("hello")
+            .sign_with_keys(&keys)
+            .expect("sign test event");
+        let context = AuthorizationReceiptContext {
+            enabled: true,
+            source_sha: None,
+            agent_pubkey: "b".repeat(64),
+            policy: InvocationPolicyEvidence::default(),
+            sink: None,
+        };
+        let channel = || ChannelEvidence {
+            channel_id: uuid::Uuid::nil(),
+            channel_type: "unknown",
+            participant_pubkeys: Vec::new(),
+            participant_set_commitment_sha256: None,
+            participant_metadata_event_id: None,
+            participant_metadata_created_at: None,
+            participant_metadata_author_pubkey: None,
+            participant_metadata_verified: false,
+            participant_metadata_current_for_coordinate: false,
+        };
+        let seed_a = context
+            .seed(
+                &event,
+                keys.public_key().to_hex(),
+                channel(),
+                &RespondTo::Anyone,
+                AuthorGateDecision::AllowedAnyone,
+            )
+            .expect("receipts enabled");
+        let seed_b = context
+            .seed(
+                &event,
+                keys.public_key().to_hex(),
+                channel(),
+                &RespondTo::Anyone,
+                AuthorGateDecision::AllowedAnyone,
+            )
+            .expect("receipts enabled");
+        assert_ne!(seed_a.decision_id, seed_b.decision_id);
+        uuid::Uuid::parse_str(&seed_a.decision_id).expect("decision_id must be a valid UUID");
+    }
+
+    #[test]
+    fn gate_and_turn_records_from_the_same_seed_share_one_decision_id() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::text_note("hello")
+            .sign_with_keys(&keys)
+            .expect("sign test event");
+        let context = AuthorizationReceiptContext {
+            enabled: true,
+            source_sha: None,
+            agent_pubkey: "b".repeat(64),
+            policy: InvocationPolicyEvidence::default(),
+            sink: None,
+        };
+        let seed = context
+            .seed(
+                &event,
+                keys.public_key().to_hex(),
+                ChannelEvidence {
+                    channel_id: uuid::Uuid::nil(),
+                    channel_type: "unknown",
+                    participant_pubkeys: Vec::new(),
+                    participant_set_commitment_sha256: None,
+                    participant_metadata_event_id: None,
+                    participant_metadata_created_at: None,
+                    participant_metadata_author_pubkey: None,
+                    participant_metadata_verified: false,
+                    participant_metadata_current_for_coordinate: false,
+                },
+                &RespondTo::Anyone,
+                AuthorGateDecision::AllowedAnyone,
+            )
+            .expect("receipts enabled");
+        let gate_record = seed.record("gate_evaluated", None, false, None);
+        let turn_record = seed.record(
+            "turn_dispatched",
+            Some("turn-1"),
+            true,
+            Some("2026-01-01T00:00:00Z"),
+        );
+        assert_eq!(gate_record.decision_id, turn_record.decision_id);
+        assert_eq!(gate_record.decision_id, seed.decision_id);
+    }
+
+    #[test]
+    fn now_rfc3339_is_seconds_precision_with_z_suffix() {
+        let ts = now_rfc3339();
+        assert!(ts.ends_with('Z'), "timestamp must end with Z: {ts}");
+        assert!(
+            !ts.contains('.'),
+            "seconds-precision timestamp must not contain fractional seconds: {ts}"
+        );
+        chrono::DateTime::parse_from_rfc3339(&ts).expect("must be valid RFC3339");
+    }
+
+    // ── fail-closed head selection ──────────────────────────────────────
+
+    fn signed_custom_event(
+        keys: &nostr::Keys,
+        kind: u16,
+        tags: Vec<nostr::Tag>,
+        content: &str,
+        created_at: u64,
+    ) -> serde_json::Value {
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(kind), content)
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign test event");
+        serde_json::to_value(&event).expect("serialize test event")
+    }
+
+    fn policy_event_value(
+        owner_keys: &nostr::Keys,
+        agent_hex: &str,
+        created_at: u64,
+    ) -> serde_json::Value {
+        let tags = vec![nostr::Tag::parse(["d", agent_hex]).expect("d tag")];
+        signed_custom_event(
+            owner_keys,
+            buzz_core::kind::KIND_MANAGED_AGENT as u16,
+            tags,
+            r#"{"respond_to":"anyone","respond_to_allowlist":[]}"#,
+            created_at,
+        )
+    }
+
+    fn profile_event_value(
+        agent_keys: &nostr::Keys,
+        owner_keys: &nostr::Keys,
+        created_at: u64,
+    ) -> serde_json::Value {
+        let auth_tag_json =
+            buzz_sdk::nip_oa::compute_auth_tag(owner_keys, &agent_keys.public_key(), "")
+                .expect("compute auth tag");
+        let auth_tag_parts: Vec<String> =
+            serde_json::from_str(&auth_tag_json).expect("auth tag json");
+        let tag = nostr::Tag::parse(auth_tag_parts).expect("auth tag");
+        signed_custom_event(agent_keys, 0, vec![tag], "{}", created_at)
+    }
+
+    /// A record that structurally claims the policy coordinate (matching
+    /// kind, owner pubkey, and `d` tag) but cannot be parsed as an `Event`
+    /// (its `id`/`sig` are not valid hex). `created_at` is present and
+    /// numeric so it can win the newest-claimant comparison on its own
+    /// merits.
+    fn malformed_policy_claimant(
+        owner_hex: &str,
+        agent_hex: &str,
+        created_at: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": buzz_core::kind::KIND_MANAGED_AGENT,
+            "pubkey": owner_hex,
+            "created_at": created_at,
+            "tags": [["d", agent_hex]],
+            "content": "",
+            "id": "not-a-valid-64-char-hex-event-id",
+            "sig": "not-a-valid-signature",
+        })
+    }
+
+    /// A record that structurally claims the policy coordinate but whose
+    /// `created_at` itself is not a valid number, so it cannot be dated by
+    /// raw inspection and must be treated as the presumptive newest.
+    fn unparseable_created_at_policy_claimant(
+        owner_hex: &str,
+        agent_hex: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": buzz_core::kind::KIND_MANAGED_AGENT,
+            "pubkey": owner_hex,
+            "created_at": "not-a-number",
+            "tags": [["d", agent_hex]],
+            "content": "",
+            "id": "not-a-valid-64-char-hex-event-id",
+            "sig": "not-a-valid-signature",
+        })
+    }
+
+    #[test]
+    fn policy_head_valid_newest_wins() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let owner = owner_keys.public_key();
+        let agent = agent_keys.public_key();
+        let agent_hex = agent.to_hex();
+
+        let older = policy_event_value(&owner_keys, &agent_hex, 100);
+        let newer = policy_event_value(&owner_keys, &agent_hex, 200);
+        let newer_id = newer
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+        let response = serde_json::json!([older, newer]);
+
+        let evidence = verified_policy_evidence(
+            None,
+            Some(&response),
+            &agent,
+            &owner,
+            &RespondTo::Anyone,
+            &HashSet::new(),
+        );
+
+        assert_eq!(evidence.policy_event_id, Some(newer_id));
+        assert!(evidence.policy_current_for_coordinate);
+    }
+
+    #[test]
+    fn policy_head_malformed_newer_shadows_older_valid() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let owner = owner_keys.public_key();
+        let agent = agent_keys.public_key();
+        let agent_hex = agent.to_hex();
+        let owner_hex = owner.to_hex();
+
+        let older_valid = policy_event_value(&owner_keys, &agent_hex, 100);
+        let newer_malformed = malformed_policy_claimant(&owner_hex, &agent_hex, 200);
+        let response = serde_json::json!([older_valid, newer_malformed]);
+
+        let evidence = verified_policy_evidence(
+            None,
+            Some(&response),
+            &agent,
+            &owner,
+            &RespondTo::Anyone,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            evidence.policy_event_id, None,
+            "a malformed newer claimant must shadow an older valid record, not be skipped"
+        );
+        assert!(!evidence.policy_current_for_coordinate);
+    }
+
+    #[test]
+    fn policy_head_unparseable_newer_created_at_poisons() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let owner = owner_keys.public_key();
+        let agent = agent_keys.public_key();
+        let agent_hex = agent.to_hex();
+        let owner_hex = owner.to_hex();
+
+        let older_valid = policy_event_value(&owner_keys, &agent_hex, 100);
+        let newer_unparseable = unparseable_created_at_policy_claimant(&owner_hex, &agent_hex);
+        let response = serde_json::json!([older_valid, newer_unparseable]);
+
+        let evidence = verified_policy_evidence(
+            None,
+            Some(&response),
+            &agent,
+            &owner,
+            &RespondTo::Anyone,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            evidence.policy_event_id, None,
+            "a claimant with an unparseable created_at must poison selection, not be skipped"
+        );
+        assert!(!evidence.policy_current_for_coordinate);
+    }
+
+    #[test]
+    fn policy_head_zero_claimants_is_none() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let owner = owner_keys.public_key();
+        let agent = agent_keys.public_key();
+
+        let evidence = verified_policy_evidence(
+            None,
+            Some(&serde_json::json!([])),
+            &agent,
+            &owner,
+            &RespondTo::Anyone,
+            &HashSet::new(),
+        );
+
+        assert_eq!(evidence.policy_event_id, None);
+        assert!(!evidence.policy_current_for_coordinate);
+    }
+
+    #[test]
+    fn owner_binding_malformed_newer_shadows_older_valid() {
+        let owner_keys = nostr::Keys::generate();
+        let agent_keys = nostr::Keys::generate();
+        let owner = owner_keys.public_key();
+        let agent = agent_keys.public_key();
+        let agent_hex = agent.to_hex();
+
+        let older_valid = profile_event_value(&agent_keys, &owner_keys, 100);
+        let newer_malformed = serde_json::json!({
+            "kind": 0,
+            "pubkey": agent_hex,
+            "created_at": 200,
+            "tags": [],
+            "content": "{}",
+            "id": "not-a-valid-64-char-hex-event-id",
+            "sig": "not-a-valid-signature",
+        });
+        let response = serde_json::json!([older_valid, newer_malformed]);
+
+        let evidence = verified_policy_evidence(
+            Some(&response),
+            None,
+            &agent,
+            &owner,
+            &RespondTo::Anyone,
+            &HashSet::new(),
+        );
+
+        assert!(!evidence.agent_owner_binding_verified);
+        assert_eq!(evidence.agent_owner_binding_event_id, None);
     }
 }
