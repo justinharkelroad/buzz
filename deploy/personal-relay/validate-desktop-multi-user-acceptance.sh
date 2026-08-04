@@ -26,11 +26,11 @@ Strictly validates a short-lived v3 acceptance manifest claiming Mary's
 own-identity use of all eight custom agents in both the common stream and eight
 exact 1:1 DM conversations, with two completed DM turns per agent. It also
 requires one denied group-DM probe and one denied unauthorized-third-party
-1:1 DM probe per agent, 32 canonical ACP authorization-decision records, plus
+1:1 DM probe per agent, 48 canonical ACP authorization-decision records, plus
 its opaque, human-reviewed evidence-bundle index in personal staging. This
 validator checks manifest contract structure, hashes, record cross-bindings,
-and freshness. Decision-record SHA-256 values are computed over the exact
-`jq -ceS .` record output plus its trailing newline. It does not authenticate
+and freshness. Decision-record SHA-256 values are computed over the domain line,
+the exact `jq -ceS .` record output, and their trailing newlines. It does not authenticate
 the evidence bundle or ACP runtime, verify event signatures, or turn indexed
 receipts into cryptographic proof. A denial label must come from the retained
 machine record and must never be inferred from silence. Its summary alone never
@@ -485,7 +485,7 @@ jq -e \
     end;
   def decision_record_shape:
     exact_keys([
-      "schema", "source_sha", "agent_pubkey", "event_signer_pubkey",
+      "schema", "decision_id", "source_sha", "agent_pubkey", "event_signer_pubkey",
       "author_pubkey", "challenge_event_id", "challenge_kind",
       "challenge_created_at", "challenge_signature_verified", "channel_id",
       "channel_type", "participant_pubkeys",
@@ -501,6 +501,8 @@ jq -e \
       "decided_at", "turn_started_at"
     ])
     and .schema == "buzz-acp-authorization-decision/v1"
+    and (.decision_id | type == "string"
+      and test("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
     and (.source_sha | hex40)
     and (.agent_pubkey | hex64)
     and (.event_signer_pubkey | hex64)
@@ -548,9 +550,27 @@ jq -e \
   | ($record.completed_at | utc_epoch) as $completed
   | ($record.expires_at | utc_epoch) as $expires
   | ([
+      $record.agents[].dm_conversation.turns[].gate_decision_record,
       $record.agents[].dm_conversation.turns[].decision_record,
       $record.dm_negative_probes[].decision_record
     ]) as $decision_records
+  | ([
+      ($record.agents[].dm_conversation.turns[]
+        | {decision_id: .gate_decision_record.decision_id,
+           phase: .gate_decision_record.phase,
+           turn_started: .gate_decision_record.turn_started,
+           source: "turn_gate"}),
+      ($record.agents[].dm_conversation.turns[]
+        | {decision_id: .decision_record.decision_id,
+           phase: .decision_record.phase,
+           turn_started: .decision_record.turn_started,
+           source: "turn_dispatched"}),
+      ($record.dm_negative_probes[]
+        | {decision_id: .decision_record.decision_id,
+           phase: .decision_record.phase,
+           turn_started: .decision_record.turn_started,
+           source: "probe"})
+    ]) as $decision_id_occurrences
   | exact_keys([
       "schema", "relay", "desktop", "identities", "hosted_buzz",
       "evidence_bundle_sha256", "installed_at", "started_at", "completed_at",
@@ -609,9 +629,22 @@ jq -e \
   and .agent_inventory_sha256 == $expected_agent_inventory_sha256
   and .all_agents_passed == true
   and .all_dm_negative_probes_passed == true
-  and ($decision_records | length) == 32
+  and ($decision_records | length) == 48
   and all($decision_records[]; decision_record_shape)
   and ([$decision_records[].challenge_event_id] | unique | length) == 32
+  and ($decision_id_occurrences | length) == 48
+  and ([$decision_id_occurrences[].decision_id] | unique | length) == 32
+  and ($decision_id_occurrences | group_by(.decision_id)
+    | all(.[];
+      ((length == 2
+        and ([.[] | select(.source == "turn_gate"
+          and .phase == "gate_evaluated" and .turn_started == false)] | length) == 1
+        and ([.[] | select(.source == "turn_dispatched"
+          and .phase == "turn_dispatched" and .turn_started == true)] | length) == 1)
+      or (length == 1
+        and ([.[] | select(.source == "probe"
+          and .phase == "gate_evaluated" and .turn_started == false)] | length) == 1))
+  ))
   and ([$decision_records[].turn_id | select(. != null)] as $turn_ids
     | ($turn_ids | length) == 16
     and ($turn_ids | unique | length) == 16)
@@ -746,6 +779,7 @@ jq -e \
         .dm_conversation.channel_metadata.metadata_receipt_sha256,
         .dm_conversation.db_invariant.invariant_receipt_sha256,
         .dm_conversation.turns[].decision_receipt_sha256,
+        .dm_conversation.turns[].gate_decision_receipt_sha256,
         .dm_conversation.turns[].exchange_receipt_sha256),
     (.dm_negative_probes[]
       | .probe_receipt_sha256,
@@ -753,8 +787,8 @@ jq -e \
         .decision_receipt_sha256,
         .no_turn_receipt_sha256)
   ] as $receipt_hashes
-    | ($receipt_hashes | length) == 176
-    and ($receipt_hashes | unique | length) == 176
+    | ($receipt_hashes | length) == 192
+    and ($receipt_hashes | unique | length) == 192
   )
   and all(.agents[];
     . as $agent
@@ -980,6 +1014,7 @@ jq -e \
       . as $turn
       | ($turn.decision_record.decided_at | utc_epoch) as $decision_at
       | ($turn.decision_record.turn_started_at | utc_epoch) as $turn_started_at
+      | ($turn.gate_decision_record.decided_at | utc_epoch) as $gate_decision_at
       | exact_keys([
         "ordinal", "challenge_nonce_sha256", "challenge_event_id",
         "challenge_kind", "challenge_created_at", "challenge_author_pubkey",
@@ -988,7 +1023,8 @@ jq -e \
         "response_event_id", "response_kind", "response_created_at",
         "response_author_pubkey", "response_root_event_id",
         "response_parent_event_id", "response_p_tags", "author_gate_decision",
-        "decision_receipt_sha256", "decision_record", "turn_id",
+        "decision_receipt_sha256", "decision_record",
+        "gate_decision_receipt_sha256", "gate_decision_record", "turn_id",
         "author_gate_decided_at", "turn_started", "turn_started_at",
         "exchange_receipt_sha256"
       ])
@@ -1004,6 +1040,57 @@ jq -e \
       and .response_author_pubkey == $agent.agent_pubkey
       and .response_p_tags == [$record.identities.mary_pubkey]
       and .author_gate_decision == "allowed_explicit_allowlist"
+      and (.gate_decision_receipt_sha256 | hex64)
+      and (.gate_decision_record | decision_record_shape)
+      and .gate_decision_record.source_sha == $record.relay.source_sha
+      and .gate_decision_record.agent_pubkey == $agent.agent_pubkey
+      and .gate_decision_record.event_signer_pubkey == .challenge_author_pubkey
+      and .gate_decision_record.author_pubkey == $record.identities.mary_pubkey
+      and .gate_decision_record.challenge_event_id == .challenge_event_id
+      and .gate_decision_record.challenge_event_id == .decision_record.challenge_event_id
+      and .gate_decision_record.challenge_kind == .challenge_kind
+      and .gate_decision_record.challenge_created_at == .challenge_created_at
+      and .gate_decision_record.challenge_signature_verified == .challenge_signature_verified
+      and .gate_decision_record.channel_id == $agent.dm_conversation.channel_metadata.d_tag
+      and .gate_decision_record.channel_type == $agent.dm_conversation.channel_type
+      and .gate_decision_record.participant_pubkeys == $agent.dm_conversation.participant_pubkeys
+      and .gate_decision_record.participant_set_commitment_sha256 ==
+        $agent.dm_conversation.channel_metadata.participant_set_commitment_sha256
+      and .gate_decision_record.participant_metadata_event_id ==
+        $agent.dm_conversation.channel_metadata.event_id
+      and .gate_decision_record.participant_metadata_created_at ==
+        $agent.dm_conversation.channel_metadata.created_at
+      and .gate_decision_record.participant_metadata_author_pubkey ==
+        $agent.dm_conversation.channel_metadata.author_pubkey
+      and .gate_decision_record.participant_metadata_verified ==
+        $agent.dm_conversation.channel_metadata.signature_verified
+      and .gate_decision_record.participant_metadata_current_for_coordinate ==
+        $agent.dm_conversation.channel_metadata.current_for_d_tag
+      and .gate_decision_record.agent_owner_binding_event_id ==
+        $agent.authorization.agent_owner_binding_event_id
+      and .gate_decision_record.agent_owner_binding_verified ==
+        $agent.authorization.agent_owner_binding_verified
+      and .gate_decision_record.policy_event_id == $agent.authorization.policy_event_id
+      and .gate_decision_record.policy_event_kind == $agent.authorization.policy_event_kind
+      and .gate_decision_record.policy_event_created_at ==
+        $agent.authorization.policy_event_created_at
+      and .gate_decision_record.policy_author_pubkey ==
+        $agent.authorization.policy_author_pubkey
+      and .gate_decision_record.policy_event_verified ==
+        $agent.authorization.policy_event_verified
+      and .gate_decision_record.policy_current_for_coordinate ==
+        $agent.authorization.policy_current_for_coordinate
+      and .gate_decision_record.policy_matches_runtime ==
+        $agent.authorization.policy_matches_runtime
+      and .gate_decision_record.respond_to_mode == $agent.authorization.policy
+      and .gate_decision_record.decision == .author_gate_decision
+      and .gate_decision_record.phase == "gate_evaluated"
+      and .gate_decision_record.turn_id == null
+      and .gate_decision_record.turn_started == false
+      and $gate_decision_at != null
+      and ($turn.challenge_created_at | utc_epoch) <= $gate_decision_at
+      and .gate_decision_record.turn_started_at == null
+      and .gate_decision_record.decision_id == .decision_record.decision_id
       and (.decision_receipt_sha256 | hex64)
       and (.decision_record | decision_record_shape)
       and .decision_record.source_sha == $record.relay.source_sha
@@ -1056,6 +1143,7 @@ jq -e \
       and $decision_at != null
       and $turn_started_at != null
       and ($turn.challenge_created_at | utc_epoch) <= $decision_at
+      and $gate_decision_at <= $decision_at
       and $decision_at <= $turn_started_at
       and $turn_started_at <= ($turn.response_created_at | utc_epoch)
       and .turn_started == true
@@ -1252,7 +1340,8 @@ validate_decision_record_hash() {
     || fail "could not canonicalize $label"
   expected_hash=$(jq -er "$expected_filter" "$manifest_snapshot") \
     || fail "could not read expected hash for $label"
-  actual_hash=$(printf '%s\n' "$canonical_record" | sha256_line)
+  actual_hash=$(printf '%s\n%s\n' \
+    "buzz-acp-authorization-decision/v1" "$canonical_record" | sha256_line)
   [[ "$actual_hash" == "$expected_hash" ]] \
     || fail "$label does not match its canonical decision-record SHA-256"
 }
@@ -1263,6 +1352,10 @@ for agent_index in {0..7}; do
       ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_record" \
       ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_receipt_sha256" \
       "agent $agent_index DM turn $turn_index decision record"
+    validate_decision_record_hash \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_record" \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_receipt_sha256" \
+      "agent $agent_index DM turn $turn_index gate decision record"
   done
 done
 for probe_index in {0..15}; do
@@ -1304,7 +1397,7 @@ jq -cnS \
     dm_negative_probe_count: 16,
     group_dm_denial_probe_count: 8,
     unauthorized_third_party_dm_denial_probe_count: 8,
-    machine_decision_record_count: 32,
+    machine_decision_record_count: 48,
     machine_decision_records_cross_bound: true,
     manifest_contract_passed: true,
     evidence_bundle_authenticated: false,

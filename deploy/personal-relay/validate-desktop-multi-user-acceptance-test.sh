@@ -424,6 +424,7 @@ jq -n \
                 decision_receipt_sha256: h(5000 + (2 * $i)),
                 decision_record: {
                   schema: "buzz-acp-authorization-decision/v1",
+                  decision_id: uuid(6000 + (2 * $i)),
                   source_sha: $relay_source_sha,
                   agent_pubkey: h(10 + $i),
                   event_signer_pubkey: $mary_pubkey,
@@ -464,7 +465,17 @@ jq -n \
                 turn_started: true,
                 turn_started_at: (($started + 32) | todateiso8601),
                 exchange_receipt_sha256: h(1800 + (2 * $i))
-              },
+              }
+              | .decision_record as $decision_record
+              | . + {
+                  gate_decision_receipt_sha256: h(5200 + (2 * $i)),
+                  gate_decision_record: ($decision_record
+                    | .phase = "gate_evaluated"
+                    | .turn_id = null
+                    | .turn_started = false
+                    | .decided_at = .challenge_created_at
+                    | .turn_started_at = null)
+                },
               {
                 ordinal: 2,
                 challenge_nonce_sha256: h(2401 + (2 * $i)),
@@ -487,6 +498,7 @@ jq -n \
                 decision_receipt_sha256: h(5001 + (2 * $i)),
                 decision_record: {
                   schema: "buzz-acp-authorization-decision/v1",
+                  decision_id: uuid(6001 + (2 * $i)),
                   source_sha: $relay_source_sha,
                   agent_pubkey: h(10 + $i),
                   event_signer_pubkey: $mary_pubkey,
@@ -528,6 +540,16 @@ jq -n \
                 turn_started_at: (($started + 52) | todateiso8601),
                 exchange_receipt_sha256: h(1801 + (2 * $i))
               }
+              | .decision_record as $decision_record
+              | . + {
+                  gate_decision_receipt_sha256: h(5201 + (2 * $i)),
+                  gate_decision_record: ($decision_record
+                    | .phase = "gate_evaluated"
+                    | .turn_id = null
+                    | .turn_started = false
+                    | .decided_at = .challenge_created_at
+                    | .turn_started_at = null)
+                }
             ],
             continuity_verified: true,
             continuity_receipt_sha256: h(1900 + $i)
@@ -584,6 +606,7 @@ jq -n \
           decision_receipt_sha256: h(5100 + (2 * $i) + $probe_index),
           decision_record: {
             schema: "buzz-acp-authorization-decision/v1",
+            decision_id: uuid(6200 + (2 * $i) + $probe_index),
             source_sha: $relay_source_sha,
             agent_pubkey: h(10 + $i),
             event_signer_pubkey: (if $probe_index == 0
@@ -651,7 +674,8 @@ set_decision_record_hash_in_file() {
   record_filter=$2
   hash_filter=$3
   canonical=$(jq -ceS "$record_filter" "$target")
-  digest=$(printf '%s\n' "$canonical" | sha256_line)
+  digest=$(printf '%s\n%s\n' \
+    "buzz-acp-authorization-decision/v1" "$canonical" | sha256_line)
   updated="$fixture_root/decision-hash-update.json"
   jq --arg digest "$digest" "$hash_filter = \$digest" "$target" > "$updated"
   mv "$updated" "$target"
@@ -666,6 +690,9 @@ for agent_index in {0..7}; do
     set_decision_record_hash \
       ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_record" \
       ".agents[$agent_index].dm_conversation.turns[$turn_index].decision_receipt_sha256"
+    set_decision_record_hash \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_record" \
+      ".agents[$agent_index].dm_conversation.turns[$turn_index].gate_decision_receipt_sha256"
   done
 done
 for probe_index in {0..15}; do
@@ -736,7 +763,7 @@ jq -e \
   and .dm_negative_probe_count == 16
   and .group_dm_denial_probe_count == 8
   and .unauthorized_third_party_dm_denial_probe_count == 8
-  and .machine_decision_record_count == 32
+  and .machine_decision_record_count == 48
   and .machine_decision_records_cross_bound == true
   and .manifest_contract_passed == true
   and .evidence_bundle_authenticated == false
@@ -827,6 +854,7 @@ jq -e '
         .dm_conversation.channel_metadata.metadata_receipt_sha256,
         .dm_conversation.db_invariant.invariant_receipt_sha256,
         .dm_conversation.turns[].decision_receipt_sha256,
+        .dm_conversation.turns[].gate_decision_receipt_sha256,
         .dm_conversation.turns[].exchange_receipt_sha256),
     (.dm_negative_probes[]
       | .probe_receipt_sha256,
@@ -834,10 +862,17 @@ jq -e '
         .decision_receipt_sha256,
         .no_turn_receipt_sha256)
   ] as $receipt_hashes
-    | ($receipt_hashes | length) == 176
-    and ($receipt_hashes | unique | length) == 176)
+    | ($receipt_hashes | length) == 192
+    and ($receipt_hashes | unique | length) == 192)
+  and ([
+    .agents[].dm_conversation.turns[].gate_decision_record.decision_id,
+    .agents[].dm_conversation.turns[].decision_record.decision_id,
+    .dm_negative_probes[].decision_record.decision_id
+  ] as $decision_ids
+    | ($decision_ids | length) == 48
+    and ($decision_ids | unique | length) == 32)
 ' "$valid" >/dev/null \
-  || fail "fixture does not cover all 64 interaction event IDs, 40 channel-security event IDs, 16 authorization event IDs, 40 nonces, 24 DM channels, and 176 receipt hashes"
+  || fail "fixture does not cover all 64 interaction event IDs, 40 channel-security event IDs, 16 authorization event IDs, 40 nonces, 24 DM channels, 192 receipt hashes, and 48 decision-record occurrences / 32 decision IDs"
 "$validator" --input "$valid" --evidence-bundle "$evidence_bundle" \
   "${common_args[@]}" >/dev/null \
   || fail "same-second parallel positive fixture was rejected"
@@ -909,6 +944,48 @@ mutate_record_and_rehash() {
 
 positive_decision_record='.agents[0].dm_conversation.turns[0].decision_record'
 positive_decision_hash='.agents[0].dm_conversation.turns[0].decision_receipt_sha256'
+positive_gate_decision_record='.agents[0].dm_conversation.turns[0].gate_decision_record'
+positive_gate_decision_hash='.agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256'
+
+mutate_record_and_rehash decision-id-pair-mismatch \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record.decision_id =
+    "00000000-0000-4000-8000-000000006299"' \
+  "$positive_gate_decision_record" "$positive_gate_decision_hash"
+
+decision_id_reuse_across_pairs="$fixture_root/decision-id-reuse-across-pairs.json"
+jq '
+  .agents[0].dm_conversation.turns[0].decision_record.decision_id =
+    .agents[0].dm_conversation.turns[1].decision_record.decision_id
+  | .agents[0].dm_conversation.turns[0].gate_decision_record.decision_id =
+      .agents[0].dm_conversation.turns[1].decision_record.decision_id
+' "$valid" > "$decision_id_reuse_across_pairs"
+set_decision_record_hash_in_file "$decision_id_reuse_across_pairs" \
+  '.agents[0].dm_conversation.turns[0].decision_record' \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256'
+set_decision_record_hash_in_file "$decision_id_reuse_across_pairs" \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record' \
+  '.agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256'
+expect_rejected decision-id-reuse-across-pairs "$decision_id_reuse_across_pairs"
+
+mutate_and_reject missing-gate-decision-record '
+  del(.agents[0].dm_conversation.turns[0].gate_decision_record,
+      .agents[0].dm_conversation.turns[0].gate_decision_receipt_sha256)
+'
+
+mutate_record_and_rehash gate-turn-started \
+  '.agents[0].dm_conversation.turns[0].gate_decision_record.turn_started = true' \
+  "$positive_gate_decision_record" "$positive_gate_decision_hash"
+
+wrong_domain_hash="$fixture_root/wrong-decision-domain-prefix.json"
+jq '.' "$valid" > "$wrong_domain_hash"
+wrong_domain_digest=$(jq -ceS \
+  '.agents[0].dm_conversation.turns[0].decision_record' "$wrong_domain_hash" \
+  | sha256_line)
+jq --arg digest "$wrong_domain_digest" \
+  '.agents[0].dm_conversation.turns[0].decision_receipt_sha256 = $digest' \
+  "$wrong_domain_hash" > "$fixture_root/wrong-decision-domain-prefix-updated.json"
+mv "$fixture_root/wrong-decision-domain-prefix-updated.json" "$wrong_domain_hash"
+expect_rejected wrong-decision-domain-prefix "$wrong_domain_hash"
 
 mutate_and_reject decision-record-canonical-hash-mismatch \
   '.agents[0].dm_conversation.turns[0].decision_receipt_sha256 = ("a" * 64)'

@@ -457,7 +457,7 @@ Desktop acceptance has two stages. The pre-build staging receipt proves the
 approved relay, Gate 1, smoke, and control inputs, but it cannot prove behavior
 after the exact DMG is installed. After Justin separately approves installation
 of that exact staging DMG and before cutover, create a private evidence bundle
-that is short-lived plus a `personal-desktop-multi-user-acceptance/v2` manifest.
+that is short-lived plus a `personal-desktop-multi-user-acceptance/v3` manifest.
 The manifest binds the bundle, the exact DMG, attestation predicate, final v3 audit
 receipt, relay, channel, hosted-Buzz, identity, and eight-agent inventory records.
 For each agent it also binds recipient discovery and selection, an exact 1:1 DM
@@ -478,7 +478,7 @@ a public Actions artifact. The checked-in example is poisoned with
 
 Run `validate-desktop-multi-user-acceptance.sh` with independently retained
 expected values, never values copied from the manifest. Its resulting
-`personal-desktop-multi-user-acceptance-summary/v2` checks
+`personal-desktop-multi-user-acceptance-summary/v3` checks
 structure, descriptor-safe files, hashes, cross-bindings, and freshness. It does not authenticate
 the opaque bundle or event signatures. It rejects symlinks and same-inode
 manifest/bundle aliases, then uses a sealed private snapshot of the safely
@@ -499,6 +499,36 @@ acceptance remain mandatory.
 Any future production or promotion lane must exact-download and independently
 verify both the manifest and evidence bundle by immutable identity and digest,
 rerun the validator, and reject a summary-only handoff.
+
+The v3 manifest carries machine-emitted `buzz-acp-authorization-decision/v1`
+records, not operator-authored labels. ACP emits them when started with
+`--authorization-decision-receipts` and
+`--authorization-decision-receipt-path <file>` (env
+`BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPTS` /
+`BUZZ_ACP_AUTHORIZATION_DECISION_RECEIPT_PATH`). The sink is an append-only
+JSONL file that requires a `0700` parent directory and `0600` file, refuses
+symlinks, is single-writer within one ACP process, and grows without rotation;
+receipts are refused on non-Unix hosts. Every record embeds the compile-time
+`source_sha` injected through `BUZZ_BUILD_SOURCE_SHA` (a `build.rs`
+`rerun-if-env-changed` trigger prevents a cached build from baking a stale
+SHA), and it must equal the relay source SHA. Each authorization decision
+produces a `gate_evaluated` record with `turn_started: false`; an allowed turn
+additionally produces a `turn_dispatched` record at the real turn-start
+boundary, and both halves of the pair share one `decision_id` UUID. The
+manifest binds, per agent, both records for each of the two DM turns and the
+single `gate_evaluated` denial record for each negative probe: 48 decision
+records total (8 agents x 2 turns x 2 phases + 16 denials), 32 unique
+`decision_id` values (16 pair IDs used exactly twice, 16 probe IDs used
+exactly once). Every `*_receipt_sha256` for a decision record is recomputed
+from its canonical record: the hash input is the ASCII line
+`buzz-acp-authorization-decision/v1`, one newline, the `jq -cS`
+sorted-key compact JSON of the record, and one trailing newline. The full
+receipt-hash list must contain exactly 192 unique values, derived as
+8 x (10 + 3 x 2) + 8 x 2 x 4: ten scalar operator receipts and three per-turn
+hashes (gate decision, turn-start decision, exchange) per agent, plus four
+receipt hashes per negative probe. The independent derivation test
+(`validate-desktop-multi-user-acceptance-formula-test.sh`) recomputes those
+counts from the symbolic formula and must stay green.
 
 Mary's production acceptance is a hard release blocker. Mary must complete it
 while signed in as her own identity, as a member of the personal relay and the
