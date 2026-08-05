@@ -197,8 +197,7 @@ echo "checking desktop deep-link scheme"
 curl "${curl_args[@]}" \
   -H 'Accept: text/html' \
   "$base_url/invite/runtime-scheme-smoke" >"$web_index_path"
-node --input-type=module - "$web_index_path" "$expected_desktop_scheme" <<'NODE' ||
-  fail "served invite page does not contain the expected desktop deep-link scheme"
+node --input-type=module - "$web_index_path" "$expected_desktop_scheme" <<'NODE' || fail "served invite page does not contain the expected desktop deep-link scheme"
 import { readFileSync } from "node:fs";
 
 const html = readFileSync(process.argv[2], "utf8");
