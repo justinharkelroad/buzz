@@ -1275,6 +1275,7 @@ jobs:
           BASH_ENV: ""
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           EXPECTED_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1
           EXPECTED_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           EXPECTED_PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
@@ -1329,12 +1330,28 @@ jobs:
           [[ "$plist_executable" =~ ^[A-Za-z0-9._-]+$ ]]
           main_executable="$app/Contents/MacOS/$plist_executable"
           [[ -f "$main_executable" && -x "$main_executable" && ! -L "$main_executable" ]]
-          /usr/bin/grep -aFq -- "$EXPECTED_BANNER_ARTIFACT" "$main_executable" || {
-            echo "::error::packaged staging app does not contain the rendered banner evidence"
+          # Banner evidence lives in the compiled frontend, which tauri embeds in a
+          # compressed form: the markers are not plaintext anywhere inside the .app,
+          # so grepping the executable can never pass and its companion negative check
+          # passes vacuously. Verify the surface the markers actually exist on, using
+          # the repository's purpose-built verifier over the exact frontend build output
+          # that this same job embedded into the app.
+          frontend_dist="desktop/dist"
+          [[ -d "$frontend_dist" && ! -L "$frontend_dist" ]] || {
+            echo "::error::frontend build output is missing for banner verification"
             exit 1
           }
-          if /usr/bin/grep -aFq -- "$FORBIDDEN_BANNER_ARTIFACT" "$main_executable"; then
-            echo "::error::packaged staging app contains the production banner-absent evidence"
+          VITE_BUZZ_BUILD_CHANNEL="$BUZZ_BUILD_CHANNEL" \
+            node desktop/scripts/verify-personal-staging-banner-build.mjs "$frontend_dist" || {
+            echo "::error::staging frontend does not satisfy the banner build contract"
+            exit 1
+          }
+          /usr/bin/grep -rlaF -- "$EXPECTED_BANNER_ARTIFACT" "$frontend_dist" >/dev/null || {
+            echo "::error::staging frontend does not contain the rendered banner evidence"
+            exit 1
+          }
+          if /usr/bin/grep -rlaF -- "$FORBIDDEN_BANNER_ARTIFACT" "$frontend_dist" >/dev/null 2>&1; then
+            echo "::error::staging frontend contains the production banner-absent evidence"
             exit 1
           fi
           case "$DESKTOP_TARGET" in
