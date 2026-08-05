@@ -1088,6 +1088,45 @@ jobs:
               )
             ' "$proof_dir/release-provenance-verification.json" >/dev/null
 
+      - name: Resolve exact per-architecture platform digests
+        id: platforms
+        env:
+          DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
+        run: |
+          set -euo pipefail
+          proof_dir=/tmp/personal-relay-gate1-image-proof
+          docker buildx imagetools inspect "$DEPLOYMENT_REF" --raw \
+            > "$proof_dir/merged-index.json"
+          actual_sha256=$(sha256sum "$proof_dir/merged-index.json" | awk '{print $1}')
+          expected_sha256=${IMAGE_DIGEST#sha256:}
+          if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+            echo "::error::raw merged index bytes do not match the approved merged image digest (expected $expected_sha256, got $actual_sha256)"
+            exit 1
+          fi
+          platform_manifests=$(jq -c '[.manifests[] | select(.annotations["vnd.docker.reference.type"] == null)]' "$proof_dir/merged-index.json")
+          platform_count=$(jq 'length' <<<"$platform_manifests")
+          if [[ "$platform_count" != 2 ]]; then
+            echo "::error::expected exactly two platform manifests in the merged index, found $platform_count"
+            exit 1
+          fi
+          if ! jq -e 'all(.[]; .platform.os == "linux")' <<<"$platform_manifests" >/dev/null; then
+            echo "::error::a platform manifest in the merged index is not linux"
+            exit 1
+          fi
+          architectures=$(jq -c '[.[].platform.architecture] | sort' <<<"$platform_manifests")
+          if [[ "$architectures" != '["amd64","arm64"]' ]]; then
+            echo "::error::merged index platform manifests are not exactly amd64 and arm64 (found: $architectures)"
+            exit 1
+          fi
+          amd64_digest=$(jq -er '.[] | select(.platform.architecture == "amd64") | .digest' <<<"$platform_manifests")
+          arm64_digest=$(jq -er '.[] | select(.platform.architecture == "arm64") | .digest' <<<"$platform_manifests")
+          {
+            echo "amd64_digest=$amd64_digest"
+            echo "arm64_digest=$arm64_digest"
+            echo "amd64_ref=${IMAGE_NAME}@${amd64_digest}"
+            echo "arm64_ref=${IMAGE_NAME}@${arm64_digest}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Reverify relay runtime and both required binaries
         env:
           DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
@@ -1133,11 +1172,10 @@ jobs:
         env:
           TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
           TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
-          TRIVY_PLATFORM: linux/amd64
           TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
         with:
           cache: false
-          image-ref: ${{ steps.identity.outputs.deployment_ref }}
+          image-ref: ${{ steps.platforms.outputs.amd64_ref }}
           scanners: secret
           format: json
           output: /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-amd64.json
@@ -1151,11 +1189,10 @@ jobs:
         env:
           TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
           TRIVY_IGNOREFILE: /tmp/personal-relay-trivy-ignore
-          TRIVY_PLATFORM: linux/arm64
           TRIVY_SECRET_CONFIG: /tmp/personal-relay-trivy-secret.yaml
         with:
           cache: false
-          image-ref: ${{ steps.identity.outputs.deployment_ref }}
+          image-ref: ${{ steps.platforms.outputs.arm64_ref }}
           scanners: secret
           format: json
           output: /tmp/personal-relay-gate1-image-proof/personal-relay-trivy-secret-arm64.json
@@ -1167,34 +1204,43 @@ jobs:
       - name: Bind zero-secret reports to both exact architectures
         env:
           DEPLOYMENT_REF: ${{ steps.identity.outputs.deployment_ref }}
+          AMD64_REF: ${{ steps.platforms.outputs.amd64_ref }}
+          ARM64_REF: ${{ steps.platforms.outputs.arm64_ref }}
+          AMD64_DIGEST: ${{ steps.platforms.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.platforms.outputs.arm64_digest }}
         run: |
           set -euo pipefail
           proof_dir=/tmp/personal-relay-gate1-image-proof
           for arch in amd64 arm64; do
             report="$proof_dir/personal-relay-trivy-secret-${arch}.json"
             bound_report="/tmp/personal-relay-trivy-secret-${arch}-bound.json"
+            if [[ "$arch" == amd64 ]]; then
+              expected_ref="$AMD64_REF"
+            else
+              expected_ref="$ARM64_REF"
+            fi
             jq '. + {Trivy: {Version: "0.70.0"}}' \
               "$report" > "$bound_report"
             install -m 0600 "$bound_report" "$report"
             jq -e \
               --arg arch "$arch" \
-              --arg deployment_ref "$DEPLOYMENT_REF" \
+              --arg expected_ref "$expected_ref" \
               --arg source_sha "$SOURCE_SHA" '
                 .SchemaVersion == 2
-                and .ArtifactName == $deployment_ref
+                and .ArtifactName == $expected_ref
                 and .ArtifactType == "container_image"
                 and .Trivy.Version == "0.70.0"
-                and (.Metadata.RepoDigests | index($deployment_ref)) != null
+                and (.Metadata.RepoDigests | index($expected_ref)) != null
                 and .Metadata.ImageConfig.architecture == $arch
                 and .Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha
                 and ([.Results[]? | .Secrets[]?] | length) == 0
               ' "$report" >/dev/null || {
               echo "::error::zero-secret binding failed for $arch"
-              jq -r --arg arch "$arch" --arg deployment_ref "$DEPLOYMENT_REF" --arg source_sha "$SOURCE_SHA" '
+              jq -r --arg arch "$arch" --arg expected_ref "$expected_ref" --arg source_sha "$SOURCE_SHA" '
                 "SchemaVersion=\(.SchemaVersion)",
                 "ArtifactType=\(.ArtifactType)",
-                "ArtifactName_matches=\(.ArtifactName == $deployment_ref) (\(.ArtifactName))",
-                "RepoDigests_contains_ref=\((.Metadata.RepoDigests | index($deployment_ref)) != null) (\(.Metadata.RepoDigests))",
+                "ArtifactName_matches=\(.ArtifactName == $expected_ref) (\(.ArtifactName))",
+                "RepoDigests_contains_ref=\((.Metadata.RepoDigests | index($expected_ref)) != null) (\(.Metadata.RepoDigests))",
                 "architecture=\(.Metadata.ImageConfig.architecture) expected=\($arch)",
                 "revision_matches=\(.Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha)",
                 "secrets_count=\([.Results[]? | .Secrets[]?] | length)"
@@ -1205,6 +1251,8 @@ jobs:
           jq -n \
             --arg deployment_ref "$DEPLOYMENT_REF" \
             --arg source_sha "$SOURCE_SHA" \
+            --arg amd64_digest "$AMD64_DIGEST" \
+            --arg arm64_digest "$ARM64_DIGEST" \
             --arg amd64_sha "$(sha256sum "$proof_dir/personal-relay-trivy-secret-amd64.json" | awk '{print $1}')" \
             --arg arm64_sha "$(sha256sum "$proof_dir/personal-relay-trivy-secret-arm64.json" | awk '{print $1}')" '
             {
@@ -1212,8 +1260,8 @@ jobs:
               source_sha: $source_sha,
               scanner: {name: "Trivy", version: "0.70.0", scanners: ["secret"]},
               architectures: [
-                {architecture: "amd64", secrets_found: 0, report_sha256: $amd64_sha},
-                {architecture: "arm64", secrets_found: 0, report_sha256: $arm64_sha}
+                {architecture: "amd64", secrets_found: 0, report_sha256: $amd64_sha, platform_digest: $amd64_digest},
+                {architecture: "arm64", secrets_found: 0, report_sha256: $arm64_sha, platform_digest: $arm64_digest}
               ]
             }
           ' > "$proof_dir/secret-scan-proof.json"
