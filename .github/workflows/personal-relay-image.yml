@@ -2424,6 +2424,15 @@ jobs:
               and (.manifests | sort_by(.digest)) == $expected[0]
             ' personal-relay-merged-index.json >/dev/null
 
+      - name: Provide default-path GHCR credential for attestation
+        env:
+          DOCKER_CONFIG: /home/runner/.docker
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Fresh owner-authorization and protected-main recheck immediately before provenance attestation
         env:
           AUTHORIZATION_ARTIFACT_EXPIRES_AT: ${{ needs.release-approval.outputs.authorization_artifact_expires_at }}
@@ -2602,12 +2611,35 @@ jobs:
 
       - name: Attest merged image provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        env:
+          DOCKER_CONFIG: /home/runner/.docker
         with:
           subject-name: ${{ needs.prepare.outputs.image_name }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
           create-storage-record: false
           show-summary: false
+
+      - name: Remove default-path GHCR credential after attestation
+        if: ${{ always() }}
+        env:
+          DOCKER_CONFIG: /home/runner/.docker
+        run: |
+          set -euo pipefail
+          config_file="$DOCKER_CONFIG/config.json"
+          if [[ -L "$config_file" ]]; then
+            unlink -- "$config_file"
+            echo "::error::refused to follow a symlinked Docker credential file"
+            exit 1
+          fi
+          if [[ -e "$config_file" ]]; then
+            [[ -f "$config_file" && -O "$config_file" ]]
+            shred --force --iterations=3 --remove --zero -- "$config_file"
+          fi
+          [[ ! -e "$config_file" && ! -L "$config_file" ]] || {
+            echo "::error::default-path Docker credential file survived cleanup"
+            exit 1
+          }
 
       - name: Remove GHCR credentials after registry attestation
         if: ${{ always() }}
