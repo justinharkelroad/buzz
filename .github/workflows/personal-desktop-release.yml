@@ -1275,13 +1275,13 @@ jobs:
           BASH_ENV: ""
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
-          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           EXPECTED_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1
           EXPECTED_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           EXPECTED_PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
           EXPECTED_URI_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           FORBIDDEN_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1
           HOSTED_HTTPS: ${{ steps.deployment.outputs.hosted_https }}
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           PERSONAL_PRODUCTION_HTTPS: ${{ steps.deployment.outputs.personal_production_https }}
           RELAY_HTTPS: ${{ steps.build-contract.outputs.relay_https }}
@@ -1341,8 +1341,8 @@ jobs:
             echo "::error::frontend build output is missing for banner verification"
             exit 1
           }
-          VITE_BUZZ_BUILD_CHANNEL="$BUZZ_BUILD_CHANNEL" \
-            node desktop/scripts/verify-personal-staging-banner-build.mjs "$frontend_dist" || {
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          node desktop/scripts/verify-personal-staging-banner-build.mjs "$frontend_dist" || {
             echo "::error::staging frontend does not satisfy the banner build contract"
             exit 1
           }
