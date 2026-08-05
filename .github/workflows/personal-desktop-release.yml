@@ -1183,6 +1183,10 @@ jobs:
           app=$(find "$bundle_dir" -maxdepth 1 -name '*.app' -type d -print -quit)
           app_count=$(find "$bundle_dir" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d '[:space:]')
           [[ "$app_count" == 1 && -n "$app" ]]
+          # Emit an ABSOLUTE path: the DMG step runs its verification diff after cd desktop,
+          # so a repo-root-relative path resolves to desktop/desktop/... and the diff fails.
+          app="$(cd "$(dirname "$app")" && pwd)/$(basename "$app")"
+          [[ -d "$app" ]]
           snapshot_root=$(/usr/bin/mktemp -d /tmp/personal-desktop-unpacked-app.XXXXXX)
           /usr/bin/ditto "$app" "$snapshot_root/$(basename "$app")"
           {
