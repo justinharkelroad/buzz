@@ -1268,6 +1268,18 @@ jobs:
           }
           cleanup_mount
           trap - EXIT
+          # The bundler consumed the unpacked .app. Downstream steps (sidecar parity,
+          # banner and scheme checks, attestation inputs) all inspect it in place, so
+          # restore the byte-identical snapshot we just proved the DMG was built from.
+          [[ ! -e "$UNPACKED_APP" ]] || {
+            echo "::error::unpacked app unexpectedly present before restore"
+            exit 1
+          }
+          /usr/bin/ditto "$snapshot_app" "$UNPACKED_APP"
+          /usr/bin/diff -qr "$snapshot_app" "$UNPACKED_APP" || {
+            echo "::error::restored app differs from the verified snapshot"
+            exit 1
+          }
 
       - name: Verify package and exact sidecar parity
         id: artifacts
