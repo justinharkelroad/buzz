@@ -319,7 +319,7 @@ jq -e \
     and .head_branch == "main"
     and .head_sha == $source_sha
     and .event == "workflow_dispatch"
-    and .path == ".github/workflows/personal-relay-image.yml@main"
+    and .path == ".github/workflows/personal-relay-image.yml"
     and .repository.full_name == $repository
     and all([.actor, .triggering_actor][];
       (keys == ["id", "login", "node_id"])
@@ -706,7 +706,7 @@ jq -e \
     and .event == "workflow_dispatch"
     and .head_sha == $workflow_sha
     and .head_branch == "main"
-    and .path == ".github/workflows/personal-relay-gate1.yml@main"
+    and .path == ".github/workflows/personal-relay-gate1.yml"
     and .repository.full_name == "justinharkelroad/buzz"
     and (.triggering_actor | identity)
     and (.actor | identity)
@@ -844,7 +844,7 @@ jq -e \
   and $source_run[0].event == "workflow_dispatch"
   and $source_run[0].head_sha == $workflow_sha
   and $source_run[0].head_branch == "main"
-  and $source_run[0].path == ".github/workflows/personal-relay-gate1.yml@main"
+  and $source_run[0].path == ".github/workflows/personal-relay-gate1.yml"
   and $source_run[0].repository.full_name == $repository
   and ($source_job | length) == 1
   and ($source_job[0] | keys | sort) == ([

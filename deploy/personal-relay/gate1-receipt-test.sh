@@ -245,7 +245,7 @@ jq -n --arg source_sha "$source_sha" '{
   head_branch: "main",
   head_sha: $source_sha,
   event: "workflow_dispatch",
-  path: ".github/workflows/personal-relay-image.yml@main",
+  path: ".github/workflows/personal-relay-image.yml",
   repository: {full_name: "justinharkelroad/buzz"},
   actor: {login: "justinharkelroad", id: 1111, node_id: "MDQ6VXNlcjExMTE="},
   triggering_actor: {login: "justinharkelroad", id: 1111, node_id: "MDQ6VXNlcjExMTE="}
@@ -382,7 +382,7 @@ jq -n '[{
   enforcement: "active",
   bypass_actors: []
 }]' > "$tmp_dir/main-rulesets.json"
-jq -n --arg gate1_sha "$gate1_sha" '{id: 303, run_attempt: 1, event: "workflow_dispatch", head_sha: $gate1_sha, head_branch: "main", path: ".github/workflows/personal-relay-gate1.yml@main", repository: {full_name: "justinharkelroad/buzz"}, actor: {login: "justinharkelroad", id: 111, node_id: "MDQ6VXNlcjExMQ=="}, triggering_actor: {login: "justinharkelroad", id: 111, node_id: "MDQ6VXNlcjExMQ=="}}' > "$tmp_dir/gate1-run-metadata.json"
+jq -n --arg gate1_sha "$gate1_sha" '{id: 303, run_attempt: 1, event: "workflow_dispatch", head_sha: $gate1_sha, head_branch: "main", path: ".github/workflows/personal-relay-gate1.yml", repository: {full_name: "justinharkelroad/buzz"}, actor: {login: "justinharkelroad", id: 111, node_id: "MDQ6VXNlcjExMQ=="}, triggering_actor: {login: "justinharkelroad", id: 111, node_id: "MDQ6VXNlcjExMQ=="}}' > "$tmp_dir/gate1-run-metadata.json"
 source_proof="$tmp_dir/source-proof"
 mkdir -p "$source_proof"
 printf '%s\n' 'name: Personal Relay Gate 1 protected workflow fixture' \
@@ -399,7 +399,7 @@ jq -n --arg gate1_sha "$gate1_sha" '{
   event: "workflow_dispatch",
   head_sha: $gate1_sha,
   head_branch: "main",
-  path: ".github/workflows/personal-relay-gate1.yml@main",
+  path: ".github/workflows/personal-relay-gate1.yml",
   repository: {full_name: "justinharkelroad/buzz"}
 }' > "$source_proof/source-test-run.json"
 jq -n --arg gate1_sha "$gate1_sha" '{

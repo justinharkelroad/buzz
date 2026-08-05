@@ -432,7 +432,7 @@ if ! jq -se \
       type == "object" and
       .SchemaVersion == 2 and
       .ArtifactType == "spdx" and
-      .ArtifactName == $spdx_path and
+      ((.ArtifactName | split("/") | last) == ($spdx_path | split("/") | last)) and
       .Trivy.Version == $trivy_version and
       (.Results == null or (.Results | type) == "array") and
       (if ($required_purls | length) == 0 then
