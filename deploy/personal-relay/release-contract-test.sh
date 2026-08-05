@@ -2262,8 +2262,13 @@ require_desktop(bash_version_status.success?, "unable to identify /bin/bash for 
 if RUBY_PLATFORM.include?("darwin")
   require_desktop(bash_version == "3.2", "macOS Desktop fixture must execute with system Bash 3.2, found #{bash_version}")
 end
-dmg_split = dmg_build_run.split("\n/usr/bin/diff -qr", 2)
+dmg_split = dmg_build_run.split("\n# POST-BUILD DMG PARITY CHECK", 2)
 require_desktop(dmg_split.length == 2, "Desktop DMG branch fixture could not isolate the post-build parity check")
+require_desktop(dmg_build_run.include?("hdiutil attach"), "Desktop DMG parity check must mount the built DMG read-only")
+require_desktop(dmg_build_run.include?("-readonly -nobrowse"), "Desktop DMG parity check must mount read-only and nobrowse")
+require_desktop(dmg_build_run.include?("/usr/bin/diff -qr \"$snapshot_app\" \"$mounted_app\""), "Desktop DMG parity check must diff the snapshot against the mounted DMG payload")
+require_desktop(dmg_build_run.include?("DMG payload differs from the snapshotted unpacked app"), "Desktop DMG parity check must fail loudly on payload drift")
+require_desktop(dmg_build_run.include?("hdiutil detach"), "Desktop DMG parity check must detach the mounted volume")
 fixture_scripts = {
   "candidate" => candidate_build_run,
   "dmg" => dmg_split.fetch(0) + "\n",
