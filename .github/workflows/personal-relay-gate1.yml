@@ -55,6 +55,7 @@ jobs:
 
       - name: Stage changed Gate 1 approvals for proactive secret scanning
         id: changed-approvals
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -78,7 +79,7 @@ jobs:
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
       - name: Create trusted empty Trivy configuration outside the checkout
-        if: steps.changed-approvals.outputs.count != '0'
+        if: github.event_name == 'pull_request' && steps.changed-approvals.outputs.count != '0'
         run: |
           set -euo pipefail
           [[ ! -e trivyignores && ! -L trivyignores ]]
@@ -95,7 +96,7 @@ jobs:
           printf '{}\n' > /tmp/personal-relay-trivy-secret.yaml
 
       - name: Scan changed Gate 1 approvals for secrets
-        if: steps.changed-approvals.outputs.count != '0'
+        if: github.event_name == 'pull_request' && steps.changed-approvals.outputs.count != '0'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_CONFIG: /tmp/personal-relay-trivy-config.yaml
@@ -114,7 +115,7 @@ jobs:
           version: v0.70.0
 
       - name: Validate proactive approval secret-scan report
-        if: steps.changed-approvals.outputs.count != '0'
+        if: github.event_name == 'pull_request' && steps.changed-approvals.outputs.count != '0'
         run: |
           set -euo pipefail
           report=/tmp/personal-relay-gate1-pr-approval-secret.json
@@ -1187,7 +1188,19 @@ jobs:
                 and .Metadata.ImageConfig.architecture == $arch
                 and .Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha
                 and ([.Results[]? | .Secrets[]?] | length) == 0
-              ' "$report" >/dev/null
+              ' "$report" >/dev/null || {
+              echo "::error::zero-secret binding failed for $arch"
+              jq -r --arg arch "$arch" --arg deployment_ref "$DEPLOYMENT_REF" --arg source_sha "$SOURCE_SHA" '
+                "SchemaVersion=\(.SchemaVersion)",
+                "ArtifactType=\(.ArtifactType)",
+                "ArtifactName_matches=\(.ArtifactName == $deployment_ref) (\(.ArtifactName))",
+                "RepoDigests_contains_ref=\((.Metadata.RepoDigests | index($deployment_ref)) != null) (\(.Metadata.RepoDigests))",
+                "architecture=\(.Metadata.ImageConfig.architecture) expected=\($arch)",
+                "revision_matches=\(.Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha)",
+                "secrets_count=\([.Results[]? | .Secrets[]?] | length)"
+              ' "$report"
+              exit 1
+            }
           done
           jq -n \
             --arg deployment_ref "$DEPLOYMENT_REF" \
