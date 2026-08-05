@@ -1211,6 +1211,8 @@ jobs:
           ENV: ""
           SKIPPY_LLAMA_AUTO_BUILD: "0"
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"
+          UNPACKED_APP: ${{ steps.unpacked-app.outputs.app }}
+          UNPACKED_SNAPSHOT: ${{ steps.unpacked-app.outputs.snapshot }}
           VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           VITE_BUZZ_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
@@ -1233,9 +1235,39 @@ jobs:
             echo "::error::unsupported desktop target"
             exit 1
           fi
-          /usr/bin/diff -qr \
-            "${{ steps.unpacked-app.outputs.snapshot }}/$(basename "${{ steps.unpacked-app.outputs.app }}")" \
-            "${{ steps.unpacked-app.outputs.app }}"
+          # POST-BUILD DMG PARITY CHECK
+          # The tauri dmg bundler consumes the unpacked .app, so the live path no longer
+          # exists here. Prove the same property against the DMG payload: mount the freshly
+          # built image read-only and diff the app it actually contains against the snapshot.
+          snapshot_app="$UNPACKED_SNAPSHOT/$(basename "$UNPACKED_APP")"
+          [[ -d "$snapshot_app" ]]
+          dmg_dir="src-tauri/target/${DESKTOP_TARGET}/release/bundle/dmg"
+          dmg=$(find "$dmg_dir" -maxdepth 1 -name '*.dmg' -type f -print -quit)
+          dmg_count=$(find "$dmg_dir" -maxdepth 1 -name '*.dmg' -type f | wc -l | tr -d '[:space:]')
+          [[ "$dmg_count" == 1 && -n "$dmg" ]] || {
+            echo "::error::expected exactly one built DMG"
+            exit 1
+          }
+          mount_point=$(/usr/bin/mktemp -d /tmp/personal-desktop-dmg-verify.XXXXXX)
+          cleanup_mount() { /usr/bin/hdiutil detach "$mount_point" -quiet >/dev/null 2>&1 || true; }
+          trap cleanup_mount EXIT
+          /usr/bin/hdiutil attach "$dmg" -readonly -nobrowse -noverify -noautoopen -mountpoint "$mount_point" >/dev/null
+          mounted_app=$(find "$mount_point" -maxdepth 1 -name '*.app' -type d -print -quit)
+          mounted_count=$(find "$mount_point" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d '[:space:]')
+          [[ "$mounted_count" == 1 && -n "$mounted_app" ]] || {
+            echo "::error::expected exactly one app bundle inside the built DMG"
+            exit 1
+          }
+          [[ "$(basename "$mounted_app")" == "$(basename "$snapshot_app")" ]] || {
+            echo "::error::DMG app bundle name does not match the snapshotted app"
+            exit 1
+          }
+          /usr/bin/diff -qr "$snapshot_app" "$mounted_app" || {
+            echo "::error::DMG payload differs from the snapshotted unpacked app"
+            exit 1
+          }
+          cleanup_mount
+          trap - EXIT
 
       - name: Verify package and exact sidecar parity
         id: artifacts
