@@ -1315,6 +1315,22 @@ jobs:
             shred -u "$DOCKER_CONFIG/config.json"
           fi
           [[ ! -e "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+          while IFS= read -r -d '' residual; do
+            if [[ -L "$residual" ]]; then
+              unlink -- "$residual"
+            elif [[ -f "$residual" && -O "$residual" ]]; then
+              shred --force --iterations=3 --remove --zero -- "$residual"
+            elif [[ -d "$residual" && -O "$residual" ]]; then
+              rm -rf -- "$residual"
+            else
+              echo "::error::unexpected residual entry in Docker credential directory: $(basename -- "$residual")"
+              exit 1
+            fi
+          done < <(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print0)
+          [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+            echo "::error::Docker credential directory not empty after cleanup"
+            exit 1
+          }
           rmdir "$DOCKER_CONFIG"
           [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
 
@@ -2530,6 +2546,22 @@ jobs:
           [[ -f "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
           shred -u "$DOCKER_CONFIG/config.json"
           [[ ! -e "$DOCKER_CONFIG/config.json" && ! -L "$DOCKER_CONFIG/config.json" ]]
+          while IFS= read -r -d '' residual; do
+            if [[ -L "$residual" ]]; then
+              unlink -- "$residual"
+            elif [[ -f "$residual" && -O "$residual" ]]; then
+              shred --force --iterations=3 --remove --zero -- "$residual"
+            elif [[ -d "$residual" && -O "$residual" ]]; then
+              rm -rf -- "$residual"
+            else
+              echo "::error::unexpected residual entry in Docker credential directory: $(basename -- "$residual")"
+              exit 1
+            fi
+          done < <(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print0)
+          [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+            echo "::error::Docker credential directory not empty after cleanup"
+            exit 1
+          }
           rmdir "$DOCKER_CONFIG"
           [[ ! -e "$DOCKER_CONFIG" && ! -L "$DOCKER_CONFIG" ]]
           trap - EXIT
