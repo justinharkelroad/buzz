@@ -2843,8 +2843,7 @@ def validate_trivy_step(step, inherited_env, expected_outputs, trivy_action, lab
     require_contract(trusted_tmp_path?(secret_config), "secret config is not a trusted /tmp file: #{label}")
     expected_env["TRIVY_SECRET_CONFIG"] = secret_config
     if inputs.key?("image-ref")
-      require_contract(%w[linux/amd64 linux/arm64].include?(environment["TRIVY_PLATFORM"]), "secret image platform drifted: #{label}")
-      expected_env["TRIVY_PLATFORM"] = environment["TRIVY_PLATFORM"]
+      require_contract(!environment.key?("TRIVY_PLATFORM"), "secret image-ref scan must not rely on TRIVY_PLATFORM (aquasecurity/trivy-action ignores it for the secret scanner; scope the scan with a platform-digest-qualified image-ref instead): #{label}")
     end
     require_contract(environment == expected_env, "secret Trivy env has suppressor or drift: #{label}: #{environment.inspect}")
     require_contract([inputs["trivy-config"], inputs["trivyignores"], secret_config].uniq.length == 3, "secret policy files overlap: #{label}")

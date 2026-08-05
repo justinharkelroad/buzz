@@ -1140,7 +1140,20 @@ jq -e --arg source_sha "$source_sha" --arg deployment_ref "$deployment_ref" '
   || fail "runtime contract log hash differs from its proof"
 grep -Fx "personal relay runtime contract passed: $deployment_ref" "$runtime_log" >/dev/null \
   || fail "runtime log does not prove the exact digest-qualified image contract"
-jq -e --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" '
+platform_manifests=$(jq -c '[.[] | select(.annotations["vnd.docker.reference.type"] == null)]' "$expected_descriptors")
+[[ "$(jq 'length' <<<"$platform_manifests")" == 2 ]] \
+  || fail "release evidence does not have exactly two platform manifests"
+jq -e 'all(.[]; .platform.os == "linux")' <<<"$platform_manifests" >/dev/null \
+  || fail "a platform manifest in the release evidence is not linux"
+[[ "$(jq -c '[.[].platform.architecture] | sort' <<<"$platform_manifests")" == '["amd64","arm64"]' ]] \
+  || fail "release evidence platform manifests are not exactly amd64 and arm64"
+amd64_platform_digest=$(jq -er '.[] | select(.platform.architecture == "amd64") | .digest' <<<"$platform_manifests")
+arm64_platform_digest=$(jq -er '.[] | select(.platform.architecture == "arm64") | .digest' <<<"$platform_manifests")
+amd64_platform_ref="${image}@${amd64_platform_digest}"
+arm64_platform_ref="${image}@${arm64_platform_digest}"
+
+jq -e --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" \
+  --arg amd64_digest "$amd64_platform_digest" --arg arm64_digest "$arm64_platform_digest" '
   .deployment_ref == $deployment_ref
   and .source_sha == $source_sha
   and .scanner == {name: "Trivy", version: "0.70.0", scanners: ["secret"]}
@@ -1149,20 +1162,23 @@ jq -e --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" '
   and all(.architectures[];
     .secrets_found == 0
     and (.report_sha256 | test("^[0-9a-f]{64}$"))
+    and .platform_digest == (if .architecture == "amd64" then $amd64_digest else $arm64_digest end)
   )
 ' "$secret_scan_proof" >/dev/null || fail "exact image embedded-secret proof is incomplete"
 for arch in amd64 arm64; do
   if [[ "$arch" == amd64 ]]; then
     raw_secret_report=$secret_report_amd64
+    platform_ref=$amd64_platform_ref
   else
     raw_secret_report=$secret_report_arm64
+    platform_ref=$arm64_platform_ref
   fi
-  jq -e --arg arch "$arch" --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" '
+  jq -e --arg arch "$arch" --arg platform_ref "$platform_ref" --arg source_sha "$source_sha" '
     .SchemaVersion == 2
-    and .ArtifactName == $deployment_ref
+    and .ArtifactName == $platform_ref
     and .ArtifactType == "container_image"
     and .Trivy.Version == "0.70.0"
-    and (.Metadata.RepoDigests | index($deployment_ref)) != null
+    and (.Metadata.RepoDigests | index($platform_ref)) != null
     and .Metadata.ImageConfig.architecture == $arch
     and .Metadata.ImageConfig.config.Labels["org.opencontainers.image.revision"] == $source_sha
     and ([.Results[]? | .Secrets[]?] | length) == 0

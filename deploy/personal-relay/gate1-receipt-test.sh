@@ -29,6 +29,8 @@ gate1_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 db_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 java_db_sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 artifact_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+amd64_platform_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
+arm64_platform_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
 
 fail() {
   printf '%s\n' "Gate 1 fixture test failed: $*" >&2
@@ -60,10 +62,10 @@ build_architecture_evidence() {
   manifest="$evidence/personal-relay-attestation-manifest-${arch}.json"
   index="$evidence/personal-relay-image-index-${arch}.json"
   if [[ "$arch" == amd64 ]]; then
-    platform_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
+    platform_digest=$amd64_platform_digest
     platform_size=1111
   else
-    platform_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+    platform_digest=$arm64_platform_digest
     platform_size=2222
   fi
 
@@ -687,10 +689,17 @@ jq -n '{
 printf '%s\n' "personal relay runtime contract passed: ghcr.io/justinharkelroad/buzz-relay-personal@${image_digest}" > "$tmp_dir/runtime.log"
 jq -n --arg source_sha "$source_sha" --arg deployment_ref "ghcr.io/justinharkelroad/buzz-relay-personal@${image_digest}" --arg log_sha "$(sha256_file "$tmp_dir/runtime.log")" '{source_sha: $source_sha, deployment_ref: $deployment_ref, runtime_contract: "passed", binaries: {buzz_admin: true, buzz_relay: true}, log_sha256: $log_sha}' > "$tmp_dir/runtime-verification.json"
 deployment_ref="ghcr.io/justinharkelroad/buzz-relay-personal@${image_digest}"
+image="ghcr.io/justinharkelroad/buzz-relay-personal"
+amd64_platform_ref="${image}@${amd64_platform_digest}"
+arm64_platform_ref="${image}@${arm64_platform_digest}"
 for arch in amd64 arm64; do
-  jq -n --arg deployment_ref "$deployment_ref" --arg arch "$arch" --arg source_sha "$source_sha" '{SchemaVersion: 2, ArtifactName: $deployment_ref, ArtifactType: "container_image", Metadata: {RepoDigests: [$deployment_ref], ImageConfig: {architecture: $arch, config: {Labels: {"org.opencontainers.image.revision": $source_sha}}}}, Results: [], Trivy: {Version: "0.70.0"}}' > "$tmp_dir/secret-${arch}.json"
+  if [[ "$arch" == amd64 ]]; then platform_ref=$amd64_platform_ref; else platform_ref=$arm64_platform_ref; fi
+  jq -n --arg platform_ref "$platform_ref" --arg arch "$arch" --arg source_sha "$source_sha" '{SchemaVersion: 2, ArtifactName: $platform_ref, ArtifactType: "container_image", Metadata: {RepoDigests: [$platform_ref], ImageConfig: {architecture: $arch, config: {Labels: {"org.opencontainers.image.revision": $source_sha}}}}, Results: [], Trivy: {Version: "0.70.0"}}' > "$tmp_dir/secret-${arch}.json"
 done
-jq -n --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" --arg amd64_sha "$(sha256_file "$tmp_dir/secret-amd64.json")" --arg arm64_sha "$(sha256_file "$tmp_dir/secret-arm64.json")" '{deployment_ref: $deployment_ref, source_sha: $source_sha, scanner: {name: "Trivy", version: "0.70.0", scanners: ["secret"]}, architectures: [{architecture: "amd64", secrets_found: 0, report_sha256: $amd64_sha}, {architecture: "arm64", secrets_found: 0, report_sha256: $arm64_sha}]}' > "$tmp_dir/secret-scan-proof.json"
+jq -n --arg deployment_ref "$deployment_ref" --arg source_sha "$source_sha" \
+  --arg amd64_digest "$amd64_platform_digest" --arg arm64_digest "$arm64_platform_digest" \
+  --arg amd64_sha "$(sha256_file "$tmp_dir/secret-amd64.json")" --arg arm64_sha "$(sha256_file "$tmp_dir/secret-arm64.json")" \
+  '{deployment_ref: $deployment_ref, source_sha: $source_sha, scanner: {name: "Trivy", version: "0.70.0", scanners: ["secret"]}, architectures: [{architecture: "amd64", secrets_found: 0, report_sha256: $amd64_sha, platform_digest: $amd64_digest}, {architecture: "arm64", secrets_found: 0, report_sha256: $arm64_sha, platform_digest: $arm64_digest}]}' > "$tmp_dir/secret-scan-proof.json"
 
 template="$tmp_dir/approval-template.json"
 bash "$gate1" prepare \
@@ -1107,6 +1116,7 @@ expect_evidence_rejected() {
   local validation_approval=${11:-"$approval"}
   local validation_approval_sha=${12:-"$approval_sha"}
   local validation_approval_secret_proof=${13:-"$tmp_dir/approval-secret-scan-proof.json"}
+  local validation_secret_scan_proof=${14:-"$tmp_dir/secret-scan-proof.json"}
   if bash "$gate1" validate \
     --evidence-dir "$validation_evidence" \
     --approval "$validation_approval" \
@@ -1126,7 +1136,7 @@ expect_evidence_rejected() {
     --image-validation-artifact-id 402 \
     --image-validation-artifact-name "personal-relay-gate1-image-validation-${source_sha}-${image_digest#sha256:}-303-1" \
     --image-validation-artifact-digest "$artifact_digest" \
-    --secret-scan-proof "$tmp_dir/secret-scan-proof.json" \
+    --secret-scan-proof "$validation_secret_scan_proof" \
     --approval-secret-scan-proof "$validation_approval_secret_proof" \
     --secret-report-amd64 "$secret_amd64" \
     --secret-report-arm64 "$tmp_dir/secret-arm64.json" \
@@ -1251,6 +1261,31 @@ expect_evidence_rejected missing-source-proof-file "$bad_proof/source-test-resul
 
 jq '.Metadata.RepoDigests = []' "$tmp_dir/secret-amd64.json" > "$tmp_dir/tampered-secret-amd64.json"
 expect_evidence_rejected tampered-secret-repodigest "$source_proof/source-test-result.json" "$tmp_dir/tampered-secret-amd64.json" "$tmp_dir/gate1-run-metadata.json"
+jq 'del(.architectures[0].platform_digest)' "$tmp_dir/secret-scan-proof.json" \
+  > "$tmp_dir/secret-scan-proof-missing-platform-digest.json"
+expect_evidence_rejected missing-platform-digest \
+  "$source_proof/source-test-result.json" "$tmp_dir/secret-amd64.json" "$tmp_dir/gate1-run-metadata.json" \
+  "$tmp_dir/main-branch.json" "$tmp_dir/main-effective-rules.json" true \
+  "$tmp_dir/environment.json" "$tmp_dir/main-rulesets.json" "$evidence" "$approval" "$approval_sha" \
+  "$tmp_dir/approval-secret-scan-proof.json" "$tmp_dir/secret-scan-proof-missing-platform-digest.json"
+jq '(.architectures[] | select(.architecture == "amd64") | .platform_digest) = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+  "$tmp_dir/secret-scan-proof.json" > "$tmp_dir/secret-scan-proof-wrong-platform-digest.json"
+expect_evidence_rejected wrong-platform-digest \
+  "$source_proof/source-test-result.json" "$tmp_dir/secret-amd64.json" "$tmp_dir/gate1-run-metadata.json" \
+  "$tmp_dir/main-branch.json" "$tmp_dir/main-effective-rules.json" true \
+  "$tmp_dir/environment.json" "$tmp_dir/main-rulesets.json" "$evidence" "$approval" "$approval_sha" \
+  "$tmp_dir/approval-secret-scan-proof.json" "$tmp_dir/secret-scan-proof-wrong-platform-digest.json"
+jq -n --arg deployment_ref "$deployment_ref" --arg arch amd64 --arg source_sha "$source_sha" \
+  '{SchemaVersion: 2, ArtifactName: $deployment_ref, ArtifactType: "container_image", Metadata: {RepoDigests: [$deployment_ref], ImageConfig: {architecture: $arch, config: {Labels: {"org.opencontainers.image.revision": $source_sha}}}}, Results: [], Trivy: {Version: "0.70.0"}}' \
+  > "$tmp_dir/secret-amd64-merged-ref.json"
+jq --arg sha "$(sha256_file "$tmp_dir/secret-amd64-merged-ref.json")" \
+  '(.architectures[] | select(.architecture == "amd64") | .report_sha256) = $sha' \
+  "$tmp_dir/secret-scan-proof.json" > "$tmp_dir/secret-scan-proof-merged-ref-rebound.json"
+expect_evidence_rejected merged-ref-secret-report \
+  "$source_proof/source-test-result.json" "$tmp_dir/secret-amd64-merged-ref.json" "$tmp_dir/gate1-run-metadata.json" \
+  "$tmp_dir/main-branch.json" "$tmp_dir/main-effective-rules.json" true \
+  "$tmp_dir/environment.json" "$tmp_dir/main-rulesets.json" "$evidence" "$approval" "$approval_sha" \
+  "$tmp_dir/approval-secret-scan-proof.json" "$tmp_dir/secret-scan-proof-merged-ref-rebound.json"
 jq '.run_attempt = 2' "$tmp_dir/gate1-run-metadata.json" > "$tmp_dir/tampered-run-attempt.json"
 expect_evidence_rejected tampered-run-attempt "$source_proof/source-test-result.json" "$tmp_dir/secret-amd64.json" "$tmp_dir/tampered-run-attempt.json"
 jq '.actor.login = "not-the-owner" | .triggering_actor.login = "not-the-owner"' "$tmp_dir/gate1-run-metadata.json" > "$tmp_dir/tampered-owner.json"
