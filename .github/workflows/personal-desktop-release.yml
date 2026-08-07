@@ -1237,9 +1237,9 @@ jobs:
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
           [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri build --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1309,9 +1309,9 @@ jobs:
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
           [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri bundle --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1443,7 +1443,7 @@ jobs:
             echo "::error::frontend build output is missing for banner verification"
             exit 1
           }
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == personal-staging ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           node desktop/scripts/verify-personal-staging-banner-build.mjs "$frontend_dist" || {
             echo "::error::staging frontend does not satisfy the banner build contract"
             exit 1

@@ -28,7 +28,17 @@ export async function verifyPersonalStagingBannerBuild(
   outputDirectory,
   buildChannel,
 ) {
-  if (buildChannel && buildChannel !== "personal-staging") {
+  // `production` is an explicit channel, not merely the absence of one. This function was
+  // written when the production lane left VITE_BUZZ_BUILD_CHANNEL unset, so it treated any
+  // non-empty value other than `personal-staging` as garbage and rejected it. The production
+  // desktop lane now sets the channel explicitly, matching build.rs, which accepts exactly
+  // `production` and `personal-staging`. Unset is still accepted so an ad hoc local build
+  // keeps working. Anything else is still a hard error.
+  if (
+    buildChannel &&
+    buildChannel !== "personal-staging" &&
+    buildChannel !== "production"
+  ) {
     throw new Error(`unsupported VITE_BUZZ_BUILD_CHANNEL: ${buildChannel}`);
   }
   const staging = buildChannel === "personal-staging";
