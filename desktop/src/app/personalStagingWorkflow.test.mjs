@@ -27,7 +27,13 @@ test("production keeps the hosted buzz deep-link scheme", () => {
 });
 
 test("personal staging compiles the visible build identity", () => {
-  assert.match(workflowSource, /^\s+STAGING_BUILD_CHANNEL: personal-staging$/m);
+  // Since the lane selector was added the build channel resolves per lane. The expectation is the
+  // EXACT expression, so this stays as strict as the previous literal: any other expression, or a
+  // bare literal, still fails.
+  assert.match(
+    workflowSource,
+    /^\s+STAGING_BUILD_CHANNEL: \$\{\{ inputs\.lane == 'production' && 'personal-production' \|\| 'personal-staging' \}\}$/m,
+  );
   assert.match(
     workflowSource,
     /VITE_BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}/,
@@ -64,9 +70,13 @@ test("native build profile couples storage identity to the deep-link scheme", ()
 });
 
 test("personal staging overrides and verifies a distinct deep-link scheme", () => {
+  // Per-lane deep-link scheme. The production lane must be exactly `buzz` because the relay
+  // accepts no third value; the staging lane keeps `buzz-personal-staging`. Asserting the exact
+  // expression preserves the original strictness, and the doesNotMatch below still guarantees the
+  // staging lane can never resolve to a bare `buzz`.
   assert.match(
     workflowSource,
-    /^\s+STAGING_URI_SCHEME: buzz-personal-staging$/m,
+    /^\s+STAGING_URI_SCHEME: \$\{\{ inputs\.lane == 'production' && 'buzz' \|\| 'buzz-personal-staging' \}\}$/m,
   );
   assert.match(workflowSource, /desktop: \{ schemes: \[stagingUriScheme\] \}/);
   assert.match(
