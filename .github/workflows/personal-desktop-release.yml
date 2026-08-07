@@ -62,7 +62,14 @@ jobs:
       SOURCE_SHA: ${{ inputs.source_sha }}
       BUILD_LANE: ${{ inputs.lane }}
       STAGING_AUTO_CONNECT_DEFAULT_RELAY: "true"
-      STAGING_BUILD_CHANNEL: ${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}
+      # The APPLICATION build channel. The desktop code (build.rs, desktop_profile.rs,
+      # verify-personal-staging-banner-build.mjs) recognises exactly `production` and
+      # `personal-staging`, and pairs them with `buzz` and `buzz-personal-staging`.
+      STAGING_BUILD_CHANNEL: ${{ inputs.lane == 'production' && 'production' || 'personal-staging' }}
+      # The GITHUB ENVIRONMENT name, which is a different namespace from the build
+      # channel and only coincides for staging. Conflating the two is what caused the
+      # production lane to feed the app a channel value it does not accept.
+      LANE_ENVIRONMENT: ${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}
       STAGING_DEPLOYMENT_RECEIPT_JSON: ${{ inputs.lane == 'production' && vars.PERSONAL_PRODUCTION_DEPLOYMENT_RECEIPT_JSON || vars.PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON }}
       STAGING_DEPLOYMENT_RECEIPT_SHA256: ${{ inputs.staging_deployment_receipt_sha256 }}
       STAGING_URI_SCHEME: ${{ inputs.lane == 'production' && 'buzz' || 'buzz-personal-staging' }}
@@ -254,7 +261,7 @@ jobs:
             --expected-sha "$GITHUB_SHA" \
             --expected-repository justinharkelroad/buzz
 
-          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/environments/$STAGING_BUILD_CHANNEL" \
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/environments/$LANE_ENVIRONMENT" \
             > /tmp/personal-staging-environment.raw.json
           jq -S '{
               id,
@@ -288,7 +295,7 @@ jobs:
               }' > /tmp/personal-staging-run-identity.json
 
           jq \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
@@ -355,7 +362,7 @@ jobs:
             exit 1
           }
           [[ -n "$STAGING_DEPLOYMENT_RECEIPT_JSON" ]] || {
-            echo "::error::the lane deployment receipt variable is required in $STAGING_BUILD_CHANNEL"
+            echo "::error::the lane deployment receipt variable is required in $LANE_ENVIRONMENT"
             exit 1
           }
           canonical_receipt=$(jq -ceS . <<<"$STAGING_DEPLOYMENT_RECEIPT_JSON") || {
@@ -370,7 +377,7 @@ jobs:
           }
           jq -e \
             --arg evaluated_at "$EVALUATED_AT" \
-            --arg expected_environment "$STAGING_BUILD_CHANNEL" \
+            --arg expected_environment "$LANE_ENVIRONMENT" \
             --slurpfile run_identity /tmp/personal-staging-run-identity.json '
             . as $receipt
             | ($receipt | keys | sort) == [
@@ -755,8 +762,8 @@ jobs:
               bundle_id="$BASE_BUNDLE_ID.staging"
               ;;
             production)
-              [[ "$STAGING_BUILD_CHANNEL" == personal-production ]] || {
-                echo "::error::production lane requires build channel personal-production, got $STAGING_BUILD_CHANNEL"
+              [[ "$STAGING_BUILD_CHANNEL" == production ]] || {
+                echo "::error::production lane requires build channel production, got $STAGING_BUILD_CHANNEL"
                 exit 1
               }
               # The relay accepts only `buzz` or `buzz-personal-staging` as a desktop scheme,
@@ -995,7 +1002,7 @@ jobs:
           if (!stagingUriScheme || !/^[a-z][a-z0-9+.-]*$/.test(stagingUriScheme)) {
             throw new Error("desktop URI scheme must be a valid scheme");
           }
-          if (buildChannel === "personal-production") {
+          if (buildChannel === "production") {
             if (stagingUriScheme !== "buzz") {
               throw new Error("production URI scheme must be exactly buzz");
             }
@@ -1004,7 +1011,7 @@ jobs:
               throw new Error("staging URI scheme must be valid and distinct from buzz");
             }
           } else {
-            throw new Error("build channel must be personal-production or personal-staging");
+            throw new Error("build channel must be production or personal-staging");
           }
 
           const config = {
@@ -1644,7 +1651,7 @@ jobs:
           [[ -s "$SIDECAR_MANIFEST_PATH" && ! -L "$SIDECAR_MANIFEST_PATH" ]]
           [[ "$(shasum -a 256 "$SIDECAR_MANIFEST_PATH" | awk '{print $1}')" == "$SIDECAR_MANIFEST_SHA" ]]
           jq -n \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             --slurpfile sidecars "$SIDECAR_MANIFEST_PATH" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$APPROVED_SOURCE_SHA" \
@@ -3728,7 +3735,7 @@ jobs:
           rmdir "$DOCKER_CONFIG"
 
           jq \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
@@ -3749,7 +3756,7 @@ jobs:
           ' "$authorization/personal-staging-branch-policies.json" >/dev/null
 
           jq -e \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             --slurpfile sidecars "$sidecar_manifest" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$EXPECTED_SOURCE_SHA" \
@@ -4679,7 +4686,7 @@ jobs:
                 }
             ' > "$predicate"
           jq -e \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             --arg dmg_name "$DMG_NAME" \
             --arg dmg_sha256 "$DMG_SHA256" \
             --argjson candidate_artifact_id "$CANDIDATE_ARTIFACT_ID" \
@@ -5019,7 +5026,7 @@ jobs:
             /tmp/personal-desktop-sealed-main-rulesets.canonical.json
 
           gh api --hostname github.com \
-            "repos/$GITHUB_REPOSITORY/environments/$STAGING_BUILD_CHANNEL" \
+            "repos/$GITHUB_REPOSITORY/environments/$LANE_ENVIRONMENT" \
             > /tmp/personal-desktop-live-staging-environment.raw.json
           jq -S '{
               id,
@@ -5033,7 +5040,7 @@ jobs:
             }' /tmp/personal-desktop-live-staging-environment.raw.json \
             > /tmp/personal-desktop-live-staging-environment.json
           jq \
-            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            --arg lane_environment "$LANE_ENVIRONMENT" \
             -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]

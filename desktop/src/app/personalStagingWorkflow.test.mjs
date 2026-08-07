@@ -27,12 +27,12 @@ test("production keeps the hosted buzz deep-link scheme", () => {
 });
 
 test("personal staging compiles the visible build identity", () => {
-  // Since the lane selector was added the build channel resolves per lane. The expectation is the
-  // EXACT expression, so this stays as strict as the previous literal: any other expression, or a
-  // bare literal, still fails.
+  // The APPLICATION build channel resolves per lane. Production is `production`, the value the
+  // desktop code accepts (see desktop/src-tauri/build.rs), NOT the GitHub environment name
+  // `personal-production`. Conflating those two is what broke seven production builds.
   assert.match(
     workflowSource,
-    /^\s+STAGING_BUILD_CHANNEL: \$\{\{ inputs\.lane == 'production' && 'personal-production' \|\| 'personal-staging' \}\}$/m,
+    /^\s+STAGING_BUILD_CHANNEL: \$\{\{ inputs\.lane == 'production' && 'production' \|\| 'personal-staging' \}\}$/m,
   );
   assert.match(
     workflowSource,
