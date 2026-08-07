@@ -1418,7 +1418,13 @@ require_desktop(!workflow_text.match?(/\bfeatures=\(\)/), "desktop workflow must
 require_desktop(!workflow_text.match?(/\$\{features\[@\]\}/), "desktop workflow must not expand a nounset-unsafe features array")
 [candidate_build_run, dmg_build_run].each do |run|
   require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]'), "native and visible desktop build channels must match")
-  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == personal-staging ]]'), "native desktop build channel must fail closed to personal staging")
+  # This previously required the literal `personal-staging`, which was correct while the
+  # workflow built one lane. The workflow is now dual-lane, so the fail-closed property is
+  # no longer "must be staging" but "must be pinned to the lane's own channel". The channel
+  # is not free-floating: STAGING_BUILD_CHANNEL is derived from inputs.lane at the job level,
+  # and the lane case statement asserts each lane against its own required value.
+  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]'), "native desktop build channel must fail closed to the lane channel")
+  require_desktop(run.include?('[[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]'), "visible desktop build channel must fail closed to the lane channel")
   require_desktop(run.include?('if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then'), "desktop target branch lost explicit arm64 selection")
   require_desktop(run.include?('elif [[ "$DESKTOP_TARGET" == "x86_64-apple-darwin" ]]; then'), "desktop target branch lost explicit x86_64 selection")
   require_desktop(run.include?('--features mesh-llm'), "arm64 Desktop build lost the reviewed mesh-llm feature")
@@ -2299,8 +2305,20 @@ expected_target_output = {
   },
 }
 repo_root = File.expand_path("../..", File.dirname(path))
+# Both lanes are executed. This fixture previously ran the staging channel only, so the run
+# block was never proven against the production lane and nine production builds failed on
+# lane-specific defects the local suite reported as green. The emitted commands are expected
+# to be identical for both lanes: the Tauri config filename is fixed and its CONTENTS are
+# generated per lane from the build contract, so the lane difference lives in the config, not
+# in the command line. Any future change that makes the command line lane-dependent will fail
+# here rather than on a runner.
+fixture_lanes = {
+  "personal-staging" => "buzz-personal-staging",
+  "production" => "buzz",
+}
 expected_target_output.each do |target, expected_by_script|
   fixture_scripts.each do |label, script|
+    fixture_lanes.each do |lane_channel, lane_scheme|
     harness = <<~BASH + script
       pnpm() { printf '%s\n' "$*"; }
     BASH
@@ -2308,16 +2326,18 @@ expected_target_output.each do |target, expected_by_script|
       {
         "BASH_COMPAT" => "3.2",
         "BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" => "true",
-        "BUZZ_BUILD_CHANNEL" => "personal-staging",
-        "BUZZ_BUILD_DEEP_LINK_SCHEME" => "buzz-personal-staging",
+        "BUZZ_BUILD_CHANNEL" => lane_channel,
+        "BUZZ_BUILD_DEEP_LINK_SCHEME" => lane_scheme,
         "DESKTOP_TARGET" => target,
-        "VITE_BUZZ_BUILD_CHANNEL" => "personal-staging",
-        "VITE_BUZZ_DEEP_LINK_SCHEME" => "buzz-personal-staging",
+        "STAGING_BUILD_CHANNEL" => lane_channel,
+        "VITE_BUZZ_BUILD_CHANNEL" => lane_channel,
+        "VITE_BUZZ_DEEP_LINK_SCHEME" => lane_scheme,
       },
       "/bin/bash", "-c", harness, chdir: repo_root,
     )
-    require_desktop(status.success?, "Desktop Bash 3.2 #{label} fixture failed for #{target}: #{stderr}")
-    require_desktop(stdout.lines.map(&:chomp) == expected_by_script.fetch(label), "Desktop Bash 3.2 #{label} command parity drifted for #{target}: #{stdout.inspect}")
+    require_desktop(status.success?, "Desktop Bash 3.2 #{label} fixture failed for #{target} on lane #{lane_channel}: #{stderr}")
+    require_desktop(stdout.lines.map(&:chomp) == expected_by_script.fetch(label), "Desktop Bash 3.2 #{label} command parity drifted for #{target} on lane #{lane_channel}: #{stdout.inspect}")
+    end
   end
 end
 

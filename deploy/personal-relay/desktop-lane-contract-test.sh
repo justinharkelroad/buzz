@@ -145,6 +145,34 @@ else
   fail=$((fail + 1))
 fi
 
+# The guard above only matched QUOTED occurrences, so it reported clean while five
+# UNQUOTED shell comparisons still pinned the build channel to staging. In bash `[[ ]]`
+# the right-hand side needs no quotes, so `== personal-staging` is the natural spelling
+# and the one that was actually used. The ninth failed production build on 2026-08-07 was
+# this class again. Match the unquoted form too, allowing only the comparison that lives
+# inside the `staging)` arm of the lane case statement, where the literal is correct.
+STRAY_BARE=$(grep -nE '==[[:space:]]+personal-staging[[:space:]]*\]\]' "$WORKFLOW" \
+  | grep -vE 'STAGING_BUILD_CHANNEL" == personal-staging' \
+  | wc -l | tr -d ' ')
+if [[ "$STRAY_BARE" -eq 0 ]]; then
+  printf 'ok   no unquoted personal-staging channel comparisons remain\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL %s unquoted `== personal-staging` comparison(s) remain outside the staging arm\n' "$STRAY_BARE"
+  fail=$((fail + 1))
+fi
+
+# The banner verifier runs inside `pnpm build` as Tauri's beforeBuildCommand, so it fails
+# the production lane before any workflow assertion is reached. It must accept the explicit
+# `production` channel, not only an unset one.
+if grep -q 'buildChannel !== "production"' desktop/scripts/verify-personal-staging-banner-build.mjs; then
+  printf 'ok   banner verifier accepts the explicit production channel\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL banner verifier rejects VITE_BUZZ_BUILD_CHANNEL=production; pnpm build will fail\n'
+  fail=$((fail + 1))
+fi
+
 if grep -q 'environments/\$LANE_ENVIRONMENT' "$WORKFLOW"; then
   printf 'ok   GitHub environment is fetched by the lane-derived name\n'
   pass=$((pass + 1))

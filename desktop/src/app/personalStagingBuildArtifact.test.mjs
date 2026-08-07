@@ -45,6 +45,24 @@ test("accepts only the banner-absent marker for production", async () => {
   });
 });
 
+test("accepts the explicit production channel, not only an unset one", async () => {
+  // The production desktop lane sets VITE_BUZZ_BUILD_CHANNEL=production explicitly, which
+  // is the value build.rs accepts. This verifier previously rejected any non-empty value
+  // other than `personal-staging`, so it failed every production build at `pnpm build`.
+  await withFixture(PRODUCTION_BANNER_ARTIFACT, async (root) => {
+    await assert.doesNotReject(
+      verifyPersonalStagingBannerBuild(root, "production"),
+    );
+  });
+  // An explicit `production` channel must still reject a bundle carrying the staging banner.
+  await withFixture(STAGING_BANNER_ARTIFACT, async (root) => {
+    await assert.rejects(
+      verifyPersonalStagingBannerBuild(root, "production"),
+      /built frontend (?:is missing|unexpectedly contains)/,
+    );
+  });
+});
+
 test("rejects an unsupported build channel", async () => {
   await withFixture(PRODUCTION_BANNER_ARTIFACT, async (root) => {
     await assert.rejects(
