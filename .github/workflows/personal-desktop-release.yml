@@ -1,10 +1,18 @@
-name: Personal Desktop Staging Candidate
+name: Personal Desktop Candidate
 
 on:
   workflow_dispatch:
     inputs:
+      lane:
+        description: "Which lane to build. staging is the default and behaves exactly as before."
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
       confirmation:
-        description: "Type BUILD_PERSONAL_STAGING_DESKTOP to create unsigned staging Actions artifacts"
+        description: "Type BUILD_PERSONAL_STAGING_DESKTOP for staging, BUILD_PERSONAL_PRODUCTION_DESKTOP for production"
         required: true
         type: string
       source_sha:
@@ -33,18 +41,18 @@ on:
           - x86_64-apple-darwin
 
 concurrency:
-  group: personal-desktop-staging-${{ github.sha }}-${{ inputs.target }}
+  group: personal-desktop-${{ inputs.lane }}-${{ github.sha }}-${{ inputs.target }}
   cancel-in-progress: false
 
 permissions: {}
 
 jobs:
   build:
-    name: Build unsigned staging candidate (${{ inputs.target }})
+    name: Build unsigned ${{ inputs.lane }} candidate (${{ inputs.target }})
     if: github.repository == 'justinharkelroad/buzz'
     runs-on: macos-latest
     timeout-minutes: 120
-    environment: personal-staging
+    environment: ${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}
     permissions:
       actions: read
       contents: read
@@ -52,11 +60,12 @@ jobs:
     env:
       GATE1_EVIDENCE_RUN_ID: ${{ inputs.gate1_evidence_run_id }}
       SOURCE_SHA: ${{ inputs.source_sha }}
+      BUILD_LANE: ${{ inputs.lane }}
       STAGING_AUTO_CONNECT_DEFAULT_RELAY: "true"
-      STAGING_BUILD_CHANNEL: personal-staging
-      STAGING_DEPLOYMENT_RECEIPT_JSON: ${{ vars.PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON }}
+      STAGING_BUILD_CHANNEL: ${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}
+      STAGING_DEPLOYMENT_RECEIPT_JSON: ${{ inputs.lane == 'production' && vars.PERSONAL_PRODUCTION_DEPLOYMENT_RECEIPT_JSON || vars.PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON }}
       STAGING_DEPLOYMENT_RECEIPT_SHA256: ${{ inputs.staging_deployment_receipt_sha256 }}
-      STAGING_URI_SCHEME: buzz-personal-staging
+      STAGING_URI_SCHEME: ${{ inputs.lane == 'production' && 'buzz' || 'buzz-personal-staging' }}
       TARGET: ${{ inputs.target }}
       VERSION: ${{ inputs.version }}
     outputs:
@@ -103,13 +112,32 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
           RULESET_EVIDENCE_TOKEN: ${{ secrets.PERSONAL_RULESET_EVIDENCE_TOKEN }}
           STAGING_BUILD_CONFIRMATION: ${{ inputs.confirmation }}
+          BUILD_LANE: ${{ inputs.lane }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          [[ "$STAGING_BUILD_CONFIRMATION" == "BUILD_PERSONAL_STAGING_DESKTOP" ]] || {
-            echo "::error::confirmation must be exactly BUILD_PERSONAL_STAGING_DESKTOP"
-            exit 1
-          }
+          # Lane-aware confirmation. Each lane compares against its OWN exact literal phrase, so a
+          # staging confirmation can never authorize a production build and vice versa. The
+          # comparisons are written out literally rather than via a computed variable so that the
+          # release contract test can continue to assert the exact staging guard by string match.
+          case "$BUILD_LANE" in
+            staging)
+              [[ "$STAGING_BUILD_CONFIRMATION" == "BUILD_PERSONAL_STAGING_DESKTOP" ]] || {
+                echo "::error::confirmation must be exactly BUILD_PERSONAL_STAGING_DESKTOP"
+                exit 1
+              }
+              ;;
+            production)
+              [[ "$STAGING_BUILD_CONFIRMATION" == "BUILD_PERSONAL_PRODUCTION_DESKTOP" ]] || {
+                echo "::error::confirmation must be exactly BUILD_PERSONAL_PRODUCTION_DESKTOP"
+                exit 1
+              }
+              ;;
+            *)
+              echo "::error::lane must be exactly staging or production"
+              exit 1
+              ;;
+          esac
           [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]] || {
             echo "::error::only repository owner justinharkelroad may authorize a personal desktop staging build"
             exit 1
@@ -696,10 +724,53 @@ jobs:
             exit 1
           }
           [[ "$STAGING_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
-          [[ "$STAGING_BUILD_CHANNEL" == personal-staging ]]
-          [[ "$STAGING_URI_SCHEME" =~ ^[a-z][a-z0-9+.-]*$ && "$STAGING_URI_SCHEME" != buzz ]]
-          product_name="$BASE_PRODUCT_NAME Staging"
-          bundle_id="$BASE_BUNDLE_ID.staging"
+          # Lane-aware identity assertions. Each lane asserts its OWN correct values, so the
+          # staging guard is exactly as strict as before (scheme must not be `buzz`) while
+          # production gets an equally strict guard of its own (scheme must be `buzz`).
+          # Neither lane can be built with the other lane's identity.
+          # Every assertion below is EXPLICIT (`|| { error; exit 1; }`) rather than a bare
+          # `[[ ]]` relying on `set -e`. Reason, found 2026-08-06: on bash 3.2, which is what
+          # /bin/bash still is on macOS, `set -e` does NOT abort on a failing `[[ ]]`. A bare
+          # assertion is therefore silently decorative on that interpreter. Explicit exits
+          # behave identically on every bash version, so the guard cannot depend on which
+          # interpreter the runner happens to provide.
+          case "$BUILD_LANE" in
+            staging)
+              [[ "$STAGING_BUILD_CHANNEL" == personal-staging ]] || {
+                echo "::error::staging lane requires build channel personal-staging, got $STAGING_BUILD_CHANNEL"
+                exit 1
+              }
+              [[ "$STAGING_URI_SCHEME" =~ ^[a-z][a-z0-9+.-]*$ ]] || {
+                echo "::error::staging uri scheme is not a valid scheme: $STAGING_URI_SCHEME"
+                exit 1
+              }
+              [[ "$STAGING_URI_SCHEME" != buzz ]] || {
+                echo "::error::staging must never claim the production deep-link scheme buzz"
+                exit 1
+              }
+              product_name="$BASE_PRODUCT_NAME Staging"
+              bundle_id="$BASE_BUNDLE_ID.staging"
+              ;;
+            production)
+              [[ "$STAGING_BUILD_CHANNEL" == personal-production ]] || {
+                echo "::error::production lane requires build channel personal-production, got $STAGING_BUILD_CHANNEL"
+                exit 1
+              }
+              # The relay accepts only `buzz` or `buzz-personal-staging` as a desktop scheme,
+              # so production is required to be exactly `buzz`. See the 2026-08-06 finding on
+              # the deep-link scheme collision with Block-hosted Buzz during acceptance.
+              [[ "$STAGING_URI_SCHEME" == buzz ]] || {
+                echo "::error::production lane requires deep-link scheme buzz, got $STAGING_URI_SCHEME"
+                exit 1
+              }
+              product_name="$BASE_PRODUCT_NAME"
+              bundle_id="$BASE_BUNDLE_ID"
+              ;;
+            *)
+              echo "::error::lane must be exactly staging or production"
+              exit 1
+              ;;
+          esac
           jq -nS \
             --argjson auto_connect_default_relay "$STAGING_AUTO_CONNECT_DEFAULT_RELAY" \
             --arg build_channel "$STAGING_BUILD_CHANNEL" \
