@@ -368,6 +368,7 @@ jobs:
           }
           jq -e \
             --arg evaluated_at "$EVALUATED_AT" \
+            --arg expected_environment "$STAGING_BUILD_CHANNEL" \
             --slurpfile run_identity /tmp/personal-staging-run-identity.json '
             . as $receipt
             | ($receipt | keys | sort) == [
@@ -396,7 +397,7 @@ jobs:
                 "smoke_passed",
                 "wss_origin"
               ]
-            and $receipt.environment == "personal-staging"
+            and $receipt.environment == $expected_environment
             and ($receipt.https_origin | type == "string" and length > 0)
             and ($receipt.wss_origin | type == "string" and length > 0)
             and ($receipt.hosted_https_origin | type == "string" and length > 0)
