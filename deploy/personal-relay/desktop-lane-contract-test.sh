@@ -35,7 +35,7 @@ resolve_lane() { # lane build_channel uri_scheme -> "product_name|bundle_id" on 
         bundle_id="$BASE_BUNDLE_ID.staging"
         ;;
       production)
-        [[ "$STAGING_BUILD_CHANNEL" == personal-production ]] || exit 1
+        [[ "$STAGING_BUILD_CHANNEL" == production ]] || exit 1
         [[ "$STAGING_URI_SCHEME" == buzz ]] || exit 1
         product_name="$BASE_PRODUCT_NAME"
         bundle_id="$BASE_BUNDLE_ID"
@@ -72,17 +72,17 @@ expect "staging builds the staging identity" \
 
 expect "production builds the clean identity" \
   "$BASE_PRODUCT_NAME|$BASE_BUNDLE_ID" \
-  production personal-production buzz
+  production production buzz
 
 # Negative: neither lane may borrow the other's identity. An empty result means refusal.
 expect "staging refuses the production deep-link scheme" \
   "" staging personal-staging buzz
 
 expect "staging refuses a production build channel" \
-  "" staging personal-production buzz-personal-staging
+  "" staging production buzz-personal-staging
 
 expect "production refuses the staging deep-link scheme" \
-  "" production personal-production buzz-personal-staging
+  "" production production buzz-personal-staging
 
 expect "production refuses a staging build channel" \
   "" production personal-staging buzz
@@ -119,11 +119,11 @@ else
   fail=$((fail + 1))
 fi
 
-if grep -q 'arg expected_environment "\$STAGING_BUILD_CHANNEL"' "$WORKFLOW"; then
-  printf 'ok   expected_environment is bound to the lane-aware build channel\n'
+if grep -q 'arg expected_environment "\$LANE_ENVIRONMENT"' "$WORKFLOW"; then
+  printf 'ok   expected_environment is bound to the GitHub environment, not the build channel\n'
   pass=$((pass + 1))
 else
-  printf 'FAIL expected_environment is not bound to the lane-aware build channel\n'
+  printf 'FAIL expected_environment is not bound to LANE_ENVIRONMENT\n'
   fail=$((fail + 1))
 fi
 
@@ -135,7 +135,7 @@ fi
 # three jq name assertions, the sealed evidence records, and the Tauri config
 # validation. Each one only surfaced on the next build attempt.
 STRAY=$(grep -nE '"personal-staging"|PERSONAL_STAGING_DEPLOYMENT' "$WORKFLOW" \
-  | grep -vE "inputs.lane == .production.|buildChannel === \"personal-staging\"" \
+  | grep -vE "inputs.lane == .production.|buildChannel === \"personal-staging\"|LANE_ENVIRONMENT" \
   | wc -l | tr -d ' ')
 if [[ "$STRAY" -eq 0 ]]; then
   printf 'ok   no unguarded personal-staging literals remain in the workflow\n'
@@ -145,7 +145,7 @@ else
   fail=$((fail + 1))
 fi
 
-if grep -q 'environments/\$STAGING_BUILD_CHANNEL' "$WORKFLOW"; then
+if grep -q 'environments/\$LANE_ENVIRONMENT' "$WORKFLOW"; then
   printf 'ok   GitHub environment is fetched by the lane-derived name\n'
   pass=$((pass + 1))
 else
@@ -153,11 +153,45 @@ else
   fail=$((fail + 1))
 fi
 
-if grep -q 'buildChannel === "personal-production"' "$WORKFLOW"; then
+if grep -q 'buildChannel === "production"' "$WORKFLOW"; then
   printf 'ok   Tauri config validates the production lane explicitly\n'
   pass=$((pass + 1))
 else
   printf 'FAIL Tauri config does not validate the production lane\n'
+  fail=$((fail + 1))
+fi
+
+
+# --- Build channel and GitHub environment are DIFFERENT namespaces ------------
+# Root cause of seven failed production builds on 2026-08-07. One variable was used
+# for both the APPLICATION build channel and the GITHUB ENVIRONMENT name. They are
+# identical for staging (`personal-staging`), so nothing caught it, but they differ
+# for production: the app recognises `production`, the environment is named
+# `personal-production`. The app was being fed a channel it rejects.
+if grep -q "STAGING_BUILD_CHANNEL: \${{ inputs.lane == 'production' && 'production' ||" "$WORKFLOW"; then
+  printf 'ok   build channel uses the APPLICATION value the desktop code accepts\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL build channel does not use the application value (production)\n'
+  fail=$((fail + 1))
+fi
+
+if grep -q "LANE_ENVIRONMENT: \${{ inputs.lane == 'production' && 'personal-production' ||" "$WORKFLOW"; then
+  printf 'ok   GitHub environment name is a separate lane variable\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL GitHub environment name is not a separate variable\n'
+  fail=$((fail + 1))
+fi
+
+# The desktop source is the authority on which channels exist. Assert the workflow
+# cannot emit a channel the native build would panic on.
+BUILDRS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/desktop/src-tauri/build.rs"
+if grep -q '"production" | "personal-staging"' "$BUILDRS"; then
+  printf 'ok   native build accepts exactly the two channels the workflow emits\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL native build channel list changed; workflow may emit an unsupported channel\n'
   fail=$((fail + 1))
 fi
 
