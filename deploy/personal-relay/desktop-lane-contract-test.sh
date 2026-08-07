@@ -93,6 +93,40 @@ expect "an invalid deep-link scheme is refused" \
 expect "an unknown lane is refused outright" \
   "" sneaky personal-staging buzz-personal-staging
 
+
+# --- Receipt validation must be lane-aware -----------------------------------
+# Regression guard for the gap found on 2026-08-07: the lane selector was added
+# for build identity, but the deployment-receipt validator still asserted
+# `environment == "personal-staging"` unconditionally. The production lane
+# therefore rejected a valid production receipt and could never build. The lane
+# change looked complete because every test covered build identity and none
+# covered receipt validation.
+WORKFLOW="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.github/workflows/personal-desktop-release.yml"
+
+if grep -q 'receipt.environment == "personal-staging"' "$WORKFLOW"; then
+  printf 'FAIL receipt validator hard-codes personal-staging; production receipts can never validate\n'
+  fail=$((fail + 1))
+else
+  printf 'ok   receipt validator does not hard-code personal-staging\n'
+  pass=$((pass + 1))
+fi
+
+if grep -q 'and \$receipt.environment == \$expected_environment' "$WORKFLOW"; then
+  printf 'ok   receipt validator compares against the lane-derived environment\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL receipt validator does not compare against a lane-derived environment\n'
+  fail=$((fail + 1))
+fi
+
+if grep -q 'arg expected_environment "\$STAGING_BUILD_CHANNEL"' "$WORKFLOW"; then
+  printf 'ok   expected_environment is bound to the lane-aware build channel\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL expected_environment is not bound to the lane-aware build channel\n'
+  fail=$((fail + 1))
+fi
+
 echo "---"
 echo "pass=$pass fail=$fail"
 
