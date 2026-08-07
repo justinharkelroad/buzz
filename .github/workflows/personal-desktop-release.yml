@@ -116,18 +116,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Lane-aware confirmation. Each lane demands its OWN exact phrase, so a staging
-          # confirmation can never authorize a production build and vice versa. This keeps the
-          # original staging guard exactly as strong as it was.
+          # Lane-aware confirmation. Each lane compares against its OWN exact literal phrase, so a
+          # staging confirmation can never authorize a production build and vice versa. The
+          # comparisons are written out literally rather than via a computed variable so that the
+          # release contract test can continue to assert the exact staging guard by string match.
           case "$BUILD_LANE" in
-            staging) expected_confirmation="BUILD_PERSONAL_STAGING_DESKTOP" ;;
-            production) expected_confirmation="BUILD_PERSONAL_PRODUCTION_DESKTOP" ;;
-            *) echo "::error::lane must be exactly staging or production"; exit 1 ;;
+            staging)
+              [[ "$STAGING_BUILD_CONFIRMATION" == "BUILD_PERSONAL_STAGING_DESKTOP" ]] || {
+                echo "::error::confirmation must be exactly BUILD_PERSONAL_STAGING_DESKTOP"
+                exit 1
+              }
+              ;;
+            production)
+              [[ "$STAGING_BUILD_CONFIRMATION" == "BUILD_PERSONAL_PRODUCTION_DESKTOP" ]] || {
+                echo "::error::confirmation must be exactly BUILD_PERSONAL_PRODUCTION_DESKTOP"
+                exit 1
+              }
+              ;;
+            *)
+              echo "::error::lane must be exactly staging or production"
+              exit 1
+              ;;
           esac
-          [[ "$STAGING_BUILD_CONFIRMATION" == "$expected_confirmation" ]] || {
-            echo "::error::confirmation must be exactly $expected_confirmation for lane $BUILD_LANE"
-            exit 1
-          }
           [[ "$GITHUB_ACTOR" == "justinharkelroad" && "$GITHUB_TRIGGERING_ACTOR" == "justinharkelroad" ]] || {
             echo "::error::only repository owner justinharkelroad may authorize a personal desktop staging build"
             exit 1

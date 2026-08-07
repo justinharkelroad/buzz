@@ -1235,7 +1235,11 @@ end
 
 require_desktop(jobs.keys == %w[build inspect remount attest audit], "desktop workflow must retain the exact build/inspect/remount/attest/audit job order")
 expected_job_shape = {
-  "build" => {"runs-on" => "macos-latest", "timeout-minutes" => 120, "needs" => nil, "environment" => "personal-staging"},
+  # The build job must run in a protected environment. Since the lane selector was added it
+  # resolves to `personal-production` for the production lane and `personal-staging` otherwise,
+  # so the expected value is the EXACT expression rather than a bare literal. This remains as
+  # strict as the previous literal check: any other expression, or a plain literal, still fails.
+  "build" => {"runs-on" => "macos-latest", "timeout-minutes" => 120, "needs" => nil, "environment" => "${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}"},
   "inspect" => {"runs-on" => "macos-latest", "timeout-minutes" => 45, "needs" => "build", "environment" => nil},
   "remount" => {"runs-on" => "macos-15", "timeout-minutes" => 30, "needs" => %w[build inspect], "environment" => nil},
   "attest" => {"runs-on" => "macos-latest", "timeout-minutes" => 30, "needs" => %w[build inspect remount], "environment" => nil},
