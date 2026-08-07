@@ -254,7 +254,7 @@ jobs:
             --expected-sha "$GITHUB_SHA" \
             --expected-repository justinharkelroad/buzz
 
-          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/environments/personal-staging" \
+          gh api --hostname github.com "repos/$GITHUB_REPOSITORY/environments/$STAGING_BUILD_CHANNEL" \
             > /tmp/personal-staging-environment.raw.json
           jq -S '{
               id,
@@ -287,10 +287,12 @@ jobs:
                 triggering_actor: {login: .triggering_actor.login, id: .triggering_actor.id, node_id: .triggering_actor.node_id}
               }' > /tmp/personal-staging-run-identity.json
 
-          jq -e '
+          jq \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
-            and .name == "personal-staging"
+            and .name == $lane_environment
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
             and .deployment_branch_policy.protected_branches == false
@@ -353,7 +355,7 @@ jobs:
             exit 1
           }
           [[ -n "$STAGING_DEPLOYMENT_RECEIPT_JSON" ]] || {
-            echo "::error::PERSONAL_STAGING_DEPLOYMENT_RECEIPT_JSON is required in personal-staging"
+            echo "::error::the lane deployment receipt variable is required in $STAGING_BUILD_CHANNEL"
             exit 1
           }
           canonical_receipt=$(jq -ceS . <<<"$STAGING_DEPLOYMENT_RECEIPT_JSON") || {
@@ -985,15 +987,24 @@ jobs:
           import { writeFileSync } from "node:fs";
 
           const stagingUriScheme = process.env.EXPECTED_URI_SCHEME;
-          if (
-            !stagingUriScheme ||
-            !/^[a-z][a-z0-9+.-]*$/.test(stagingUriScheme) ||
-            stagingUriScheme === "buzz"
-          ) {
-            throw new Error("staging URI scheme must be valid and distinct from buzz");
+          const buildChannel = process.env.EXPECTED_BUILD_CHANNEL;
+          // Lane-aware scheme validation. The relay accepts only `buzz` or
+          // `buzz-personal-staging`, so production MUST be exactly `buzz` and staging must
+          // never claim it. Each lane is checked against its own required value, so both
+          // remain guarded rather than one being loosened.
+          if (!stagingUriScheme || !/^[a-z][a-z0-9+.-]*$/.test(stagingUriScheme)) {
+            throw new Error("desktop URI scheme must be a valid scheme");
           }
-          if (process.env.EXPECTED_BUILD_CHANNEL !== "personal-staging") {
-            throw new Error("staging build channel marker is missing");
+          if (buildChannel === "personal-production") {
+            if (stagingUriScheme !== "buzz") {
+              throw new Error("production URI scheme must be exactly buzz");
+            }
+          } else if (buildChannel === "personal-staging") {
+            if (stagingUriScheme === "buzz") {
+              throw new Error("staging URI scheme must be valid and distinct from buzz");
+            }
+          } else {
+            throw new Error("build channel must be personal-production or personal-staging");
           }
 
           const config = {
@@ -1633,6 +1644,7 @@ jobs:
           [[ -s "$SIDECAR_MANIFEST_PATH" && ! -L "$SIDECAR_MANIFEST_PATH" ]]
           [[ "$(shasum -a 256 "$SIDECAR_MANIFEST_PATH" | awk '{print $1}')" == "$SIDECAR_MANIFEST_SHA" ]]
           jq -n \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
             --slurpfile sidecars "$SIDECAR_MANIFEST_PATH" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$APPROVED_SOURCE_SHA" \
@@ -1738,7 +1750,7 @@ jobs:
               staging_deployment_evidence_reference: $staging_deployment_evidence_reference,
               smoke_approval_record_sha256: $smoke_approval_record_sha256,
               staging_controls: {
-                environment: "personal-staging",
+                environment: $lane_environment,
                 environment_configuration_sha256: $staging_environment_sha256,
                 deployment_branch_policies_sha256: $staging_branch_policies_sha256,
                 run_identity_sha256: $staging_run_identity_sha256,
@@ -3715,10 +3727,12 @@ jobs:
           rm -f "$DOCKER_CONFIG/config.json"
           rmdir "$DOCKER_CONFIG"
 
-          jq -e '
+          jq \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
-            and .name == "personal-staging"
+            and .name == $lane_environment
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
             and .deployment_branch_policy.protected_branches == false
@@ -3735,6 +3749,7 @@ jobs:
           ' "$authorization/personal-staging-branch-policies.json" >/dev/null
 
           jq -e \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
             --slurpfile sidecars "$sidecar_manifest" \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg source_sha "$EXPECTED_SOURCE_SHA" \
@@ -3868,7 +3883,7 @@ jobs:
             and .relay_image_ref == $relay_image_ref
             and .relay_image_ref == (.relay_image + "@" + .relay_digest)
             and .staging_deployment_receipt_sha256 == $staging_receipt_sha
-            and .staging_controls.environment == "personal-staging"
+            and .staging_controls.environment == $lane_environment
             and .staging_controls.environment_configuration_sha256 == $staging_environment_sha
             and .staging_controls.deployment_branch_policies_sha256 == $staging_branch_policies_sha
             and .staging_controls.run_identity_sha256 == $staging_run_identity_sha
@@ -4664,6 +4679,7 @@ jobs:
                 }
             ' > "$predicate"
           jq -e \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
             --arg dmg_name "$DMG_NAME" \
             --arg dmg_sha256 "$DMG_SHA256" \
             --argjson candidate_artifact_id "$CANDIDATE_ARTIFACT_ID" \
@@ -4777,7 +4793,7 @@ jobs:
                 .staging.controls.deployment_branch_policies_sha256,
                 .staging.controls.run_identity_sha256
               ][]; test("^[0-9a-f]{64}$"))
-              and .staging.controls.environment == "personal-staging"
+              and .staging.controls.environment == $lane_environment
               and .staging.controls.deployment_branch == "main"
               and .staging.controls.authorized_owner.login == "justinharkelroad"
               and .safety == {
@@ -5003,7 +5019,7 @@ jobs:
             /tmp/personal-desktop-sealed-main-rulesets.canonical.json
 
           gh api --hostname github.com \
-            "repos/$GITHUB_REPOSITORY/environments/personal-staging" \
+            "repos/$GITHUB_REPOSITORY/environments/$STAGING_BUILD_CHANNEL" \
             > /tmp/personal-desktop-live-staging-environment.raw.json
           jq -S '{
               id,
@@ -5016,10 +5032,12 @@ jobs:
               protection_rules: [.protection_rules[]] | sort_by(.type)
             }' /tmp/personal-desktop-live-staging-environment.raw.json \
             > /tmp/personal-desktop-live-staging-environment.json
-          jq -e '
+          jq \
+            --arg lane_environment "$STAGING_BUILD_CHANNEL" \
+            -e '
             type == "object"
             and keys == ["deployment_branch_policy", "id", "name", "node_id", "protection_rules"]
-            and .name == "personal-staging"
+            and .name == $lane_environment
             and (.id | type == "number" and . >= 1 and floor == .)
             and (.node_id | type == "string" and length > 0)
             and .deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}
