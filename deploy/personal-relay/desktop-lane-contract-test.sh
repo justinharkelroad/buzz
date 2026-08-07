@@ -127,6 +127,40 @@ else
   fail=$((fail + 1))
 fi
 
+
+# --- No hard-coded staging assumptions outside a staging-only branch ----------
+# Regression guard for the class of bug found across six failed production builds
+# on 2026-08-07. PR 21 parameterised the lane INPUTS but left many CONSUMERS
+# asserting `personal-staging` unconditionally: the environment fetched by name,
+# three jq name assertions, the sealed evidence records, and the Tauri config
+# validation. Each one only surfaced on the next build attempt.
+STRAY=$(grep -nE '"personal-staging"|PERSONAL_STAGING_DEPLOYMENT' "$WORKFLOW" \
+  | grep -vE "inputs.lane == .production.|buildChannel === \"personal-staging\"" \
+  | wc -l | tr -d ' ')
+if [[ "$STRAY" -eq 0 ]]; then
+  printf 'ok   no unguarded personal-staging literals remain in the workflow\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL %s unguarded personal-staging literal(s) remain; production lane will fail\n' "$STRAY"
+  fail=$((fail + 1))
+fi
+
+if grep -q 'environments/\$STAGING_BUILD_CHANNEL' "$WORKFLOW"; then
+  printf 'ok   GitHub environment is fetched by the lane-derived name\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL GitHub environment is not fetched by the lane-derived name\n'
+  fail=$((fail + 1))
+fi
+
+if grep -q 'buildChannel === "personal-production"' "$WORKFLOW"; then
+  printf 'ok   Tauri config validates the production lane explicitly\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL Tauri config does not validate the production lane\n'
+  fail=$((fail + 1))
+fi
+
 echo "---"
 echo "pass=$pass fail=$fail"
 
