@@ -1482,7 +1482,13 @@ jobs:
               for url_type in plist.get("CFBundleURLTypes", [])
               for scheme in url_type.get("CFBundleURLSchemes", [])
           ]
-          if any(scheme.casefold() == "buzz" for scheme in schemes):
+          # Staging-only guard. Production legitimately registers `buzz`, so applying this rule to a
+          # production build rejects a correct app. The `schemes != [expected_scheme]` check below is
+          # lane-agnostic and already forbids staging from registering buzz, since staging's expected
+          # scheme is buzz-personal-staging. This stays as defence in depth for the staging lane.
+          if build_lane != "production" and any(
+              scheme.casefold() == "buzz" for scheme in schemes
+          ):
               raise SystemExit("staging app registers the hosted buzz URI scheme")
           if schemes != [expected_scheme]:
               raise SystemExit(
@@ -2363,7 +2369,13 @@ jobs:
               for url_type in plist.get("CFBundleURLTypes", [])
               for scheme in url_type.get("CFBundleURLSchemes", [])
           ]
-          if any(scheme.casefold() == "buzz" for scheme in schemes):
+          # Staging-only guard. Production legitimately registers `buzz`, so applying this rule to a
+          # production build rejects a correct app. The `schemes != [expected_scheme]` check below is
+          # lane-agnostic and already forbids staging from registering buzz, since staging's expected
+          # scheme is buzz-personal-staging. This stays as defence in depth for the staging lane.
+          if build_lane != "production" and any(
+              scheme.casefold() == "buzz" for scheme in schemes
+          ):
               raise SystemExit("staging app registers the hosted buzz URI scheme")
           if schemes != [expected_scheme]:
               raise SystemExit(
