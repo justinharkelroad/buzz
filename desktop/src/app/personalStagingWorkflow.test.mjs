@@ -61,11 +61,11 @@ test("personal staging compiles the visible build identity", () => {
   // The two therefore differ for production, so equality can no longer express the coupling.
   // An allowed-pair check is strictly tighter: exactly two combinations, nothing else.
   assert.equal(
-    workflowSource.match(/production:\|personal-staging:personal-staging\) ;;/g)?.length,
+    workflowSource.match(/production:\|personal-staging:personal-staging\) ;;/g)
+      ?.length,
     2,
     "compiler and Vite channels must be coupled by an allowed-pair check before both build phases",
   );
-
 });
 
 test("native build profile couples storage identity to the deep-link scheme", () => {
