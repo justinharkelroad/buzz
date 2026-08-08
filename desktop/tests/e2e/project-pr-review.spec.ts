@@ -2,7 +2,6 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
-import { focusAndHold } from "../helpers/focus";
 
 const SHOTS = "test-results/project-pr-review";
 const RECOVERY_SHOTS = "test-results/project-pr-conflict-recovery";
@@ -21,19 +20,17 @@ async function enableProjectsFeature(page: import("@playwright/test").Page) {
 }
 
 /**
- * Fills the shared work-item dialog's title and body.
+ * Fills the shared work-item dialog's title and body, then proves each field
+ * kept its own value.
  *
- * `CreateProjectWorkItemDialog` focuses its title input from a 50ms
- * `setTimeout` *on top of* the focus Radix already gives it on open. The
- * element is therefore focused immediately while a second `focus()` is still
- * queued, so `toBeFocused()` does not prove the handoff is finished. If that
- * queued call lands between Playwright focusing the body textarea and
- * inserting the text, the insertion goes to the title's caret instead and the
- * two fields concatenate — the submitted `subject` tag carries the body text
- * appended to the title.
- *
- * Holding focus on the body until it settles drains the queued handoff before
- * any text is typed.
+ * `CreateProjectWorkItemDialog` used to correct focus to the title from a 50ms
+ * `setTimeout`, on top of the focus Radix already grants on open. When that
+ * queued call landed between Playwright focusing the body textarea and
+ * inserting the text, the insertion went to the title's caret instead and the
+ * two fields concatenated — the submitted `subject` tag carried the body text
+ * appended to the title. The dialog now claims the title through Radix's
+ * `onOpenAutoFocus`, so there is no second handoff to race; the value
+ * assertions below are the regression guard.
  */
 async function fillWorkItemDialog(
   page: import("@playwright/test").Page,
@@ -43,7 +40,6 @@ async function fillWorkItemDialog(
   const titleInput = page.getByTestId(`${prefix}-title`);
   const bodyInput = page.getByTestId(`${prefix}-body`);
 
-  await focusAndHold(bodyInput);
   await titleInput.fill(fields.title);
   await bodyInput.fill(fields.body);
 
