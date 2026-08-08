@@ -29,6 +29,31 @@ fn main() {
     }
     println!("cargo:rustc-env=BUZZ_DESKTOP_BUILD_CHANNEL={build_channel}");
 
+    // Bundle id, compiled in so the OS keyring service can be scoped by APPLICATION rather
+    // than by build channel.
+    //
+    // Keyring isolation was previously keyed on the channel alone: personal-staging got its own
+    // service and everything else shared `buzz-desktop`. That is correct while only one
+    // production-channel Buzz exists on a machine. It is not correct for a fork, because a fork's
+    // production build and the upstream production app are BOTH `production` and therefore share
+    // one keychain blob (`buzz-desktop` / `secrets`), including the `identity` key inside it.
+    // A fork build would adopt the upstream app's identity on first launch and could overwrite or
+    // delete it afterwards.
+    //
+    // Default is empty, which preserves the existing `buzz-desktop` service exactly, so upstream
+    // builds are unaffected. Only a build that explicitly passes its bundle id gets a scoped
+    // service. Scoping can only ever REDUCE sharing, never widen it.
+    println!("cargo:rerun-if-env-changed=BUZZ_BUILD_BUNDLE_ID");
+    let bundle_id = std::env::var("BUZZ_BUILD_BUNDLE_ID").unwrap_or_default();
+    if !bundle_id.is_empty()
+        && !bundle_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        panic!("BUZZ_BUILD_BUNDLE_ID must be alphanumeric with dots, dashes or underscores, got {bundle_id:?}");
+    }
+    println!("cargo:rustc-env=BUZZ_DESKTOP_BUNDLE_ID={bundle_id}");
+
     let deep_link_scheme =
         std::env::var("BUZZ_BUILD_DEEP_LINK_SCHEME").unwrap_or_else(|_| "buzz".to_owned());
     let mut scheme_chars = deep_link_scheme.chars();
