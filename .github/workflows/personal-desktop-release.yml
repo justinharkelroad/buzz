@@ -1428,11 +1428,14 @@ jobs:
           BASH_ENV: ""
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
-          EXPECTED_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1
+          # Lane-dependent. Staging RENDERS the staging banner; production must prove it is ABSENT.
+          # These were pinned to the staging pair, so the production lane asserted the exact inverse
+          # of the truth and failed only after a full successful build and DMG creation.
+          EXPECTED_BANNER_ARTIFACT: ${{ inputs.lane == 'production' && 'BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1' || 'BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1' }}
           EXPECTED_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           EXPECTED_PRODUCT_NAME: ${{ steps.build-contract.outputs.product_name }}
           EXPECTED_URI_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
-          FORBIDDEN_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1
+          FORBIDDEN_BANNER_ARTIFACT: ${{ inputs.lane == 'production' && 'BUZZ_PERSONAL_STAGING_BANNER_RENDERED_V1' || 'BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1' }}
           HOSTED_HTTPS: ${{ steps.deployment.outputs.hosted_https }}
           VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -1459,12 +1462,18 @@ jobs:
           [[ "$plist_bundle_id" == "$EXPECTED_BUNDLE_ID" ]]
           [[ "$plist_name" == "$EXPECTED_PRODUCT_NAME" ]]
           [[ "$plist_display_name" == "$EXPECTED_PRODUCT_NAME" ]]
-          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" <<'PY'
+          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" "$BUILD_LANE" <<'PY'
           import plistlib
           import sys
 
-          info_plist, expected_scheme = sys.argv[1:]
-          if expected_scheme.casefold() == "buzz":
+          info_plist, expected_scheme, build_lane = sys.argv[1:]
+          # The relay accepts only `buzz` or `buzz-personal-staging`. Production MUST be exactly
+          # `buzz`; staging must never claim it. Keying on the lane keeps BOTH halves strict rather
+          # than asserting the staging rule against a production build.
+          if build_lane == "production":
+              if expected_scheme.casefold() != "buzz":
+                  raise SystemExit("production URI scheme must be exactly buzz")
+          elif expected_scheme.casefold() == "buzz":
               raise SystemExit("staging URI scheme must not be buzz")
           with open(info_plist, "rb") as plist_file:
               plist = plistlib.load(plist_file)
@@ -1473,7 +1482,13 @@ jobs:
               for url_type in plist.get("CFBundleURLTypes", [])
               for scheme in url_type.get("CFBundleURLSchemes", [])
           ]
-          if any(scheme.casefold() == "buzz" for scheme in schemes):
+          # Staging-only guard. Production legitimately registers `buzz`, so applying this rule to a
+          # production build rejects a correct app. The `schemes != [expected_scheme]` check below is
+          # lane-agnostic and already forbids staging from registering buzz, since staging's expected
+          # scheme is buzz-personal-staging. This stays as defence in depth for the staging lane.
+          if build_lane != "production" and any(
+              scheme.casefold() == "buzz" for scheme in schemes
+          ):
               raise SystemExit("staging app registers the hosted buzz URI scheme")
           if schemes != [expected_scheme]:
               raise SystemExit(
@@ -2166,6 +2181,9 @@ jobs:
           EXPECTED_RELAY_WSS: ${{ needs.build.outputs.relay_wss }}
           EXPECTED_TARGET: ${{ needs.build.outputs.target }}
           EXPECTED_URI_SCHEME: ${{ needs.build.outputs.deep_link_scheme }}
+          # The inspect job has no job-level BUILD_LANE. The plist scheme guard is lane-dependent, so
+          # the lane is passed explicitly from the same inputs the build job used.
+          BUILD_LANE: ${{ inputs.lane }}
           LEDGER_PATH: ${{ steps.inspection-inputs.outputs.ledger }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           STAGED_SIDECAR_DIR: /tmp/personal-desktop-inspect-staging
@@ -2331,12 +2349,18 @@ jobs:
           plist_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")
           [[ "$plist_bundle_id" == "$EXPECTED_BUNDLE_ID" ]]
           [[ "$plist_name" == "$EXPECTED_PRODUCT_NAME" && "$plist_display_name" == "$EXPECTED_PRODUCT_NAME" ]]
-          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" <<'PY'
+          python3 - "$info_plist" "$EXPECTED_URI_SCHEME" "$BUILD_LANE" <<'PY'
           import plistlib
           import sys
 
-          info_plist, expected_scheme = sys.argv[1:]
-          if expected_scheme.casefold() == "buzz":
+          info_plist, expected_scheme, build_lane = sys.argv[1:]
+          # The relay accepts only `buzz` or `buzz-personal-staging`. Production MUST be exactly
+          # `buzz`; staging must never claim it. Keying on the lane keeps BOTH halves strict rather
+          # than asserting the staging rule against a production build.
+          if build_lane == "production":
+              if expected_scheme.casefold() != "buzz":
+                  raise SystemExit("production URI scheme must be exactly buzz")
+          elif expected_scheme.casefold() == "buzz":
               raise SystemExit("staging URI scheme must not be buzz")
           with open(info_plist, "rb") as plist_file:
               plist = plistlib.load(plist_file)
@@ -2345,7 +2369,13 @@ jobs:
               for url_type in plist.get("CFBundleURLTypes", [])
               for scheme in url_type.get("CFBundleURLSchemes", [])
           ]
-          if any(scheme.casefold() == "buzz" for scheme in schemes):
+          # Staging-only guard. Production legitimately registers `buzz`, so applying this rule to a
+          # production build rejects a correct app. The `schemes != [expected_scheme]` check below is
+          # lane-agnostic and already forbids staging from registering buzz, since staging's expected
+          # scheme is buzz-personal-staging. This stays as defence in depth for the staging lane.
+          if build_lane != "production" and any(
+              scheme.casefold() == "buzz" for scheme in schemes
+          ):
               raise SystemExit("staging app registers the hosted buzz URI scheme")
           if schemes != [expected_scheme]:
               raise SystemExit(
