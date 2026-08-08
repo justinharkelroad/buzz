@@ -135,6 +135,7 @@ fi
 # three jq name assertions, the sealed evidence records, and the Tauri config
 # validation. Each one only surfaced on the next build attempt.
 STRAY=$(grep -nE '"personal-staging"|PERSONAL_STAGING_DEPLOYMENT' "$WORKFLOW" \
+  | grep -vE "^[0-9]+: *#" \
   | grep -vE "inputs.lane == .production.|buildChannel === \"personal-staging\"|LANE_ENVIRONMENT" \
   | wc -l | tr -d ' ')
 if [[ "$STRAY" -eq 0 ]]; then
@@ -152,6 +153,7 @@ fi
 # this class again. Match the unquoted form too, allowing only the comparison that lives
 # inside the `staging)` arm of the lane case statement, where the literal is correct.
 STRAY_BARE=$(grep -nE '==[[:space:]]+personal-staging[[:space:]]*\]\]' "$WORKFLOW" \
+  | grep -vE "^[0-9]+: *#" \
   | grep -vE 'STAGING_BUILD_CHANNEL" == personal-staging' \
   | wc -l | tr -d ' ')
 if [[ "$STRAY_BARE" -eq 0 ]]; then
@@ -162,14 +164,28 @@ else
   fail=$((fail + 1))
 fi
 
-# The banner verifier runs inside `pnpm build` as Tauri's beforeBuildCommand, so it fails
-# the production lane before any workflow assertion is reached. It must accept the explicit
-# `production` channel, not only an unset one.
-if grep -q 'buildChannel !== "production"' desktop/scripts/verify-personal-staging-banner-build.mjs; then
-  printf 'ok   banner verifier accepts the explicit production channel\n'
+# The desktop job builds `inputs.source_sha`, not this main, so a fix to the verifier on main
+# never reaches the build. The workflow must instead send the channel string that the approved
+# SOURCE accepts, which for production is EMPTY. Guard the inverted ternary specifically: the
+# natural spelling collapses to staging for both lanes because GitHub treats "" as falsy.
+if grep -q "SOURCE_BUILD_CHANNEL: \${{ inputs.lane != 'production' && 'personal-staging' || '' }}" \
+     .github/workflows/personal-desktop-release.yml; then
+  printf 'ok   production lane sends the empty channel the approved source expects\n'
   pass=$((pass + 1))
 else
-  printf 'FAIL banner verifier rejects VITE_BUZZ_BUILD_CHANNEL=production; pnpm build will fail\n'
+  printf 'FAIL SOURCE_BUILD_CHANNEL missing or not inverted; production would build as staging\n'
+  fail=$((fail + 1))
+fi
+
+# The compiler and Vite must receive the SAME string, or the native binary and the JS bundle
+# disagree about which channel they are. Both now read source_build_channel.
+STRAY_CH=$(grep -cE '(BUZZ|VITE_BUZZ)_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel' \
+  .github/workflows/personal-desktop-release.yml || true)
+if [[ "$STRAY_CH" -eq 0 ]]; then
+  printf 'ok   compiler and Vite channels both read the source dialect\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL %s channel env(s) still read the lane name instead of the source dialect\n' "$STRAY_CH"
   fail=$((fail + 1))
 fi
 

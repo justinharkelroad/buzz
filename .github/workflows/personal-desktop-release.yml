@@ -66,6 +66,14 @@ jobs:
       # verify-personal-staging-banner-build.mjs) recognises exactly `production` and
       # `personal-staging`, and pairs them with `buzz` and `buzz-personal-staging`.
       STAGING_BUILD_CHANNEL: ${{ inputs.lane == 'production' && 'production' || 'personal-staging' }}
+      # The channel string as the owner-approved SOURCE expects to receive it. Production is
+      # encoded there as an ABSENT channel, not the literal "production". See the long note at
+      # the `source_build_channel` output for the mechanism and the builds that proved it.
+      #
+      # Written inverted on purpose. GitHub's `a && b || c` ternary treats an empty string as
+      # FALSY, so the natural spelling `lane == 'production' && '' || 'personal-staging'` would
+      # yield "personal-staging" for BOTH lanes and silently build production as staging.
+      SOURCE_BUILD_CHANNEL: ${{ inputs.lane != 'production' && 'personal-staging' || '' }}
       # The GITHUB ENVIRONMENT name, which is a different namespace from the build
       # channel and only coincides for staging. Conflating the two is what caused the
       # production lane to feed the app a channel value it does not accept.
@@ -839,6 +847,28 @@ jobs:
           {
             echo "auto_connect_default_relay=$STAGING_AUTO_CONNECT_DEFAULT_RELAY"
             echo "build_channel=$STAGING_BUILD_CHANNEL"
+            # The channel value as the OWNER-APPROVED SOURCE expects to receive it, which is not
+            # always the same string as the lane name above.
+            #
+            # The desktop job builds `inputs.source_sha`, the exact source bound to the deployment
+            # receipt, NOT this repository's main. At that source, production is encoded as an
+            # ABSENT channel, not as the literal "production":
+            #
+            #   desktop/src-tauri/build.rs        BUZZ_BUILD_CHANNEL unset defaults to "production"
+            #                                     and still compiles BUZZ_DESKTOP_BUILD_CHANNEL=production
+            #   verify-personal-staging-...mjs    throws on ANY non-empty value except personal-staging,
+            #                                     so the literal "production" is rejected
+            #   PersonalStagingBuildBanner.tsx    anything not personal-staging emits the absent marker
+            #
+            # Sending the literal "production" failed ten production builds at `pnpm build`, which
+            # runs as Tauri's beforeBuildCommand. Fixing the source does not help: the fix lands on
+            # main, and main is not what gets built. The workflow has to speak the approved source's
+            # dialect. Verified against that exact source with controls on 2026-08-07.
+            #
+            # `build_channel` above stays the lane name for provenance and evidence. Only the values
+            # handed to the compiler and to Vite use this one, and they BOTH use it, so the
+            # native-equals-visible invariant still holds.
+            echo "source_build_channel=$([ "$BUILD_LANE" = production ] && printf '' || printf '%s' "$STAGING_BUILD_CHANNEL")"
             echo "bundle_id=$bundle_id"
             echo "deep_link_scheme=$STAGING_URI_SCHEME"
             echo "product_name=$product_name"
@@ -1219,7 +1249,7 @@ jobs:
         env:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
-          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
@@ -1231,15 +1261,15 @@ jobs:
           DESKTOP_TARGET: ${{ steps.build-contract.outputs.target }}
           ENV: ""
           SKIPPY_LLAMA_AUTO_BUILD: "0"
-          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           VITE_BUZZ_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
           [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri build --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1288,7 +1318,7 @@ jobs:
         env:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
-          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
@@ -1303,15 +1333,15 @@ jobs:
           TAURI_BUNDLER_DMG_IGNORE_CI: "true"
           UNPACKED_APP: ${{ steps.unpacked-app.outputs.app }}
           UNPACKED_SNAPSHOT: ${{ steps.unpacked-app.outputs.snapshot }}
-          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           VITE_BUZZ_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
         run: |
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
           [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
+          [[ "$BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           cd desktop
           if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then
             pnpm tauri bundle --verbose --no-sign --target "$DESKTOP_TARGET" \
@@ -1383,7 +1413,7 @@ jobs:
           EXPECTED_URI_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           FORBIDDEN_BANNER_ARTIFACT: BUZZ_PERSONAL_STAGING_BANNER_ABSENT_V1
           HOSTED_HTTPS: ${{ steps.deployment.outputs.hosted_https }}
-          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          VITE_BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
           PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
           PERSONAL_PRODUCTION_HTTPS: ${{ steps.deployment.outputs.personal_production_https }}
           RELAY_HTTPS: ${{ steps.build-contract.outputs.relay_https }}
@@ -1443,7 +1473,7 @@ jobs:
             echo "::error::frontend build output is missing for banner verification"
             exit 1
           }
-          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
+          [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           node desktop/scripts/verify-personal-staging-banner-build.mjs "$frontend_dist" || {
             echo "::error::staging frontend does not satisfy the banner build contract"
             exit 1

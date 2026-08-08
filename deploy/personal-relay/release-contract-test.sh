@@ -1423,8 +1423,8 @@ require_desktop(!workflow_text.match?(/\$\{features\[@\]\}/), "desktop workflow 
   # no longer "must be staging" but "must be pinned to the lane's own channel". The channel
   # is not free-floating: STAGING_BUILD_CHANNEL is derived from inputs.lane at the job level,
   # and the lane case statement asserts each lane against its own required value.
-  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]'), "native desktop build channel must fail closed to the lane channel")
-  require_desktop(run.include?('[[ "$VITE_BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]'), "visible desktop build channel must fail closed to the lane channel")
+  require_desktop(run.include?('[[ "$BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]'), "native desktop build channel must fail closed to the lane channel")
+  require_desktop(run.include?('[[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]'), "visible desktop build channel must fail closed to the lane channel")
   require_desktop(run.include?('if [[ "$DESKTOP_TARGET" == "aarch64-apple-darwin" ]]; then'), "desktop target branch lost explicit arm64 selection")
   require_desktop(run.include?('elif [[ "$DESKTOP_TARGET" == "x86_64-apple-darwin" ]]; then'), "desktop target branch lost explicit x86_64 selection")
   require_desktop(run.include?('--features mesh-llm'), "arm64 Desktop build lost the reviewed mesh-llm feature")
@@ -2312,9 +2312,11 @@ repo_root = File.expand_path("../..", File.dirname(path))
 # generated per lane from the build contract, so the lane difference lives in the config, not
 # in the command line. Any future change that makes the command line lane-dependent will fail
 # here rather than on a runner.
+# Production is exercised with an EMPTY channel, which is how the owner-approved source
+# encodes it. Sending the literal "production" is what failed ten production builds.
 fixture_lanes = {
   "personal-staging" => "buzz-personal-staging",
-  "production" => "buzz",
+  "" => "buzz",
 }
 expected_target_output.each do |target, expected_by_script|
   fixture_scripts.each do |label, script|
@@ -2329,7 +2331,7 @@ expected_target_output.each do |target, expected_by_script|
         "BUZZ_BUILD_CHANNEL" => lane_channel,
         "BUZZ_BUILD_DEEP_LINK_SCHEME" => lane_scheme,
         "DESKTOP_TARGET" => target,
-        "STAGING_BUILD_CHANNEL" => lane_channel,
+        "SOURCE_BUILD_CHANNEL" => lane_channel,
         "VITE_BUZZ_BUILD_CHANNEL" => lane_channel,
         "VITE_BUZZ_DEEP_LINK_SCHEME" => lane_scheme,
       },
