@@ -3150,7 +3150,17 @@ bash -n "$desktop_audit_validator_test"
 bash -n "$desktop_multi_user_acceptance_validator"
 bash -n "$desktop_multi_user_acceptance_test"
 [[ -f "$desktop_audit_validator_test" && -r "$desktop_audit_validator_test" && -x "$desktop_audit_validator_test" && ! -L "$desktop_audit_validator_test" ]]
-[[ $(grep -Fc 'case_root=$(clone_valid_fixture ' "$desktop_audit_validator_test") -eq 12 ]]
+# Two cases were added for the confirmation guard, which had no coverage at all: loosening it to
+# `type == "string"` left this suite green. Count raised 12 -> 14.
+#
+# The bare `[[ ]]` below was silently decorative on macOS bash 3.2, where `set -e` does NOT abort
+# on a failing conditional. It only failed on CI's bash 5, so a stale count reported a local pass
+# and a remote failure with ZERO output. Made explicit so it behaves identically on both.
+audit_case_count=$(grep -Fc 'case_root=$(clone_valid_fixture ' "$desktop_audit_validator_test")
+[[ "$audit_case_count" -eq 14 ]] || {
+  printf 'FAIL desktop audit fixture case count is %s, expected 14\n' "$audit_case_count" >&2
+  exit 1
+}
 grep -Fq 'desktop attestation audit evidence passed' "$desktop_audit_validator_test"
 for desktop_audit_mutation in \
   ledger-schema-downgrade \
