@@ -194,6 +194,19 @@ else
   fail=$((fail + 1))
 fi
 
+# Every job that READS LANE_ENVIRONMENT must also DEFINE it. It was defined only on the build job
+# while the attest job read it five times, which under `set -u` is an unbound variable that fails
+# the run after a complete successful build. This guard is per-job, not per-file, because a
+# file-wide grep reports the build job's definition and hides the gap.
+LANE_ENV_DEFS=$(grep -cE '^ +LANE_ENVIRONMENT: \$\{\{ inputs\.lane' "$W" || true)
+if [[ "$LANE_ENV_DEFS" -ge 2 ]]; then
+  printf 'ok   LANE_ENVIRONMENT is defined in more than one job scope\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL LANE_ENVIRONMENT defined %s time(s); a job that reads it would see it unbound\n' "$LANE_ENV_DEFS"
+  fail=$((fail + 1))
+fi
+
 if grep -q 'production:|personal-staging:personal-staging) ;;' "$W"; then
   printf 'ok   compiler/Vite coupling is an explicit allowed-pair check\n'
   pass=$((pass + 1))
