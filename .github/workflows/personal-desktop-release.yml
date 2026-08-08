@@ -3938,7 +3938,10 @@ jobs:
             and .version == $version
             and .channel == "staging-only"
             and .target == $target
-            and .dispatch_confirmation == "BUILD_PERSONAL_STAGING_DESKTOP"
+            # The line below already checks the confirmation against the value actually
+            # dispatched. A second clause pinning the STAGING literal made the production lane
+            # unsatisfiable: the ledger records BUILD_PERSONAL_PRODUCTION_DESKTOP, so the two
+            # clauses contradicted each other and no production build could ever attest.
             and .dispatch_confirmation == $dispatch_confirmation
             and .build_contract_sha256 == $build_contract_sha
             and .bundle_id == $bundle_id
