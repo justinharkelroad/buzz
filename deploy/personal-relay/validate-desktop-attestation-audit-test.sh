@@ -838,4 +838,23 @@ mutate_json "$case_root/expectations.json" \
   '.remount_artifact.expires_at = "2099-12-31"'
 expect_rejection expectations-expiry-format 'expectations document is invalid'
 
+# The confirmation must be one of the two lane values and nothing else. Neither the original
+# staging-pinned check nor its lane-aware replacement was covered: loosening the clause to
+# `type == "string"` left this suite fully green, so the strictness was decorative.
+case_root=$(clone_valid_fixture expectations-confirmation-unknown)
+mutate_json "$case_root/expectations.json" \
+  '.confirmation = "BUILD_SOMETHING_ELSE"'
+expect_rejection expectations-confirmation-unknown 'expectations document is invalid'
+
+# The production confirmation must be ACCEPTED. This is the case that failed every production
+# audit while the staging literal was pinned.
+case_root=$(clone_valid_fixture expectations-confirmation-production)
+mutate_json "$case_root/expectations.json" \
+  '.confirmation = "BUILD_PERSONAL_PRODUCTION_DESKTOP"'
+if ! run_verifier "$case_root" > "$fixture_root/expectations-confirmation-production.log" 2>&1; then
+  if grep -F 'expectations document is invalid' "$fixture_root/expectations-confirmation-production.log" >/dev/null; then
+    fail 'production confirmation rejected by the expectations schema'
+  fi
+fi
+
 printf '%s\n' 'desktop attestation audit fixture tests passed'

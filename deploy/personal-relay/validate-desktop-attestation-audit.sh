@@ -93,7 +93,12 @@ jq -e '
   and (.target == "aarch64-apple-darwin" or .target == "x86_64-apple-darwin")
   and (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+([+.-][0-9A-Za-z.-]+)?$"))
   and (.product_name | test("^[A-Za-z0-9][A-Za-z0-9._ -]*$"))
-  and .confirmation == "BUILD_PERSONAL_STAGING_DESKTOP"
+  # Lane-dependent. Production dispatches BUILD_PERSONAL_PRODUCTION_DESKTOP, so pinning the
+  # staging literal rejected every production audit. The set is closed to exactly the two
+  # legitimate confirmations, so this stays strict against any other value; the workflow
+  # separately binds the confirmation to the one actually dispatched.
+  and (.confirmation == "BUILD_PERSONAL_STAGING_DESKTOP"
+    or .confirmation == "BUILD_PERSONAL_PRODUCTION_DESKTOP")
   and (.gate1_evidence_run_id | type == "number" and . >= 1 and floor == .)
   and (.staging_deployment_receipt_sha256 | test("^[0-9a-f]{64}$"))
   and (.workflow | keys | sort) == ["ref", "run_attempt", "run_id", "sha"]
