@@ -55,11 +55,6 @@ export function CreateProjectWorkItemDialog({
     setWorkItemTitle("");
     setBody("");
     setErrorMessage(null);
-    const timerId = globalThis.setTimeout(
-      () => titleInputRef.current?.focus(),
-      50,
-    );
-    return () => globalThis.clearTimeout(timerId);
   }, [open]);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -114,6 +109,16 @@ export function CreateProjectWorkItemDialog({
         }
         footerClassName="border-t-0 pt-0"
         headerClassName="pb-2"
+        onOpenAutoFocus={(event) => {
+          // Claim the title as part of the open transition rather than moving
+          // focus a beat afterwards. Radix would otherwise focus the first
+          // focusable child — the repository <select> whenever a caller passes
+          // one — and a deferred correction can land between a keystroke's
+          // focus and its text insertion, redirecting typing meant for another
+          // field into this one.
+          event.preventDefault();
+          titleInputRef.current?.focus();
+        }}
         title={title}
       >
         <form
