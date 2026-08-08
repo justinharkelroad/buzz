@@ -259,7 +259,11 @@ jq -e \
       "authorized_owner", "deployment_branch", "deployment_branch_policies_sha256",
       "environment", "environment_configuration_sha256", "run_identity_sha256"
     ] | sort)
-    and .staging_controls.environment == "personal-staging"
+    # Lane-dependent. The build job writes LANE_ENVIRONMENT here, which is personal-production on
+    # the production lane. Pinning the staging value rejected every production audit. Closed to
+    # exactly the two lane environments, so it stays strict against anything else.
+    and (.staging_controls.environment == "personal-staging"
+      or .staging_controls.environment == "personal-production")
     and .staging_controls.deployment_branch == "main"
     and (.staging_controls.environment_configuration_sha256 | test("^[0-9a-f]{64}$"))
     and (.staging_controls.deployment_branch_policies_sha256 | test("^[0-9a-f]{64}$"))
