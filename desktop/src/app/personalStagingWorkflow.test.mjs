@@ -34,23 +34,37 @@ test("personal staging compiles the visible build identity", () => {
     workflowSource,
     /^\s+STAGING_BUILD_CHANNEL: \$\{\{ inputs\.lane == 'production' && 'production' \|\| 'personal-staging' \}\}$/m,
   );
+  // The values handed to the COMPILER and to VITE are not the lane name. The desktop job builds
+  // `inputs.source_sha`, the owner-approved source bound to the deployment receipt, and at that
+  // source production is encoded as an ABSENT channel. Sending the literal `production` failed
+  // ten production builds inside `pnpm build`. Fixing the source does not help, because the fix
+  // lands on main and main is not what gets built.
   assert.match(
     workflowSource,
-    /VITE_BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}/,
+    /^\s+SOURCE_BUILD_CHANNEL: \$\{\{ inputs\.lane != 'production' && 'personal-staging' \|\| '' \}\}$/m,
+    "production must send the empty channel, and the ternary must be inverted because GitHub treats '' as falsy",
   );
+  assert.match(
+    workflowSource,
+    /VITE_BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.source_build_channel \}\}/,
+  );
+  // The COMPILER keeps the lane name. build.rs validates with
+  // `matches!(channel, "production" | "personal-staging")`, and its env::var default fires only
+  // when the variable is ABSENT: an empty-but-set value returns Ok("") and would fail that check.
   assert.equal(
     workflowSource.match(
       /^\s+BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}$/gm,
     )?.length,
     2,
-    "both the candidate build and DMG bundle must compile the native staging profile",
+    "both the candidate build and DMG bundle must compile with the lane name",
   );
+  // The two therefore differ for production, so equality can no longer express the coupling.
+  // An allowed-pair check is strictly tighter: exactly two combinations, nothing else.
   assert.equal(
-    workflowSource.match(
-      /\[\[ "\$BUZZ_BUILD_CHANNEL" == "\$VITE_BUZZ_BUILD_CHANNEL" \]\]/g,
-    )?.length,
+    workflowSource.match(/production:\|personal-staging:personal-staging\) ;;/g)
+      ?.length,
     2,
-    "native and visible build identities must be coupled before both build phases",
+    "compiler and Vite channels must be coupled by an allowed-pair check before both build phases",
   );
 });
 
