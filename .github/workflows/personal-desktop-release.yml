@@ -1257,6 +1257,7 @@ jobs:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
           BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
@@ -1332,6 +1333,7 @@ jobs:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
           BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
+          BUZZ_BUILD_BUNDLE_ID: ${{ steps.build-contract.outputs.bundle_id }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
