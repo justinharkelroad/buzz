@@ -3409,6 +3409,12 @@ jobs:
       contents: read
       id-token: write
       packages: read
+    env:
+      # LANE_ENVIRONMENT was defined only on the `build` job, but the attest job reads it in five
+      # places. Under `set -u` that is an unbound variable, which failed the run AFTER a complete
+      # successful build, DMG creation, inspection, and independent remount. Same class as the
+      # BUILD_LANE scope gap in the inspect job: correct where it was written, absent where reused.
+      LANE_ENVIRONMENT: ${{ inputs.lane == 'production' && 'personal-production' || 'personal-staging' }}
     outputs:
       artifact_digest: ${{ steps.uploaded-attestation.outputs.digest }}
       artifact_expires_at: ${{ steps.uploaded-attestation.outputs.expires_at }}
