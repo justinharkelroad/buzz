@@ -1,6 +1,9 @@
 import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
+import { waitForStableScroll } from "../helpers/scroll";
+
+const THREAD_REPLY_COUNT = 48;
 
 async function seedLongThread(page: import("@playwright/test").Page) {
   await expect
@@ -10,7 +13,7 @@ async function seedLongThread(page: import("@playwright/test").Page) {
       ),
     )
     .toBe(true);
-  return page.evaluate(() => {
+  return page.evaluate((replyCount) => {
     const root = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
       channelName: "general",
       content: "Focus mode integration thread",
@@ -18,7 +21,7 @@ async function seedLongThread(page: import("@playwright/test").Page) {
     });
     if (!root) throw new Error("Failed to seed focus thread root");
 
-    for (let index = 0; index < 48; index += 1) {
+    for (let index = 0; index < replyCount; index += 1) {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
         content: `Focus reply ${index}: this deliberately wraps across several lines so changing the thread measure causes real layout reflow.`,
@@ -27,7 +30,43 @@ async function seedLongThread(page: import("@playwright/test").Page) {
       });
     }
     return root.id;
-  });
+  }, THREAD_REPLY_COUNT);
+}
+
+/**
+ * Takes the thread's scroll position away from its bottom pin and holds it
+ * there.
+ *
+ * The pin is not a single write: the panel bottom-pins on mount, re-pins on the
+ * settling pass that runs inside its own `scroll` handler, and re-pins again
+ * once the composer reports its height. A `scrollTop` write landing in that
+ * window is silently undone, and — before the deferred reply list commits —
+ * lands on a container with nothing to scroll at all. Both outcomes leave the
+ * reading-context assertions below sampling the thread root or the bottom row
+ * instead of mid-history, so they stop testing what they claim to.
+ *
+ * Ask for mid-history, let the layout settle, and confirm the request stuck.
+ */
+async function parkThreadMidHistory(
+  body: import("@playwright/test").Locator,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        await body.evaluate((element) => {
+          element.scrollTop =
+            (element.scrollHeight - element.clientHeight) * 0.4;
+          element.dispatchEvent(new Event("scroll", { bubbles: true }));
+        });
+        await waitForStableScroll(body);
+        return body.evaluate(
+          (element) =>
+            element.scrollHeight - element.clientHeight - element.scrollTop,
+        );
+      },
+      { message: "thread never held a mid-history scroll position" },
+    )
+    .toBeGreaterThan(100);
 }
 
 async function topVisibleMessageId(
@@ -181,11 +220,13 @@ test("focus and split preserve reading context and interaction ownership", async
     .toBe(true);
   await expect(channel).toHaveAttribute("inert", "");
 
-  await body.evaluate((element) => {
-    element.scrollTop = element.scrollHeight * 0.4;
-    element.dispatchEvent(new Event("scroll", { bubbles: true }));
-  });
-  const anchorId = await topVisibleMessageId(body);
+  // The reply list arrives on a deferred commit, so the drawer is "visible"
+  // with nothing scrollable in it for a frame or more. Scrolling before the
+  // last reply lands anchors this test on the thread root.
+  await expect(
+    body.getByText(`Focus reply ${THREAD_REPLY_COUNT - 1}:`),
+  ).toBeAttached();
+  await parkThreadMidHistory(body);
 
   const focusModeToggle = page.getByRole("button", {
     name: "Show thread beside channel",
@@ -194,6 +235,11 @@ test("focus and split preserve reading context and interaction ownership", async
   await expect(
     page.getByRole("tooltip", { name: "Show thread beside channel" }),
   ).toBeVisible();
+  // Sample the row the switch handler itself will record — it reads the
+  // top-visible row when the click lands, so an earlier sample can name a
+  // different row than the one the app restores.
+  await waitForStableScroll(body);
+  const anchorId = await topVisibleMessageId(body);
   await focusModeToggle.click();
   await expect(drawer).toHaveCount(0);
   await expect(channel).not.toHaveAttribute("inert", "");
@@ -216,12 +262,18 @@ test("focus and split preserve reading context and interaction ownership", async
 
   const splitModeToggle = page.getByRole("button", { name: "Expand thread" });
   await splitModeToggle.focus();
+  // Each switch restores the row that was at the top of the viewport when it
+  // was made, not the row the previous switch restored: the split view centers
+  // `anchorId`, which puts a different row at the top edge. Re-sample here, or
+  // this asserts a row the app never promised to keep.
+  await waitForStableScroll(body);
+  const splitAnchorId = await topVisibleMessageId(body);
   await splitModeToggle.press("Enter");
   await expect(drawer).toBeVisible();
   await expect(channel).toHaveAttribute("inert", "");
   await expect(page.getByTestId("thread-view-mode-toggle")).toBeFocused();
   await expect(
-    body.locator(`[data-message-id="${anchorId}"]`),
+    body.locator(`[data-message-id="${splitAnchorId}"]`),
   ).toBeInViewport();
 
   // Focus mode owns Escape even while the rich-text composer and one of its
