@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { focusAndHold } from "../helpers/focus";
 
 const SHOTS = "test-results/project-pr-review";
 const RECOVERY_SHOTS = "test-results/project-pr-conflict-recovery";
@@ -17,6 +18,37 @@ async function enableProjectsFeature(page: import("@playwright/test").Page) {
       JSON.stringify({ projects: true }),
     );
   });
+}
+
+/**
+ * Fills the shared work-item dialog's title and body.
+ *
+ * `CreateProjectWorkItemDialog` focuses its title input from a 50ms
+ * `setTimeout` *on top of* the focus Radix already gives it on open. The
+ * element is therefore focused immediately while a second `focus()` is still
+ * queued, so `toBeFocused()` does not prove the handoff is finished. If that
+ * queued call lands between Playwright focusing the body textarea and
+ * inserting the text, the insertion goes to the title's caret instead and the
+ * two fields concatenate — the submitted `subject` tag carries the body text
+ * appended to the title.
+ *
+ * Holding focus on the body until it settles drains the queued handoff before
+ * any text is typed.
+ */
+async function fillWorkItemDialog(
+  page: import("@playwright/test").Page,
+  prefix: "create-issue" | "create-pull-request",
+  fields: { body: string; title: string },
+) {
+  const titleInput = page.getByTestId(`${prefix}-title`);
+  const bodyInput = page.getByTestId(`${prefix}-body`);
+
+  await focusAndHold(bodyInput);
+  await titleInput.fill(fields.title);
+  await bodyInput.fill(fields.body);
+
+  await expect(titleInput).toHaveValue(fields.title);
+  await expect(bodyInput).toHaveValue(fields.body);
 }
 
 async function openBuzzProject(page: import("@playwright/test").Page) {
@@ -1224,12 +1256,10 @@ test("pushed local branch can open a pull request", async ({ page }) => {
   await expect(
     page.getByTestId("create-pull-request-compare-branch"),
   ).toHaveValue("feature/projects-workflow");
-  await page
-    .getByTestId("create-pull-request-title")
-    .fill("Complete the Projects git workflow");
-  await page
-    .getByTestId("create-pull-request-body")
-    .fill("Adds the missing desktop write path.");
+  await fillWorkItemDialog(page, "create-pull-request", {
+    body: "Adds the missing desktop write path.",
+    title: "Complete the Projects git workflow",
+  });
   await page.getByTestId("create-pull-request-submit").evaluate((button) => {
     button.click();
     button.click();
@@ -1319,12 +1349,10 @@ test("project issue can be created from the issues header", async ({
 
   await page.getByRole("tab", { name: "Issues", exact: true }).click();
   await page.getByRole("button", { name: "Issues", exact: true }).click();
-  await page
-    .getByTestId("create-issue-title")
-    .fill("Document the broken workflow");
-  await page
-    .getByTestId("create-issue-body")
-    .fill("The project workflow needs a clear repair path.");
+  await fillWorkItemDialog(page, "create-issue", {
+    body: "The project workflow needs a clear repair path.",
+    title: "Document the broken workflow",
+  });
   await page.getByTestId("create-issue-submit").click();
   await expect(page.getByText("Issue created.")).toBeVisible();
 
