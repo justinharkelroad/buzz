@@ -857,4 +857,22 @@ if ! run_verifier "$case_root" > "$fixture_root/expectations-confirmation-produc
   fi
 fi
 
+# The lane environment must be one of the two values and nothing else. Loosening the clause to
+# `type == "string"` left this suite green, so the guard was uncovered exactly like the
+# confirmation guard was.
+case_root=$(clone_valid_fixture ledger-environment-unknown)
+mutate_json "$case_root/candidate/personal-desktop-staging.json" \
+  '.staging_controls.environment = "personal-bogus"'
+expect_rejection ledger-environment-unknown 'candidate ledger is not bound to exact workflow inputs and build outputs'
+
+# The production environment must be ACCEPTED. This is the exact case that failed build attempt 16.
+case_root=$(clone_valid_fixture ledger-environment-production)
+mutate_json "$case_root/candidate/personal-desktop-staging.json" \
+  '.staging_controls.environment = "personal-production"'
+if ! run_verifier "$case_root" > "$fixture_root/ledger-environment-production.log" 2>&1; then
+  if grep -F 'candidate ledger is not bound to exact workflow inputs and build outputs' "$fixture_root/ledger-environment-production.log" >/dev/null; then
+    fail 'production lane environment rejected by the ledger binding check'
+  fi
+fi
+
 printf '%s\n' 'desktop attestation audit fixture tests passed'

@@ -582,7 +582,11 @@ jq -e \
   and (.evidence_bundle_sha256 | hex64)
   and .evidence_bundle_sha256 == $expected_evidence_bundle_sha256
   and (.relay | exact_keys(["environment", "source_sha", "image_ref", "pubkey"]))
-  and .relay.environment == "personal-staging"
+  # Lane-dependent. This validator gates ACCEPTANCE, not the build, so the staging pin would not
+  # have surfaced until the production acceptance packet was assembled. Closed to exactly the
+  # two lane environments, so it stays strict against anything else.
+  and (.relay.environment == "personal-staging"
+    or .relay.environment == "personal-production")
   and (.relay.source_sha | hex40)
   and .relay.source_sha == $expected_relay_source_sha
   and .relay.image_ref == $expected_relay_image_ref
