@@ -865,9 +865,16 @@ jobs:
             # main, and main is not what gets built. The workflow has to speak the approved source's
             # dialect. Verified against that exact source with controls on 2026-08-07.
             #
-            # `build_channel` above stays the lane name for provenance and evidence. Only the values
-            # handed to the compiler and to Vite use this one, and they BOTH use it, so the
-            # native-equals-visible invariant still holds.
+            # ONLY Vite uses this. The COMPILER keeps the lane name, because build.rs validates
+            # with `matches!(channel, "production" | "personal-staging")` and its
+            # `env::var(..).unwrap_or_else(..)` default fires only when the variable is ABSENT.
+            # A variable set to the empty string returns Ok("") and would fail that check, so
+            # sending the literal lane name to the compiler is correct under either reading.
+            #
+            # The two therefore differ for production, on purpose: compiler gets "production",
+            # Vite gets "". The old `BUZZ == VITE` equality can no longer express the coupling,
+            # so it is replaced by an explicit allowed-pair check, which is strictly tighter than
+            # equality: it permits exactly two combinations and nothing else.
             echo "source_build_channel=$([ "$BUILD_LANE" = production ] && printf '' || printf '%s' "$STAGING_BUILD_CHANNEL")"
             echo "bundle_id=$bundle_id"
             echo "deep_link_scheme=$STAGING_URI_SCHEME"
@@ -1249,7 +1256,7 @@ jobs:
         env:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
-          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
@@ -1266,8 +1273,14 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
+          case "$BUZZ_BUILD_CHANNEL:$VITE_BUZZ_BUILD_CHANNEL" in
+            production:|personal-staging:personal-staging) ;;
+            *)
+              echo "::error::compiler/Vite channel pair is not an allowed combination: $BUZZ_BUILD_CHANNEL / $VITE_BUZZ_BUILD_CHANNEL"
+              exit 1
+              ;;
+          esac
+          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
           [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           cd desktop
@@ -1318,7 +1331,7 @@ jobs:
         env:
           BASH_ENV: ""
           BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY: ${{ steps.build-contract.outputs.auto_connect_default_relay }}
-          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.source_build_channel }}
+          BUZZ_BUILD_CHANNEL: ${{ steps.build-contract.outputs.build_channel }}
           BUZZ_BUILD_DEEP_LINK_SCHEME: ${{ steps.build-contract.outputs.deep_link_scheme }}
           BUZZ_RELAY_HTTP: ${{ steps.build-contract.outputs.relay_https }}
           BUZZ_RELAY_URL: ${{ steps.build-contract.outputs.relay_wss }}
@@ -1338,8 +1351,14 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$BUZZ_BUILD_AUTO_CONNECT_DEFAULT_RELAY" == true ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$VITE_BUZZ_BUILD_CHANNEL" ]]
-          [[ "$BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
+          case "$BUZZ_BUILD_CHANNEL:$VITE_BUZZ_BUILD_CHANNEL" in
+            production:|personal-staging:personal-staging) ;;
+            *)
+              echo "::error::compiler/Vite channel pair is not an allowed combination: $BUZZ_BUILD_CHANNEL / $VITE_BUZZ_BUILD_CHANNEL"
+              exit 1
+              ;;
+          esac
+          [[ "$BUZZ_BUILD_CHANNEL" == "$STAGING_BUILD_CHANNEL" ]]
           [[ "$BUZZ_BUILD_DEEP_LINK_SCHEME" == "$VITE_BUZZ_DEEP_LINK_SCHEME" ]]
           [[ "$VITE_BUZZ_BUILD_CHANNEL" == "$SOURCE_BUILD_CHANNEL" ]]
           cd desktop

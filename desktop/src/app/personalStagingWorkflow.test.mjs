@@ -48,27 +48,24 @@ test("personal staging compiles the visible build identity", () => {
     workflowSource,
     /VITE_BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.source_build_channel \}\}/,
   );
+  // The COMPILER keeps the lane name. build.rs validates with
+  // `matches!(channel, "production" | "personal-staging")`, and its env::var default fires only
+  // when the variable is ABSENT: an empty-but-set value returns Ok("") and would fail that check.
   assert.equal(
     workflowSource.match(
-      /^\s+BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.source_build_channel \}\}$/gm,
+      /^\s+BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}$/gm,
     )?.length,
     2,
-    "both the candidate build and DMG bundle must compile from the source dialect channel",
+    "both the candidate build and DMG bundle must compile with the lane name",
   );
+  // The two therefore differ for production, so equality can no longer express the coupling.
+  // An allowed-pair check is strictly tighter: exactly two combinations, nothing else.
   assert.equal(
-    workflowSource.match(
-      /^\s+(?:VITE_)?BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}$/gm,
-    ),
-    null,
-    "no channel env may still read the lane name; the compiler and Vite must agree on the dialect",
-  );
-  assert.equal(
-    workflowSource.match(
-      /\[\[ "\$BUZZ_BUILD_CHANNEL" == "\$VITE_BUZZ_BUILD_CHANNEL" \]\]/g,
-    )?.length,
+    workflowSource.match(/production:\|personal-staging:personal-staging\) ;;/g)?.length,
     2,
-    "native and visible build identities must be coupled before both build phases",
+    "compiler and Vite channels must be coupled by an allowed-pair check before both build phases",
   );
+
 });
 
 test("native build profile couples storage identity to the deep-link scheme", () => {

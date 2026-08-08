@@ -177,15 +177,28 @@ else
   fail=$((fail + 1))
 fi
 
-# The compiler and Vite must receive the SAME string, or the native binary and the JS bundle
-# disagree about which channel they are. Both now read source_build_channel.
-STRAY_CH=$(grep -cE '(BUZZ|VITE_BUZZ)_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel' \
-  .github/workflows/personal-desktop-release.yml || true)
-if [[ "$STRAY_CH" -eq 0 ]]; then
-  printf 'ok   compiler and Vite channels both read the source dialect\n'
+# The compiler and Vite receive DIFFERENT strings for production, on purpose.
+#   compiler (build.rs)   needs the literal lane name; its env::var default fires only when the
+#                         variable is ABSENT, so an empty-but-set value would fail its matches!
+#   Vite (banner verifier at the APPROVED SOURCE) needs production to be EMPTY
+# Assert each side reads the right build-contract output, and that the pair coupling is an
+# explicit allowed-pair check rather than the old equality, which can no longer hold.
+W=".github/workflows/personal-desktop-release.yml"
+COMPILER_REFS=$(grep -cE '^ +BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.build_channel \}\}$' "$W" || true)
+VITE_REFS=$(grep -cE '^ +VITE_BUZZ_BUILD_CHANNEL: \$\{\{ steps\.build-contract\.outputs\.source_build_channel \}\}$' "$W" || true)
+if [[ "$COMPILER_REFS" -eq 2 && "$VITE_REFS" -eq 3 ]]; then
+  printf 'ok   compiler reads the lane name, Vite reads the source dialect\n'
   pass=$((pass + 1))
 else
-  printf 'FAIL %s channel env(s) still read the lane name instead of the source dialect\n' "$STRAY_CH"
+  printf 'FAIL channel wiring wrong: compiler=%s (want 2) vite=%s (want 3)\n' "$COMPILER_REFS" "$VITE_REFS"
+  fail=$((fail + 1))
+fi
+
+if grep -q 'production:|personal-staging:personal-staging) ;;' "$W"; then
+  printf 'ok   compiler/Vite coupling is an explicit allowed-pair check\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL compiler/Vite coupling missing; a mismatched pair could build\n'
   fail=$((fail + 1))
 fi
 
