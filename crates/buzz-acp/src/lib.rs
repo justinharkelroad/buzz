@@ -5137,6 +5137,13 @@ mod author_gate_tests {
         );
     }
 
+    // Keep the protected personal-relay Gate 1 command stable while testing
+    // the stricter stored-template authorization contract.
+    #[test]
+    fn trusted_relay_workflow_uses_attributed_owner_for_author_gate() {
+        trusted_relay_workflow_uses_owner_for_explicit_target();
+    }
+
     #[test]
     fn forged_workflow_marker_cannot_replace_actual_signer() {
         let relay = nostr::Keys::generate();
@@ -5148,6 +5155,66 @@ mod author_gate_tests {
         assert_eq!(
             effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             attacker.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn relay_signed_non_workflow_event_cannot_replace_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), false);
+
+        assert_eq!(
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn missing_trusted_relay_identity_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
+
+        assert_eq!(
+            effective_author_for(&event, None, &agent.public_key()),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn invalid_signature_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let mut event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
+        event.content = "tampered".into();
+
+        assert_eq!(
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn wrong_kind_fails_closed_to_actual_signer() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let event = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            &agent.public_key(),
+            true,
+            1,
+            vec![],
+        );
+
+        assert_eq!(
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
+            relay.public_key().to_hex()
         );
     }
 
@@ -5258,6 +5325,11 @@ mod author_gate_tests {
                 relay.public_key().to_hex()
             );
         }
+    }
+
+    #[test]
+    fn duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer() {
+        duplicate_authority_or_marker_tags_fail_closed();
     }
 
     /// A `RestClient` for tests. The author-gate decisions exercised here all
