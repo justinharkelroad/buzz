@@ -488,14 +488,16 @@ async fn author_allowed(
 
 /// Resolve the sender used by the agent instruction gate.
 ///
-/// Workflow messages are signed by the relay and carry their workflow owner in
-/// the `actor` tag. Trust that attribution only when the event signer matches
-/// the relay's NIP-11 `self` identity and the event is explicitly marked as a
-/// workflow side effect. Missing or malformed metadata fails closed to the
-/// event's actual signer.
+/// Workflow messages are signed by the relay and carry explicit owner and
+/// stored-template mention provenance. Trust that attribution only when the
+/// event signer matches the relay's NIP-11 `self` identity, the receiving agent
+/// has exactly one canonical authority-bearing mention, and all workflow
+/// metadata is unique and canonical. Missing or malformed metadata fails closed
+/// to the event's actual signer.
 pub(crate) fn effective_instruction_author(
     event: &nostr::Event,
     trusted_relay_pubkey: Option<&nostr::PublicKey>,
+    agent_pubkey_hex: &str,
 ) -> String {
     let signer = event.pubkey.to_hex();
     if trusted_relay_pubkey != Some(&event.pubkey)
@@ -518,21 +520,53 @@ pub(crate) fn effective_instruction_author(
         return signer;
     }
 
-    let actor_tags: Vec<&[String]> = event
+    let owner_tags: Vec<&[String]> = event
         .tags
         .iter()
-        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("actor"))
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("buzz:workflow-owner"))
         .map(nostr::Tag::as_slice)
         .collect();
-    if actor_tags.len() != 1 || actor_tags[0].len() != 2 {
+    let [owner_tag] = owner_tags.as_slice() else {
+        return signer;
+    };
+    let [_, owner_value] = owner_tag else {
+        return signer;
+    };
+    let Ok(owner) = nostr::PublicKey::from_hex(owner_value) else {
+        return signer;
+    };
+    if owner_value != &owner.to_hex() {
         return signer;
     }
 
-    actor_tags[0]
-        .get(1)
-        .and_then(|value| nostr::PublicKey::from_hex(value).ok())
-        .map(|pubkey| pubkey.to_hex())
-        .unwrap_or(signer)
+    let Ok(agent_pubkey) = nostr::PublicKey::from_hex(agent_pubkey_hex) else {
+        return signer;
+    };
+    let agent_pubkey = agent_pubkey.to_hex();
+    let mention_tags: Vec<&[String]> = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("buzz:workflow-mention"))
+        .map(nostr::Tag::as_slice)
+        .collect();
+    let mut mentioned_pubkeys = HashSet::with_capacity(mention_tags.len());
+    for mention_tag in mention_tags {
+        let [_, mention_value] = mention_tag else {
+            return signer;
+        };
+        let Ok(mention) = nostr::PublicKey::from_hex(mention_value) else {
+            return signer;
+        };
+        let mention = mention.to_hex();
+        if mention_value != &mention || !mentioned_pubkeys.insert(mention) {
+            return signer;
+        }
+    }
+    if !mentioned_pubkeys.contains(&agent_pubkey) {
+        return signer;
+    }
+
+    owner.to_hex()
 }
 
 /// Resolve channel metadata for the inbound author gate.
@@ -2679,6 +2713,7 @@ async fn tokio_main() -> Result<()> {
                                 let author = effective_instruction_author(
                                     &buzz_event.event,
                                     trusted_relay_pubkey.as_ref(),
+                                    &pubkey_hex,
                                 );
                                 // DM hardening: resolve channel type (fail-closed
                                 // to DM) so unrestricted `anyone` access cannot be
@@ -5043,13 +5078,18 @@ mod author_gate_tests {
 
     fn workflow_event_with(
         signer: &nostr::Keys,
-        actor: &nostr::PublicKey,
+        owner: &nostr::PublicKey,
+        agent: &nostr::PublicKey,
         include_workflow_marker: bool,
         kind: u32,
         extra_tags: Vec<nostr::Tag>,
     ) -> nostr::Event {
-        let mut tags =
-            vec![nostr::Tag::parse(["actor", &actor.to_hex()]).expect("valid actor tag")];
+        let mut tags = vec![
+            nostr::Tag::parse(["buzz:workflow-owner", &owner.to_hex()])
+                .expect("valid workflow owner tag"),
+            nostr::Tag::parse(["buzz:workflow-mention", &agent.to_hex()])
+                .expect("valid workflow mention tag"),
+        ];
         if include_workflow_marker {
             tags.push(nostr::Tag::parse(["buzz:workflow", "true"]).expect("valid workflow marker"));
         }
@@ -5062,28 +5102,46 @@ mod author_gate_tests {
 
     fn workflow_event(
         signer: &nostr::Keys,
-        actor: &nostr::PublicKey,
+        owner: &nostr::PublicKey,
+        agent: &nostr::PublicKey,
         include_workflow_marker: bool,
     ) -> nostr::Event {
         workflow_event_with(
             signer,
-            actor,
+            owner,
+            agent,
             include_workflow_marker,
             KIND_STREAM_MESSAGE,
             vec![],
         )
     }
 
+    fn effective_author_for(
+        event: &nostr::Event,
+        relay: Option<&nostr::PublicKey>,
+        agent: &nostr::PublicKey,
+    ) -> String {
+        effective_instruction_author(event, relay, &agent.to_hex())
+    }
+
     #[test]
-    fn trusted_relay_workflow_uses_attributed_owner_for_author_gate() {
+    fn trusted_relay_workflow_uses_owner_for_explicit_target() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let event = workflow_event(&relay, &owner.public_key(), true);
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
 
         assert_eq!(
-            effective_instruction_author(&event, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             owner.public_key().to_hex()
         );
+    }
+
+    // Keep the protected personal-relay Gate 1 command stable while testing
+    // the stricter stored-template authorization contract.
+    #[test]
+    fn trusted_relay_workflow_uses_attributed_owner_for_author_gate() {
+        trusted_relay_workflow_uses_owner_for_explicit_target();
     }
 
     #[test]
@@ -5091,10 +5149,11 @@ mod author_gate_tests {
         let relay = nostr::Keys::generate();
         let attacker = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let event = workflow_event(&attacker, &owner.public_key(), true);
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&attacker, &owner.public_key(), &agent.public_key(), true);
 
         assert_eq!(
-            effective_instruction_author(&event, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             attacker.public_key().to_hex()
         );
     }
@@ -5103,10 +5162,11 @@ mod author_gate_tests {
     fn relay_signed_non_workflow_event_cannot_replace_actual_signer() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let event = workflow_event(&relay, &owner.public_key(), false);
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), false);
 
         assert_eq!(
-            effective_instruction_author(&event, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             relay.public_key().to_hex()
         );
     }
@@ -5115,10 +5175,11 @@ mod author_gate_tests {
     fn missing_trusted_relay_identity_fails_closed_to_actual_signer() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let event = workflow_event(&relay, &owner.public_key(), true);
+        let agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
 
         assert_eq!(
-            effective_instruction_author(&event, None),
+            effective_author_for(&event, None, &agent.public_key()),
             relay.public_key().to_hex()
         );
     }
@@ -5127,11 +5188,12 @@ mod author_gate_tests {
     fn invalid_signature_fails_closed_to_actual_signer() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let mut event = workflow_event(&relay, &owner.public_key(), true);
+        let agent = nostr::Keys::generate();
+        let mut event = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
         event.content = "tampered".into();
 
         assert_eq!(
-            effective_instruction_author(&event, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             relay.public_key().to_hex()
         );
     }
@@ -5140,42 +5202,134 @@ mod author_gate_tests {
     fn wrong_kind_fails_closed_to_actual_signer() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let event = workflow_event_with(&relay, &owner.public_key(), true, 1, vec![]);
+        let agent = nostr::Keys::generate();
+        let event = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            &agent.public_key(),
+            true,
+            1,
+            vec![],
+        );
 
         assert_eq!(
-            effective_instruction_author(&event, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
             relay.public_key().to_hex()
         );
     }
 
     #[test]
-    fn duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer() {
+    fn non_workflow_missing_identity_tampering_and_wrong_kind_fail_closed() {
         let relay = nostr::Keys::generate();
         let owner = nostr::Keys::generate();
-        let duplicate_actor = workflow_event_with(
+        let agent = nostr::Keys::generate();
+        let non_workflow = workflow_event(&relay, &owner.public_key(), &agent.public_key(), false);
+        let mut tampered = workflow_event(&relay, &owner.public_key(), &agent.public_key(), true);
+        tampered.content = "tampered".into();
+        let wrong_kind = workflow_event_with(
             &relay,
             &owner.public_key(),
+            &agent.public_key(),
             true,
-            KIND_STREAM_MESSAGE,
-            vec![nostr::Tag::parse(["actor", &owner.public_key().to_hex()])
-                .expect("duplicate actor tag")],
-        );
-        let duplicate_workflow = workflow_event_with(
-            &relay,
-            &owner.public_key(),
-            true,
-            KIND_STREAM_MESSAGE,
-            vec![nostr::Tag::parse(["buzz:workflow", "true"]).expect("duplicate workflow marker")],
+            1,
+            vec![],
         );
 
+        for event in [&non_workflow, &tampered, &wrong_kind] {
+            assert_eq!(
+                effective_author_for(event, Some(&relay.public_key()), &agent.public_key()),
+                relay.public_key().to_hex()
+            );
+        }
         assert_eq!(
-            effective_instruction_author(&duplicate_actor, Some(&relay.public_key())),
+            effective_author_for(&wrong_kind, None, &agent.public_key()),
             relay.public_key().to_hex()
         );
+    }
+
+    #[test]
+    fn target_not_named_by_stored_template_fails_closed() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let named_agent = nostr::Keys::generate();
+        let other_agent = nostr::Keys::generate();
+        let event = workflow_event(&relay, &owner.public_key(), &named_agent.public_key(), true);
+
         assert_eq!(
-            effective_instruction_author(&duplicate_workflow, Some(&relay.public_key())),
+            effective_author_for(&event, Some(&relay.public_key()), &other_agent.public_key()),
             relay.public_key().to_hex()
         );
+    }
+
+    #[test]
+    fn legacy_actor_attribution_fails_closed() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16), "test")
+                .tags(vec![
+                    nostr::Tag::parse(["actor", &owner.public_key().to_hex()])
+                        .expect("legacy actor"),
+                    nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow marker"),
+                    nostr::Tag::parse(["p", &agent.public_key().to_hex()]).expect("legacy mention"),
+                ])
+                .sign_with_keys(&relay)
+                .expect("event signs");
+
+        assert_eq!(
+            effective_author_for(&event, Some(&relay.public_key()), &agent.public_key()),
+            relay.public_key().to_hex()
+        );
+    }
+
+    #[test]
+    fn duplicate_authority_or_marker_tags_fail_closed() {
+        let relay = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        let duplicate_owner = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            &agent.public_key(),
+            true,
+            KIND_STREAM_MESSAGE,
+            vec![
+                nostr::Tag::parse(["buzz:workflow-owner", &owner.public_key().to_hex()])
+                    .expect("duplicate owner"),
+            ],
+        );
+        let duplicate_mention = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            &agent.public_key(),
+            true,
+            KIND_STREAM_MESSAGE,
+            vec![
+                nostr::Tag::parse(["buzz:workflow-mention", &agent.public_key().to_hex()])
+                    .expect("duplicate mention"),
+            ],
+        );
+        let duplicate_marker = workflow_event_with(
+            &relay,
+            &owner.public_key(),
+            &agent.public_key(),
+            true,
+            KIND_STREAM_MESSAGE,
+            vec![nostr::Tag::parse(["buzz:workflow", "true"]).expect("duplicate marker")],
+        );
+
+        for event in [&duplicate_owner, &duplicate_mention, &duplicate_marker] {
+            assert_eq!(
+                effective_author_for(event, Some(&relay.public_key()), &agent.public_key()),
+                relay.public_key().to_hex()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_actor_or_workflow_tags_fail_closed_to_actual_signer() {
+        duplicate_authority_or_marker_tags_fail_closed();
     }
 
     /// A `RestClient` for tests. The author-gate decisions exercised here all

@@ -514,8 +514,11 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
         // to authors the real agent would have answered. External allowlist
         // grants work only in relay-verified 1:1 DMs; group/unknown DMs fail
         // closed while owner/sibling behavior is preserved.
-        let author_hex =
-            effective_instruction_author(&buzz_event.event, trusted_relay_pubkey.as_ref());
+        let author_hex = effective_instruction_author(
+            &buzz_event.event,
+            trusted_relay_pubkey.as_ref(),
+            &pubkey_hex,
+        );
         let channel = crate::resolve_author_gate_channel(
             buzz_event.channel_id,
             &pubkey_hex,
