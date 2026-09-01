@@ -656,6 +656,26 @@ async fn revalidate_webhook_dispatch(
     Ok(())
 }
 
+/// Read the unrendered `send_message` template from the durable definition.
+fn authored_send_message_text<'a>(
+    definition: &'a WorkflowDef,
+    step_id: &str,
+) -> Result<&'a str, WorkflowError> {
+    definition
+        .steps
+        .iter()
+        .find(|stored_step| stored_step.id == step_id)
+        .and_then(|stored_step| match &stored_step.action {
+            ActionDef::SendMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            WorkflowError::InvalidDefinition(
+                "SendMessage: resolved action does not match its stored authored step".into(),
+            )
+        })
+}
+
 /// Dispatch a resolved action and return its output.
 ///
 /// For MVP, most actions log their intent and return a success output.
@@ -704,6 +724,13 @@ pub async fn dispatch_action(
                 workflow.channel_id,
             )?;
             let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+            let stored_definition: WorkflowDef =
+                serde_json::from_value(workflow.definition.clone()).map_err(|e| {
+                    WorkflowError::InvalidDefinition(format!(
+                        "SendMessage: stored workflow definition is invalid: {e}"
+                    ))
+                })?;
+            let authored_text = authored_send_message_text(&stored_definition, step_id)?;
 
             info!(
                 run_id = %run_id,
@@ -714,7 +741,13 @@ pub async fn dispatch_action(
 
             let event_id = engine
                 .action_sink()?
-                .send_message(community_id, &channel_id, text, &owner_pubkey_hex)
+                .send_message(
+                    community_id,
+                    &channel_id,
+                    text,
+                    authored_text,
+                    &owner_pubkey_hex,
+                )
                 .await
                 .map_err(WorkflowError::from)?;
 
@@ -1383,6 +1416,26 @@ mod tests {
             message_id: "event-id-hex".to_owned(),
             webhook_fields: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn workflow_authority_uses_stored_unrendered_send_template() {
+        let definition: WorkflowDef = serde_json::from_value(json!({
+            "name": "authority-source",
+            "trigger": {"on": "message_posted"},
+            "steps": [{
+                "id": "send",
+                "action": "send_message",
+                "text": "echo: {{trigger.text}}"
+            }]
+        }))
+        .expect("valid workflow definition");
+
+        assert_eq!(
+            authored_send_message_text(&definition, "send").expect("stored authored text"),
+            "echo: {{trigger.text}}"
+        );
+        assert!(authored_send_message_text(&definition, "missing").is_err());
     }
 
     #[test]
